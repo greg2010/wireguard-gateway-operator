@@ -1,0 +1,56 @@
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: xgateways.infra.wgnet.dev
+spec:
+  scope: Namespaced
+  group: infra.wgnet.dev
+  names:
+    kind: XGateway
+    plural: xgateways
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                region: { type: string }
+                zone: { type: string }
+                machineType: { type: string }
+                image: { type: string }
+                diskSizeGB: { type: integer }
+                spot: { type: boolean }
+                userData: { type: string }
+                subnetCIDR: { type: string }
+                reservedIP: { type: boolean }
+                dnsHostnames:
+                  type: array
+                  items: { type: string }
+                wgListenPort: { type: integer }
+                allowedPorts:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      port: { type: integer }
+                      protocol: { type: string }
+                    required: [port, protocol]
+                serviceAccountId: { type: string }
+                secretId: { type: string }
+                wgKeySecretRef:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    key: { type: string }
+                  required: [name, key]
+              required: [region, zone, machineType, subnetCIDR, wgListenPort]
+            status:
+              type: object
+              properties:
+                address: { type: string }
+                serviceAccountEmail: { type: string }

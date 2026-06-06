@@ -1,0 +1,1 @@
+{{ .Files.Get "crossplane/gcp/xgateway-xrd.yaml" }}

@@ -1,0 +1,63 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: crossplane-providers-gate
+  namespace: crossplane-system
+  annotations:
+    # Crossplane registers provider CRDs asynchronously after the Provider CR is
+    # applied; helm --wait only waits for Deployments, not for a Provider to be
+    # Healthy. This hook blocks release completion until the providers/functions
+    # are Healthy and the CRDs a later release consumes are Established.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crossplane-providers-gate
+    spec:
+      serviceAccountName: crossplane-providers-gate
+      restartPolicy: Never
+      # The kubectl image is distroless (no shell), so each wait is its own
+      # container invoking kubectl directly. initContainers run sequentially in
+      # declared order, preserving the original providers -> functions -> CRDs
+      # gate ordering before the main container completes the Job.
+      initContainers:
+        - name: wait-providers
+          image: {{ .Values.gate.image | quote }}
+          command: ["kubectl"]
+          args:
+            - wait
+            - --for=condition=Healthy
+            - provider.pkg.crossplane.io
+            - --all
+            - --timeout={{ .Values.gate.timeout }}
+        - name: wait-functions
+          image: {{ .Values.gate.image | quote }}
+          command: ["kubectl"]
+          args:
+            - wait
+            - --for=condition=Healthy
+            - function.pkg.crossplane.io
+            - --all
+            - --timeout={{ .Values.gate.timeout }}
+      containers:
+        - name: wait-crds
+          image: {{ .Values.gate.image | quote }}
+          command: ["kubectl"]
+          args:
+            - wait
+            - --for=condition=established
+            - crd/instances.compute.gcp.m.upbound.io
+            - crd/addresses.compute.gcp.m.upbound.io
+            - crd/networks.compute.gcp.m.upbound.io
+            - crd/subnetworks.compute.gcp.m.upbound.io
+            - crd/firewalls.compute.gcp.m.upbound.io
+            - crd/serviceaccounts.cloudplatform.gcp.m.upbound.io
+            - crd/secrets.secretmanager.gcp.m.upbound.io
+            - crd/secretversions.secretmanager.gcp.m.upbound.io
+            - crd/secretiammembers.secretmanager.gcp.m.upbound.io
+            - crd/clusterproviderconfigs.gcp.m.upbound.io
+            - --timeout={{ .Values.gate.timeout }}

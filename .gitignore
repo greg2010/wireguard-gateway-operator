@@ -1,0 +1,31 @@
+# Binaries
+bin/
+
+# Environment Files
+*.env
+# Config template, committed; the filled-in .env is ignored above.
+!.env.example
+
+# IDEs
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+.zed
+.claude
+
+# OS
+.DS_Store
+
+# Local
+*.local
+
+# Local secrets
+.env
+.secrets/
+*-creds.json
+
+__debug_bin*
+
+coverage.out
+.test-output/

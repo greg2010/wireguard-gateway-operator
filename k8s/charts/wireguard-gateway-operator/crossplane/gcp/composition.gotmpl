@@ -1,0 +1,236 @@
+{{- /* The WireGuard-key Secret named by spec.wgKeySecretRef must live in the XGateway's namespace; secretDataSecretRef resolves there. */ -}}
+{{- $xr := .observed.composite.resource -}}
+{{- $spec := $xr.spec -}}
+{{- $region := $spec.region -}}
+{{- $reservedIP := dig "reservedIP" false $spec -}}
+{{- $saEmail := dig "status" "atProvider" "email" "" (getComposedResource . "service-account") -}}
+{{- $addressIP := dig "status" "atProvider" "address" "" (getComposedResource . "address") -}}
+{{- $subnetReady := false -}}
+{{- range (dig "status" "conditions" (list) (getComposedResource . "subnetwork")) -}}
+{{- if and (eq (dig "type" "" .) "Ready") (eq (dig "status" "" .) "True") -}}
+{{- $subnetReady = true -}}
+{{- end -}}
+{{- end -}}
+{{- $networkReady := false -}}
+{{- range (dig "status" "conditions" (list) (getComposedResource . "network")) -}}
+{{- if and (eq (dig "type" "" .) "Ready") (eq (dig "status" "" .) "True") -}}
+{{- $networkReady = true -}}
+{{- end -}}
+{{- end -}}
+{{- $tcpPorts := list -}}
+{{- $udpPorts := list (toString $spec.wgListenPort) -}}
+{{- range (dig "allowedPorts" (list) $spec) -}}
+{{- if eq (dig "protocol" "" .) "tcp" -}}
+{{- $tcpPorts = append $tcpPorts (toString .port) -}}
+{{- else if eq (dig "protocol" "" .) "udp" -}}
+{{- $udpPorts = append $udpPorts (toString .port) -}}
+{{- end -}}
+{{- end -}}
+{{- $address := "" -}}
+{{- if $reservedIP -}}
+{{- $address = $addressIP -}}
+{{- else -}}
+{{- $nics := dig "status" "atProvider" "networkInterface" (list) (getComposedResource . "instance") -}}
+{{- if gt (len $nics) 0 -}}
+{{- $acs := dig "accessConfig" (list) (index $nics 0) -}}
+{{- if gt (len $acs) 0 -}}
+{{- $address = dig "natIp" "" (index $acs 0) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $instanceReady := and (ne $saEmail "") $subnetReady (or (not $reservedIP) (ne $addressIP "")) -}}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Network
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: network
+spec:
+  forProvider:
+    autoCreateSubnetworks: false
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- if $networkReady }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Subnetwork
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: subnetwork
+spec:
+  forProvider:
+    ipCidrRange: {{ $spec.subnetCIDR | quote }}
+    region: {{ $region | quote }}
+    privateIpGoogleAccess: true
+    networkSelector:
+      matchControllerRef: true
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if $networkReady }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Firewall
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: firewall
+spec:
+  forProvider:
+    direction: INGRESS
+    sourceRanges:
+      - 0.0.0.0/0
+    networkSelector:
+      matchControllerRef: true
+    allow:
+      {{- if gt (len $tcpPorts) 0 }}
+      - protocol: tcp
+        ports:
+          {{- range $tcpPorts }}
+          - {{ . | quote }}
+          {{- end }}
+      {{- end }}
+      - protocol: udp
+        ports:
+          {{- range $udpPorts }}
+          - {{ . | quote }}
+          {{- end }}
+      - protocol: icmp
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if $reservedIP }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Address
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: address
+spec:
+  forProvider:
+    addressType: EXTERNAL
+    region: {{ $region | quote }}
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
+---
+apiVersion: cloudplatform.gcp.m.upbound.io/v1beta1
+kind: ServiceAccount
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: service-account
+    crossplane.io/external-name: {{ $spec.serviceAccountId | quote }}
+spec:
+  forProvider: {}
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: Secret
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: secret
+    crossplane.io/external-name: {{ $spec.secretId | quote }}
+spec:
+  forProvider:
+    replication:
+      auto: {}
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: SecretVersion
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: secret-version
+spec:
+  forProvider:
+    secretSelector:
+      matchControllerRef: true
+    secretDataSecretRef:
+      name: {{ $spec.wgKeySecretRef.name | quote }}
+      key: {{ $spec.wgKeySecretRef.key | quote }}
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- if ne $saEmail "" }}
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: SecretIAMMember
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: secret-iam
+spec:
+  forProvider:
+    role: roles/secretmanager.secretAccessor
+    member: {{ printf "serviceAccount:%s" $saEmail | quote }}
+    secretIdSelector:
+      matchControllerRef: true
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if $instanceReady }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Instance
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: instance
+spec:
+  forProvider:
+    machineType: {{ $spec.machineType | quote }}
+    zone: {{ $spec.zone | quote }}
+    bootDisk:
+      initializeParams:
+        {{- if ne (dig "image" "" $spec) "" }}
+        image: {{ $spec.image | quote }}
+        {{- end }}
+        size: {{ dig "diskSizeGB" 20 $spec }}
+    metadata:
+      {{- if ne (dig "userData" "" $spec) "" }}
+      user-data: {{ $spec.userData | quote }}
+      {{- end }}
+      {{- if ne (dig "secretId" "" $spec) "" }}
+      secret-id: {{ $spec.secretId | quote }}
+      {{- end }}
+      disable-legacy-endpoints: "true"
+      block-project-ssh-keys: "true"
+    networkInterface:
+      - subnetworkSelector:
+          matchControllerRef: true
+        accessConfig:
+          {{- if $reservedIP }}
+          - natIp: {{ $addressIP | quote }}
+          {{- else }}
+          - {}
+          {{- end }}
+    serviceAccount:
+      email: {{ $saEmail | quote }}
+      scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+    {{- if dig "spot" false $spec }}
+    scheduling:
+      provisioningModel: SPOT
+      preemptible: true
+      automaticRestart: false
+    {{- end }}
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
+---
+apiVersion: infra.wgnet.dev/v1alpha1
+kind: XGateway
+status:
+  {{- if ne $address "" }}
+  address: {{ $address | quote }}
+  {{- end }}
+  {{- if ne $saEmail "" }}
+  serviceAccountEmail: {{ $saEmail | quote }}
+  {{- end }}

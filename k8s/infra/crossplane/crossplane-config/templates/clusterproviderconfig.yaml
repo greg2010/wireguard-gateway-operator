@@ -1,0 +1,15 @@
+apiVersion: gcp.m.upbound.io/v1beta1
+kind: ClusterProviderConfig
+metadata:
+  # Referenced by the beacon composition's GCP MRs (providerConfigRef.name: default).
+  name: default
+spec:
+  projectID: {{ .Values.projectID | quote }}
+  credentials:
+    source: {{ .Values.credentials.source }}
+    {{- if eq .Values.credentials.source "Secret" }}
+    secretRef:
+      namespace: {{ .Values.credentials.secretRef.namespace | quote }}
+      name: {{ .Values.credentials.secretRef.name | quote }}
+      key: {{ .Values.credentials.secretRef.key | quote }}
+    {{- end }}

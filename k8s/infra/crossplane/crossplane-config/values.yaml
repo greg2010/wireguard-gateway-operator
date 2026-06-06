@@ -1,0 +1,19 @@
+# GCP project name (not the numeric ID) the providers act against. Set by the
+# e2e harness when it installs this chart; the kind clusters do not provision
+# real resources.
+projectID: ""
+
+# Credentials the GCP providers authenticate with.
+#   Secret mounts a GCP service-account JSON key from the referenced Secret. This
+#     is the credential path: cyno runs on-prem, where no GCP metadata server is
+#     reachable. Create the Secret before installing (default: crossplane-system/
+#     gcp-creds, key credentials.json).
+#   InjectedIdentity uses the identity attached to the provider pod and only
+#     works when the provider runs on GKE/GCE with Workload Identity, which is
+#     not this tool's deployment; secretRef is ignored when selected.
+credentials:
+  source: Secret
+  secretRef:
+    namespace: crossplane-system
+    name: gcp-creds
+    key: credentials.json

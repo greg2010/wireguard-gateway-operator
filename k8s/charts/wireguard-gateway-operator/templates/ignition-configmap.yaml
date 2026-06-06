@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "wireguard-gateway-operator.componentName" (dict "ctx" . "component" "userdata") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wireguard-gateway-operator.labels" (dict "ctx" . "component" "operator") | nindent 4 }}
+data:
+  # The static operator-global Flatcar Ignition the operator stamps onto every
+  # XGateway as spec.userData. No per-Gateway value is baked in. The operator
+  # reads it from the userData key via the GATEWAY_USER_DATA env on its Deployment.
+  userData: {{ include "wireguard-gateway-operator.ignition" . | quote }}

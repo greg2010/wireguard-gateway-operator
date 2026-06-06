@@ -1,0 +1,45 @@
+version: "2"
+run:
+    modules-download-mode: mod
+linters:
+    default: none
+    enable:
+        - errcheck
+        - exhaustive
+        - forcetypeassert
+        - govet
+        - ineffassign
+        - revive
+        - staticcheck
+        - unused
+        - whitespace
+        - exptostd
+        - usestdlibvars
+    exclusions:
+        generated: lax
+        presets:
+            - comments
+            - common-false-positives
+            - legacy
+            - std-error-handling
+        rules:
+            - linters:
+                  - errcheck
+              text: .*logger.Sync.*
+        paths:
+            - third_party$
+            - builtin$
+            - examples$
+            - ".*/mocks"
+            - "generated"
+            - "^vendor/"
+formatters:
+    enable:
+        - gofmt
+    exclusions:
+        generated: lax
+        paths:
+            - third_party$
+            - builtin$
+            - examples$
+            - "^vendor/"

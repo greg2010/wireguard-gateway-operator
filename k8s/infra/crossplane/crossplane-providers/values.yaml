@@ -1,0 +1,39 @@
+# Provider and function package references installed against Crossplane core.
+# Pin every package by tag (providers) or digest (functions) so a cluster
+# rebuild resolves the same artifacts.
+providers:
+  family:
+    # Leaf providers auto-pull the shared family as upbound-provider-family-gcp;
+    # declaring it explicitly here duplicates it and wedges RBAC ClusterRole
+    # creation for the whole gcp family.
+    enabled: false
+    package: xpkg.upbound.io/upbound/provider-family-gcp:v2.5.4
+  compute:
+    package: xpkg.upbound.io/upbound/provider-gcp-compute:v2.5.4
+  cloudplatform:
+    package: xpkg.upbound.io/upbound/provider-gcp-cloudplatform:v2.5.4
+  secretmanager:
+    package: xpkg.upbound.io/upbound/provider-gcp-secretmanager:v2.5.4
+
+functions:
+  goTemplating:
+    # Digest must match the function pinned by the composition integration test.
+    package: xpkg.crossplane.io/crossplane-contrib/function-go-templating@sha256:86f02d0b0e22725015d4be7f4d25bebee47e27300f496ad55630bc64be5f8c9a
+  autoReady:
+    # function-auto-ready v0.6.5 (multi-arch index digest).
+    package: xpkg.crossplane.io/crossplane-contrib/function-auto-ready@sha256:49cc4de717311b589c0ad9ae6d8d2256e2754ab4884391a5655b71df29bc3684
+
+gcp:
+  # Provider reconcile poll interval. The Upbound default is 10m, far too slow for
+  # the gated XBeacon composition chain (each dependent resource waits a full poll
+  # to be observed Ready); 10s lets the beacon provision within budget.
+  pollInterval: "10s"
+
+# Post-install gate. The gate Job waits for the providers/functions to report
+# Healthy and for the provider-installed CRDs to be Established, so a later
+# release that uses those CRDs does not race their asynchronous registration.
+gate:
+  image: registry.k8s.io/kubectl:v1.31.0
+  # Strictly under the e2e harness's 5m helm --wait so the gate loses the race
+  # at the deadline edge and surfaces its own diagnostics instead of helm's.
+  timeout: 240s

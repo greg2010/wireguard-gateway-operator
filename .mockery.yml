@@ -1,0 +1,12 @@
+all: false
+dir: "{{.InterfaceDir}}/mocks"
+filename: "{{.InterfaceName}}.go"
+force-file-write: true
+formatter: goimports
+generate: true
+include-auto-generated: true
+pkgname: "{{.SrcPackageName}}Mock"
+log-level: info
+# Interfaces are registered here as they are introduced. Each entry maps an
+# import path to the interfaces whose mocks mockery should generate.
+packages: {}

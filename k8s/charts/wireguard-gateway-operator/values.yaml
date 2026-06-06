@@ -1,0 +1,90 @@
+# wireguard-gateway-operator chart configuration contract.
+#
+# The operator owns per-Gateway resource creation at runtime; this chart installs
+# the operator, its RBAC and CRDs, the static Flatcar Ignition userData, and the
+# XGateway XRD/Composition. Per-Gateway gcp/forwards/dnsHostnames are expressed on
+# the Gateway CR, not here.
+#
+# Required before deploy: operator.image, link.image, gcp.projectID. Everything
+# else has a working default.
+
+# Gates only the user-facing platform prerequisite documentation knob: the
+# Crossplane provider, fabric MRs, and ProviderConfig the Composition resolves
+# against must exist before any Gateway provisions. The operator hard-requires the
+# XGateway CRD at startup, so the XRD and Composition install unconditionally.
+crossplane:
+  enabled: false
+
+operator:
+  image:
+    repository: ""
+    tag: ""
+  pullPolicy: IfNotPresent
+  # Single active replica; leader election guards against split-brain across the
+  # replica count, so this can be raised for warm standby.
+  replicas: 1
+  # Single-active-replica reconciliation via a Lease. Maps GATEWAY_OPERATOR_LEADER_ELECTION.
+  leaderElection: true
+  # Prometheus metrics bind address. "0" disables. Maps GATEWAY_OPERATOR_METRICS_ADDR.
+  metricsAddr: ":8080"
+  # healthz/readyz bind address; the probes target it. Maps GATEWAY_OPERATOR_HEALTH_ADDR.
+  healthAddr: ":8081"
+  # zap level name (debug, info, warn, error). Maps LOG_LEVEL.
+  logLevel: info
+  # Emit structured JSON logs (zap production encoder). Maps PROD_LOG_FORMAT.
+  jsonLog: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+link:
+  # Prerequisite: nodes hosting link pods must run their kubelet with
+  # --allowed-unsafe-sysctls=net.ipv4.ip_forward (or the equivalent
+  # KubeletConfiguration allowedUnsafeSysctls); the link pod sets it via its
+  # pod-level securityContext and the kubelet rejects the pod otherwise.
+  #
+  # The gateway-link image the operator stamps onto each per-Gateway link
+  # Deployment via GATEWAY_LINK_IMAGE. Built from the Dockerfile "link" target.
+  image:
+    repository: ""
+    tag: ""
+  # imagePullPolicy for the link container. Maps GATEWAY_LINK_IMAGE_PULL_POLICY.
+  pullPolicy: IfNotPresent
+
+gcp:
+  # GCP project that owns the gateway VMs and their Secret Manager secrets. The
+  # boot keyfetch script reads it; required. Per-Gateway secret IDs are operator-
+  # derived and resolved at boot from the instance metadata server.
+  projectID: ""
+  # Subnet CIDR the XGateway provisions on GCP. Maps GATEWAY_GCP_SUBNET_CIDR.
+  subnetCIDR: 10.200.0.0/24
+  # Boot image for the gateway VM. The gateway boots Flatcar because its userData
+  # is Flatcar Ignition v3.4.0; this is the GCP Flatcar stable image family.
+  # Empty leaves the Composition default. Maps GATEWAY_GCP_IMAGE.
+  image: projects/kinvolk-public/global/images/family/flatcar-stable
+  # Gateway VM boot disk size in GB. 0 leaves the Composition default. Maps GATEWAY_GCP_DISK_SIZE_GB.
+  diskSizeGB: 20
+  # Allocate a static external IP so the address survives an instance replace.
+  # Maps GATEWAY_GCP_RESERVED_IP.
+  reservedIP: true
+
+wireguard:
+  # Tunnel subnet. The CIDR suffix is reused for the link interface address. Maps GATEWAY_WG_SUBNET.
+  subnet: 10.99.0.0/29
+  # The gateway VM's wg0 address. Chart-only: it is baked into the static netdev
+  # via the Ignition, not an operator env.
+  gatewayAddress: 10.99.0.1
+  # The link end's wg0 address (without CIDR suffix). Maps GATEWAY_WG_LINK_ADDRESS.
+  linkAddress: 10.99.0.2
+  # The gateway VM's WireGuard UDP port; drives the GCP firewall and the link's
+  # peer endpoint. Also baked into the gateway netdev and nftables. Maps GATEWAY_WG_LISTEN_PORT.
+  listenPort: 51820
+  # The link's persistent-keepalive interval in seconds. Maps GATEWAY_WG_KEEPALIVE.
+  keepalive: 25
+  # The link's wg0 MTU. Maps GATEWAY_WG_MTU.
+  mtu: 1380
+  # How often the link re-reads the XGateway address. Maps GATEWAY_WG_RECONCILE_INTERVAL.
+  reconcileInterval: "10s"

@@ -1,0 +1,13 @@
+[Interface]
+PrivateKey = {{ .PrivKey }}
+{{- if gt .ListenPort 0 }}
+ListenPort = {{ .ListenPort }}
+{{- end }}
+
+[Peer]
+PublicKey = {{ .PeerPubKey }}
+Endpoint = {{ .Endpoint }}
+AllowedIPs = {{ .AllowedIPs }}
+{{- if gt .PersistentKeepalive 0 }}
+PersistentKeepalive = {{ .PersistentKeepalive }}
+{{- end }}

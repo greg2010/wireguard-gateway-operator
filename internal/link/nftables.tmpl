@@ -1,0 +1,27 @@
+table inet cyno {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+{{- range $f := . }}
+		iif "wg0" {{ $f.Protocol }} dport {{ $f.PublicPort }} dnat ip to {{ $f.ClusterIP }} : {{ $f.TargetPort }}
+{{- end }}
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname != "wg0" masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		ct state established,related accept
+{{- range $f := . }}
+		iif "wg0" ip daddr {{ $f.ClusterIP }} {{ $f.Protocol }} dport {{ $f.TargetPort }} accept
+{{- end }}
+		oifname "wg0" tcp flags syn tcp option maxseg size set rt mtu
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iif "wg0" drop
+	}
+}

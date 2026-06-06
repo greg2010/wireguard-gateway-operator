@@ -1,0 +1,15 @@
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: gcp-fast-poll
+spec:
+  deploymentTemplate:
+    spec:
+      selector: {}
+      template:
+        spec:
+          containers:
+            - name: package-runtime
+              env:
+                - name: PROVIDER_POLL
+                  value: {{ .Values.gcp.pollInterval | quote }}

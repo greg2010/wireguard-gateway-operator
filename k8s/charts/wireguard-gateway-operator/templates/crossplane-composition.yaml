@@ -1,0 +1,27 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: {{ include "wireguard-gateway-operator.componentName" (dict "ctx" . "component" "xgateway") }}
+  labels:
+    {{- include "wireguard-gateway-operator.labels" (dict "ctx" . "component" "xgateway") | nindent 4 }}
+spec:
+  compositeTypeRef:
+    apiVersion: infra.wgnet.dev/v1alpha1
+    kind: XGateway
+  mode: Pipeline
+  pipeline:
+    - step: render-gateway
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        options:
+          - missingkey=error
+        inline:
+          template: |
+{{ .Files.Get "crossplane/gcp/composition.gotmpl" | nindent 12 }}
+    - step: ready
+      functionRef:
+        name: function-auto-ready

@@ -1,0 +1,97 @@
+{{- $healthPort := .Values.operator.healthAddr | trimPrefix ":" | atoi -}}
+{{- $metricsPort := .Values.operator.metricsAddr | trimPrefix ":" | atoi -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "wireguard-gateway-operator.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wireguard-gateway-operator.labels" (dict "ctx" . "component" "operator") | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "wireguard-gateway-operator.selectorLabels" (dict "ctx" . "component" "operator") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "wireguard-gateway-operator.selectorLabels" (dict "ctx" . "component" "operator") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "wireguard-gateway-operator.name" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: {{ include "wireguard-gateway-operator.operatorImage" . | quote }}
+          imagePullPolicy: {{ .Values.operator.pullPolicy }}
+          env:
+            - name: GATEWAY_OPERATOR_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: GATEWAY_OPERATOR_LEADER_ELECTION
+              value: {{ .Values.operator.leaderElection | quote }}
+            - name: GATEWAY_OPERATOR_METRICS_ADDR
+              value: {{ .Values.operator.metricsAddr | quote }}
+            - name: GATEWAY_OPERATOR_HEALTH_ADDR
+              value: {{ .Values.operator.healthAddr | quote }}
+            - name: GATEWAY_LINK_IMAGE
+              value: {{ include "wireguard-gateway-operator.linkImage" . | quote }}
+            - name: GATEWAY_LINK_IMAGE_PULL_POLICY
+              value: {{ .Values.link.pullPolicy | quote }}
+            - name: GATEWAY_WG_SUBNET
+              value: {{ .Values.wireguard.subnet | quote }}
+            - name: GATEWAY_WG_LINK_ADDRESS
+              value: {{ .Values.wireguard.linkAddress | quote }}
+            - name: GATEWAY_WG_LISTEN_PORT
+              value: {{ .Values.wireguard.listenPort | quote }}
+            - name: GATEWAY_WG_KEEPALIVE
+              value: {{ .Values.wireguard.keepalive | quote }}
+            - name: GATEWAY_WG_MTU
+              value: {{ .Values.wireguard.mtu | quote }}
+            - name: GATEWAY_WG_RECONCILE_INTERVAL
+              value: {{ .Values.wireguard.reconcileInterval | quote }}
+            - name: GATEWAY_GCP_SUBNET_CIDR
+              value: {{ .Values.gcp.subnetCIDR | quote }}
+            - name: GATEWAY_GCP_IMAGE
+              value: {{ .Values.gcp.image | quote }}
+            - name: GATEWAY_GCP_DISK_SIZE_GB
+              value: {{ .Values.gcp.diskSizeGB | quote }}
+            - name: GATEWAY_GCP_RESERVED_IP
+              value: {{ .Values.gcp.reservedIP | quote }}
+            - name: GATEWAY_USER_DATA
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "wireguard-gateway-operator.componentName" (dict "ctx" . "component" "userdata") }}
+                  key: userData
+            - name: LOG_LEVEL
+              value: {{ .Values.operator.logLevel | quote }}
+            - name: PROD_LOG_FORMAT
+              value: {{ .Values.operator.jsonLog | quote }}
+          ports:
+            - name: health
+              containerPort: {{ $healthPort }}
+              protocol: TCP
+            {{- if ne $metricsPort 0 }}
+            - name: metrics
+              containerPort: {{ $metricsPort }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}

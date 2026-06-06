@@ -1,0 +1,16 @@
+table inet cyno {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iif "eth0" meta l4proto { tcp, udp } th dport != {{ .Values.wireguard.listenPort }} dnat ip to {{ .Values.wireguard.linkAddress }}
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "wg0" masquerade
+	}
+
+	chain mangle {
+		type filter hook forward priority mangle; policy accept;
+		oifname "wg0" tcp flags syn tcp option maxseg size set rt mtu
+	}
+}
