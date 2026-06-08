@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag $GITHUB_REF_NAME is not a semver vX.Y.Z release" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tagged commit $GITHUB_SHA is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+      - run: |
+          conclusion="$(gh run list --workflow=ci.yaml --commit "$GITHUB_SHA" --json conclusion --jq '.[0].conclusion')"
+          if [ "$conclusion" != "success" ]; then
+            echo "CI workflow has not concluded success for $GITHUB_SHA (got: ${conclusion:-none})" >&2
+            exit 1
+          fi
+
+  retag-images:
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [operator, link]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: imjasonh/setup-crane@v0.4
+      - run: |
+          SHORT="${GITHUB_SHA:0:7}"
+          SRC="ghcr.io/greg2010/wireguard-gateway-operator/${{ matrix.image }}:sha-${SHORT}"
+          crane tag "$SRC" "${{ needs.validate.outputs.version }}"
+          crane tag "$SRC" latest
+
+  package-chart:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          VERSION="$VERSION" yq -i '.operator.image.repository = "ghcr.io/greg2010/wireguard-gateway-operator/operator" | .operator.image.tag = strenv(VERSION) | .link.image.repository = "ghcr.io/greg2010/wireguard-gateway-operator/link" | .link.image.tag = strenv(VERSION)' k8s/charts/wireguard-gateway-operator/values.yaml
+          helm package k8s/charts/wireguard-gateway-operator --version "$VERSION" --app-version "$VERSION"
+          helm registry login ghcr.io -u ${{ github.actor }} --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+          helm push "wireguard-gateway-operator-${VERSION}.tgz" oci://ghcr.io/greg2010/wireguard-gateway-operator/charts
