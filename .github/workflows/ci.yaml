@@ -77,6 +77,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # kind binary must match the sigs.k8s.io/kind version in go.mod; the
+      # library's node image uses a containerd config the runner's kind can't load.
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.32.0
+          install_only: true
       - run: sudo modprobe wireguard
       - run: printf '%s' "$GCP_SA_KEY" > "$RUNNER_TEMP/gcp-creds.json"
         env:
