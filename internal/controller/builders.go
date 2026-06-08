@@ -141,6 +141,7 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 		Image:             &image,
 		DiskSizeGB:        &diskSizeGB,
 		WgListenPort:      int(effectiveWireguardPort(gw)),
+		WgMTU:             int(effectiveWGMTU(gw)),
 		WgGatewayAddress:  &wgGatewayAddress,
 		WgLinkAddress:     &wgLinkAddress,
 		WgSubnet:          &wgSubnet,

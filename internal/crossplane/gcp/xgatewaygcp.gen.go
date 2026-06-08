@@ -27,6 +27,7 @@ type XGatewayGCPSpec struct {
 	} `json:"wgKeySecretRef,omitempty"`
 	WgLinkAddress *string `json:"wgLinkAddress,omitempty"`
 	WgListenPort  int     `json:"wgListenPort"`
+	WgMTU         int     `json:"wgMTU"`
 	WgSubnet      *string `json:"wgSubnet,omitempty"`
 	Zone          string  `json:"zone"`
 }

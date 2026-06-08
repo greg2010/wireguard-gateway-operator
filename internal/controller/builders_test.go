@@ -172,6 +172,10 @@ func TestBuildXGatewayGCP(t *testing.T) {
 	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != wantWGPort {
 		t.Errorf("wgListenPort = %d, want %d", got, wantWGPort)
 	}
+	wantWGMTU := int64(effectiveWGMTU(gw))
+	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgMTU"); got != wantWGMTU {
+		t.Errorf("wgMTU = %d, want %d", got, wantWGMTU)
+	}
 	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "diskSizeGB"); got != int64(effectiveGCPDiskSizeGB(gw)) {
 		t.Errorf("diskSizeGB = %d, want %d", got, effectiveGCPDiskSizeGB(gw))
 	}
@@ -263,6 +267,24 @@ func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
 
 	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != 51999 {
 		t.Errorf("wgListenPort = %d, want 51999 (non-default spec.wireguard.listenPort)", got)
+	}
+}
+
+// TestBuildXGatewayGCPWireguardMTU pins that a non-default spec.wireguard.mtu
+// flows verbatim onto the composite's wgMTU, so the gateway VM sets wg0 to the
+// same MTU the in-cluster link uses rather than leaving it at the kernel default.
+func TestBuildXGatewayGCPWireguardMTU(t *testing.T) {
+	cfg := testConfig()
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.Wireguard.MTU = 1280
+
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	if err != nil {
+		t.Fatalf("buildXGatewayGCP: %v", err)
+	}
+
+	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgMTU"); got != 1280 {
+		t.Errorf("wgMTU = %d, want 1280 (non-default spec.wireguard.mtu)", got)
 	}
 }
 

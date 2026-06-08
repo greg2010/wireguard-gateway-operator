@@ -30,6 +30,7 @@ spec:
                 reservedIP: { type: boolean }
                 projectID: { type: string }
                 wgListenPort: { type: integer }
+                wgMTU: { type: integer }
                 wgGatewayAddress: { type: string }
                 wgLinkAddress: { type: string }
                 wgSubnet: { type: string }
@@ -49,7 +50,7 @@ spec:
                     name: { type: string }
                     key: { type: string }
                   required: [name, key]
-              required: [region, zone, machineType, sharedNetworkName, wgListenPort]
+              required: [region, zone, machineType, sharedNetworkName, wgListenPort, wgMTU]
             status:
               type: object
               properties:

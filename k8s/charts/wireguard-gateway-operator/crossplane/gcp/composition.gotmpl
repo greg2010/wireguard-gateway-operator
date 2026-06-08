@@ -158,6 +158,7 @@ spec:
       secret-id: {{ $spec.secretId | quote }}
       {{- end }}
       wg-listen-port: {{ $spec.wgListenPort | toString | quote }}
+      wg-mtu: {{ $spec.wgMTU | toString | quote }}
       {{- if ne (dig "wgGatewayAddress" "" $spec) "" }}
       wg-gateway-address: {{ $spec.wgGatewayAddress | quote }}
       {{- end }}

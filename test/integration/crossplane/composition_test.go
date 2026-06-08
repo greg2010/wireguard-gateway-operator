@@ -105,6 +105,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				"reservedIP":        true,
 				"userData":          "#cloud-config\n",
 				"wgListenPort":      51820,
+				"wgMTU":             1380,
 				"wgGatewayAddress":  "10.99.0.1",
 				"wgLinkAddress":     "10.99.0.2",
 				"wgSubnet":          "10.99.0.0/29",
@@ -191,6 +192,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				// split-brain fix at the composition boundary.
 				wantMeta := map[string]string{
 					"wg-listen-port":     "51820",
+					"wg-mtu":             "1380",
 					"wg-gateway-address": "10.99.0.1",
 					"wg-link-address":    "10.99.0.2",
 					"wg-subnet":          "10.99.0.0/29",
@@ -382,6 +384,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				"sharedNetworkName": sharedNetworkName,
 				"reservedIP":        false,
 				"wgListenPort":      51999,
+				"wgMTU":             1280,
 				"wgGatewayAddress":  "10.50.0.1",
 				"wgLinkAddress":     "10.50.0.2",
 				"wgSubnet":          "10.50.0.0/29",
@@ -405,6 +408,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				inst := desiredResource(t, resp, "instance")
 				wantMeta := map[string]string{
 					"wg-listen-port":     "51999",
+					"wg-mtu":             "1280",
 					"wg-gateway-address": "10.50.0.1",
 					"wg-link-address":    "10.50.0.2",
 					"wg-subnet":          "10.50.0.0/29",

@@ -1,12 +1,12 @@
 #!/usr/bin/env sh
 # Renders every per-Gateway boot artifact from the instance metadata server, then
 # fetches the WireGuard key bundle from GCP Secret Manager and brings wg0 up. All
-# per-Gateway values (the WireGuard listen port, the gateway and link addresses,
-# the tunnel subnet, the project ID, and the secret ID) are read from instance
-# metadata, not baked into this script: the operator sets them on the XGatewayGCP
-# spec, the composition writes them into the Instance metadata, and this script
-# resolves them at boot. The rendered Ignition is therefore byte-identical across
-# every Gateway.
+# per-Gateway values (the WireGuard listen port, the MTU, the gateway and link
+# addresses, the tunnel subnet, the project ID, and the secret ID) are read from
+# instance metadata, not baked into this script: the operator sets them on the
+# XGatewayGCP spec, the composition writes them into the Instance metadata, and
+# this script resolves them at boot. The rendered Ignition is therefore
+# byte-identical across every Gateway.
 #
 # It writes the wg0 netdev (with the fetched listen port and peer), the wg0
 # .network address, and the nftables ruleset (substituting the listen port and
@@ -69,6 +69,7 @@ write_netdev() {
 [NetDev]
 Name=wg0
 Kind=wireguard
+MTUBytes=$wg_mtu
 
 [WireGuard]
 PrivateKey=$priv
@@ -119,6 +120,7 @@ render_nft() {
 }
 
 wg_listen_port="$(fetch_metadata_attr wg-listen-port)"
+wg_mtu="$(fetch_metadata_attr wg-mtu)"
 wg_gateway_address="$(fetch_metadata_attr wg-gateway-address)"
 wg_link_address="$(fetch_metadata_attr wg-link-address)"
 wg_subnet="$(fetch_metadata_attr wg-subnet)"
