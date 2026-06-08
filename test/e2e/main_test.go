@@ -120,7 +120,7 @@ var (
 func getSuite(t *testing.T) *e2eharness.Suite {
 	t.Helper()
 	setupOnce.Do(func() {
-		sharedSuite, setupErr = e2eharness.Setup(context.Background(), t)
+		sharedSuite, setupErr = e2eharness.Setup(context.Background())
 	})
 	if setupErr != nil {
 		t.Fatalf("e2e suite setup: %v", setupErr)

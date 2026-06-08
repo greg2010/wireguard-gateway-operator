@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"testing"
 	"time"
 
 	"go.uber.org/zap"
@@ -130,12 +129,15 @@ func (s *Suite) Env() Env { return s.env }
 // caller's TestMain still delete the cluster via Teardown instead of leaking it.
 // Only the pre-cluster failures (logger init, env validation) return a nil suite,
 // and those happen before anything is created.
-func Setup(ctx context.Context, t testing.TB) (*Suite, error) {
+func Setup(ctx context.Context) (*Suite, error) {
 	log, err := zap.NewDevelopment()
 	if err != nil {
 		return nil, fmt.Errorf("zap: %w", err)
 	}
-	env := RequireEnv(t)
+	env, err := RequireEnv()
+	if err != nil {
+		return nil, fmt.Errorf("e2e env: %w", err)
+	}
 	repoDir := shared.RepoRoot()
 
 	if err := os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true"); err != nil {

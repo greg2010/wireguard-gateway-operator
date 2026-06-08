@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"testing"
 
 	"github.com/greg2010/wireguard-gateway-operator/test/harness/shared"
 )
@@ -66,13 +65,15 @@ const (
 	defaultCredsSecret    = "gcp-creds"
 )
 
-// RequireEnv reads the GCP configuration from the environment and fails the
-// test via t.Fatal if any required variable is missing or the creds file does
-// not exist. It is called after the TestMain GATEWAY_E2E gate, so reaching it with
-// an unset variable is an operator misconfiguration, not a skip condition.
-func RequireEnv(t testing.TB) Env {
-	t.Helper()
-
+// RequireEnv reads the GCP configuration from the environment and returns an
+// error naming the missing or invalid variables if any required variable is
+// unset or the creds file does not exist. It is called after the TestMain
+// GATEWAY_E2E gate, so reaching it with an unset variable is an operator
+// misconfiguration, not a skip condition; the caller propagates the error so
+// every opted-in test fails cleanly rather than skipping. It must not fail the
+// test directly: it runs inside a sync.Once, where runtime.Goexit from a
+// t.Fatal would abandon the once without recording a result.
+func RequireEnv() (Env, error) {
 	env := Env{
 		ProjectID:      os.Getenv(envProjectID),
 		Region:         os.Getenv(envRegion),
@@ -101,7 +102,7 @@ func RequireEnv(t testing.TB) Env {
 		}
 	}
 	if len(missing) > 0 {
-		t.Fatalf("GATEWAY_E2E is set but required GCP env vars are missing: %v "+
+		return Env{}, fmt.Errorf("GATEWAY_E2E is set but required GCP env vars are missing: %v "+
 			"(source them from .env; see .env.example)", missing)
 	}
 
@@ -113,10 +114,10 @@ func RequireEnv(t testing.TB) Env {
 	}
 
 	if _, err := os.Stat(env.CredsFile); err != nil {
-		t.Fatalf("%s=%q is not readable: %v", envCredsFile, env.CredsFile, err)
+		return Env{}, fmt.Errorf("%s=%q is not readable: %w", envCredsFile, env.CredsFile, err)
 	}
 
-	return env
+	return env, nil
 }
 
 // useExisting reports whether the suite should target an existing cluster
