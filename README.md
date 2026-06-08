@@ -1,10 +1,13 @@
 # wireguard-gateway-operator
 
-A Kubernetes operator that gives a private or NAT'd cluster public ingress
-without exposing a cloud LoadBalancer of its own. You apply a namespaced
-`Gateway` custom resource and the operator provisions a dedicated GCP WireGuard
-gateway VM, dials it from inside the cluster, and forwards the public TCP/UDP
-ports you list to your in-cluster Services.
+[![CI](https://github.com/greg2010/wireguard-gateway-operator/actions/workflows/ci.yaml/badge.svg)](https://github.com/greg2010/wireguard-gateway-operator/actions/workflows/ci.yaml) [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) ![Go](https://img.shields.io/github/go-mod/go-version/greg2010/wireguard-gateway-operator)
+
+A Kubernetes operator that runs WireGuard gateways on cloud VMs to give a private
+or NAT'd cluster public ingress without exposing a cloud LoadBalancer of its own.
+You apply a namespaced `Gateway` custom resource and the operator provisions a
+dedicated gateway VM, dials it from inside the cluster, and forwards the public
+TCP/UDP ports you list to your in-cluster Services. GCP is the cloud backend
+implemented today.
 
 Use it when a cluster cannot accept inbound connections directly: on-prem or
 NAT'd clusters, a homelab behind a residential ISP, anything with outbound-only
@@ -20,26 +23,59 @@ outbound, no inbound firewall rule is needed cluster-side. When `dnsHostnames` i
 set, the operator publishes a `DNSEndpoint` pointing those names at the VM's
 public IP for external-dns to serve.
 
+A minimal `Gateway`:
+
+```yaml
+apiVersion: wgnet.dev/v1alpha1
+kind: Gateway
+metadata:
+  name: edge
+  namespace: my-app
+spec:
+  gcp:
+    projectID: my-gcp-project
+    region: us-central1
+    zone: us-central1-a
+  forwards:
+    - port: 443
+      protocol: TCP
+      service: my-app
 ```
-                         public internet
-                                │
-                                ▼
-                  ┌───────────────────────────┐
-                  │   GCP gateway VM          │
-   client ──────▶ │   public IP : port        │
-                  │   WireGuard + nftables    │
-                  └────────────┬──────────────┘
-                               │ WireGuard tunnel
-                               │ (cluster dials outbound)
-                               ▼
-                  ┌───────────────────────────┐
-                  │   gateway-link Deployment │
-                  │   DNAT port → targetPort  │
-                  └────────────┬──────────────┘
-                               │ ClusterIP
-                               ▼
-                       backend Service ──▶ pods
+
+This gives `my-app` a public endpoint on a cloud VM that forwards port 443 to the
+in-cluster Service. See [Creating a gateway](#creating-a-gateway) for the full
+spec.
+
 ```
+            client
+               │
+               │  public internet
+               ▼
+┌─────────────────────────────┐
+│  cloud gateway VM           │
+│  public IP : port           │
+│  WireGuard + nftables       │
+└──────────────┬──────────────┘
+               │  WireGuard tunnel
+               │  (cluster dials outbound)
+               ▼
+┌─────────────────────────────┐
+│  gateway-link Deployment    │
+│  DNAT port → targetPort     │
+└──────────────┬──────────────┘
+               │  ClusterIP
+               ▼
+       backend Service ──▶ pods
+```
+
+## Cloud backends
+
+Gateway-VM provisioning is backend-specific, and only GCP exists today.
+
+| Backend | Status |
+|---|---|
+| GCP | Implemented |
+| AWS | Not yet implemented |
 
 ## Prerequisites
 
@@ -297,7 +333,7 @@ consent gate prevents a Gateway owner from exposing another tenant's Service to
 the public internet.
 
 ```sh
-kubectl label namespace other-team wgnet.dev/allow-gateway-ingress=true
+kubectl label namespace other-ns wgnet.dev/allow-gateway-ingress=true
 ```
 
 ```yaml
@@ -305,7 +341,7 @@ kubectl label namespace other-team wgnet.dev/allow-gateway-ingress=true
     - port: 8080
       protocol: TCP
       service: api
-      namespace: other-team
+      namespace: other-ns
 ```
 
 Backend Services of type `ClusterIP` and `NodePort` are supported (both carry a
