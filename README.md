@@ -218,16 +218,14 @@ CRDs must exist before any `Gateway` provisions.
 
 ```sh
 helm install wireguard-gateway-operator \
-  k8s/charts/wireguard-gateway-operator \
-  -n wireguard-gateway-operator --create-namespace \
-  --set operator.image.repository=YOUR_OPERATOR_IMAGE_REPO \
-  --set operator.image.tag=YOUR_OPERATOR_IMAGE_TAG \
-  --set link.image.repository=YOUR_LINK_IMAGE_REPO \
-  --set link.image.tag=YOUR_LINK_IMAGE_TAG
+  oci://ghcr.io/greg2010/wireguard-gateway-operator/charts/wireguard-gateway-operator \
+  --version 0.1.0 \
+  -n wireguard-gateway-operator --create-namespace
 ```
 
-The operator chart requires `operator.image` and `link.image`; everything else
-has a working default. The GCP project is set per Gateway via `spec.gcp.projectID`,
+The published chart pins the operator and link images, so no image values are
+needed; override `operator.image` / `link.image` only if mirroring the images
+elsewhere. The GCP project is set per Gateway via `spec.gcp.projectID`,
 not on the chart. The two images are built from this repo's `Dockerfile`
 (`make docker-build-operator` and `make docker-build`, override `OPERATOR_IMAGE` /
 `IMAGE` to push registry-qualified tags).
