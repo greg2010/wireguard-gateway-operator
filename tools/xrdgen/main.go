@@ -1,4 +1,4 @@
-// Command xrdgen generates typed Go views of the XGateway XRD's spec and status
+// Command xrdgen generates typed Go views of the XGatewayGCP XRD's spec and status
 // subtrees. The XRD's openAPIV3Schema is plain JSON Schema, which oapi-codegen
 // can consume once wrapped in a minimal OpenAPI 3 document; this tool performs
 // that wrapping and drives oapi-codegen.
@@ -20,8 +20,8 @@ import (
 )
 
 func main() {
-	xrdPath := flag.String("xrd", "k8s/charts/wireguard-gateway-operator/crossplane/gcp/xgateway-xrd.yaml", "path to the XGateway XRD YAML")
-	outDir := flag.String("out", "pkg/crossplane/gcp", "directory for the generated Go file")
+	xrdPath := flag.String("xrd", "k8s/charts/wireguard-gateway-operator/crossplane/gcp/xgateway-xrd.yaml", "path to the XGatewayGCP XRD YAML")
+	outDir := flag.String("out", "internal/crossplane/gcp", "directory for the generated Go file")
 	flag.Parse()
 
 	if err := run(*xrdPath, *outDir); err != nil {
@@ -58,7 +58,7 @@ func run(xrdPath, outDir string) error {
 	}
 
 	outFile := filepath.Join(outDir, strings.ToLower(kind)+".gen.go")
-	// skip-prune keeps the XGatewaySpec/XGatewayStatus component schemas: without
+	// skip-prune keeps the XGatewayGCPSpec/XGatewayGCPStatus component schemas: without
 	// it oapi-codegen drops every schema not referenced by an operation, and the
 	// doc deliberately has no paths.
 	cmd := exec.Command("go", "tool", "oapi-codegen",
@@ -127,20 +127,20 @@ func extractSchemas(xrdPath string) (kind string, specSchema, statusSchema map[s
 }
 
 // openAPIDoc wraps the spec and status schemas in the smallest OpenAPI 3
-// document oapi-codegen will accept, exposing them as the XGatewaySpec and
-// XGatewayStatus component schemas.
+// document oapi-codegen will accept, exposing them as the XGatewayGCPSpec and
+// XGatewayGCPStatus component schemas.
 func openAPIDoc(specSchema, statusSchema map[string]any) map[string]any {
 	return map[string]any{
 		"openapi": "3.0.0",
 		"info": map[string]any{
-			"title":   "cyno",
+			"title":   "gateway",
 			"version": "v1alpha1",
 		},
 		"paths": map[string]any{},
 		"components": map[string]any{
 			"schemas": map[string]any{
-				"XGatewaySpec":   specSchema,
-				"XGatewayStatus": statusSchema,
+				"XGatewayGCPSpec":   specSchema,
+				"XGatewayGCPStatus": statusSchema,
 			},
 		},
 	}

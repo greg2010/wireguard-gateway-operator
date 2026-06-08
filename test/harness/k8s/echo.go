@@ -17,9 +17,9 @@ import (
 // UDP datagrams on --udp-port.
 const agnhostImage = "registry.k8s.io/e2e-test-images/agnhost:2.53"
 
-// EchoFixtures deploys a TCP (HTTP) echo Service and a UDP echo Service into ns
-// and waits for the backing Deployments to become Available. The link DNATs
-// beacon ports to these Services' DNS names.
+// EchoFixtures names a TCP (HTTP) echo Service and a UDP echo Service created in
+// ns. The link DNATs gateway ports to these Services' DNS names; the probes' retry
+// budget absorbs the backing Deployments' startup, so no readiness wait is done.
 type EchoFixtures struct {
 	// TCPService is the in-cluster DNS name of the HTTP echo Service.
 	TCPService string
@@ -33,24 +33,40 @@ type EchoFixtures struct {
 
 // echo fixture constants. The container ports match the agnhost netexec flags.
 const (
-	echoTCPName = "cyno-echo-tcp"
-	echoUDPName = "cyno-echo-udp"
-	echoTCPPort = 8080
-	echoUDPPort = 8081
+	echoTCPName      = "gateway-echo-tcp"
+	echoUDPName      = "gateway-echo-udp"
+	echoNodePortName = "gateway-echo-nodeport"
+	echoXNSName      = "gateway-echo-xns"
+	echoTCPPort      = 8080
+	echoUDPPort      = 8081
 )
 
-// DeployEchoFixtures creates the TCP and UDP echo Deployments and Services in
-// ns and returns their addresses once both Deployments are Available. The
+// EchoBackend is a single HTTP echo Service the link can DNAT a forward to. It
+// is the return shape for the standalone echo helpers (NodePort, cross-namespace)
+// that deploy one backend rather than the TCP+UDP pair EchoFixtures carries.
+type EchoBackend struct {
+	// Namespace is where the echo Deployment and Service live.
+	Namespace string
+	// Service is the bare Service name; the operator builds the FQDN from it and
+	// Namespace.
+	Service string
+	// Port is the Service port the HTTP echo listens on.
+	Port int
+}
+
+// DeployEchoFixtures creates the TCP and UDP echo Deployments and Services in ns
+// and returns their addresses. It does not wait for the Deployments to become
+// Available; the data-path probes retry long enough to cover pod startup. The
 // returned Service names are short (in-namespace) DNS names; the link resolves
 // them within the same namespace.
 func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixtures, error) {
 	tcpArgs := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
 	udpArgs := []string{"netexec", fmt.Sprintf("--udp-port=%d", echoUDPPort), "--http-port=0"}
 
-	if err := c.applyEcho(ctx, ns, echoTCPName, echoTCPPort, corev1.ProtocolTCP, tcpArgs); err != nil {
+	if err := c.applyEcho(ctx, ns, echoTCPName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, tcpArgs); err != nil {
 		return EchoFixtures{}, err
 	}
-	if err := c.applyEcho(ctx, ns, echoUDPName, echoUDPPort, corev1.ProtocolUDP, udpArgs); err != nil {
+	if err := c.applyEcho(ctx, ns, echoUDPName, echoUDPPort, corev1.ProtocolUDP, corev1.ServiceTypeClusterIP, udpArgs); err != nil {
 		return EchoFixtures{}, err
 	}
 
@@ -62,9 +78,56 @@ func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixture
 	}, nil
 }
 
-// applyEcho creates one echo Deployment+Service. Idempotent on the
-// already-exists path so re-running Start in a reused namespace is safe.
-func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto corev1.Protocol, args []string) error {
+// DeployNodePortEcho creates an HTTP echo Deployment fronted by a NodePort
+// Service in ns and returns its address. A NodePort Service still carries a
+// ClusterIP, so the operator accepts it as a forward backend; this exercises the
+// service-type acceptance path for NodePort end to end. The name is distinct from
+// the ClusterIP fixtures so both can coexist in the same namespace.
+func (c *Client) DeployNodePortEcho(ctx context.Context, ns string) (EchoBackend, error) {
+	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
+	if err := c.applyEcho(ctx, ns, echoNodePortName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeNodePort, args); err != nil {
+		return EchoBackend{}, err
+	}
+	return EchoBackend{Namespace: ns, Service: echoNodePortName, Port: echoTCPPort}, nil
+}
+
+// DeployEchoInNamespace creates ns (carrying nsLabels) and deploys an HTTP echo
+// Deployment fronted by a ClusterIP Service in it, returning the backend address.
+// It is the cross-namespace forward fixture: the caller passes the consent label
+// so the operator permits a Gateway in another namespace to forward to this
+// Service. The namespace is created with the supplied labels in one shot rather
+// than via EnsureNamespace so the consent label is present before the Gateway
+// reconciles.
+func (c *Client) DeployEchoInNamespace(ctx context.Context, ns string, nsLabels map[string]string) (EchoBackend, error) {
+	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: nsLabels}}
+	if _, err := c.typed.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return EchoBackend{}, fmt.Errorf("create namespace %s: %w", ns, err)
+	}
+	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
+	if err := c.applyEcho(ctx, ns, echoXNSName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
+		return EchoBackend{}, err
+	}
+	return EchoBackend{Namespace: ns, Service: echoXNSName, Port: echoTCPPort}, nil
+}
+
+// DeployEchoBackend creates a ClusterIP HTTP echo Deployment+Service named name in
+// ns and returns its address. It is the dedicated-backend fixture the lifecycle
+// subtests attach a runtime forward to, kept distinct from the create-time echoes
+// (whose Services other subtests assert on) by its caller-chosen name. It does not
+// wait for the Deployment to become Available; the data-path probes retry long
+// enough to cover pod startup.
+func (c *Client) DeployEchoBackend(ctx context.Context, ns, name string) (EchoBackend, error) {
+	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
+	if err := c.applyEcho(ctx, ns, name, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
+		return EchoBackend{}, err
+	}
+	return EchoBackend{Namespace: ns, Service: name, Port: echoTCPPort}, nil
+}
+
+// applyEcho creates one echo Deployment+Service of the given Service type.
+// Idempotent on the already-exists path so re-running Start in a reused namespace
+// is safe.
+func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto corev1.Protocol, svcType corev1.ServiceType, args []string) error {
 	labels := map[string]string{"app": name}
 	replicas := int32(1)
 
@@ -96,6 +159,7 @@ func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels},
 		Spec: corev1.ServiceSpec{
+			Type:     svcType,
 			Selector: labels,
 			Ports: []corev1.ServicePort{{
 				Port:       int32(port),

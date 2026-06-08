@@ -25,8 +25,8 @@ functions:
 
 gcp:
   # Provider reconcile poll interval. The Upbound default is 10m, far too slow for
-  # the gated XBeacon composition chain (each dependent resource waits a full poll
-  # to be observed Ready); 10s lets the beacon provision within budget.
+  # the gated XGatewayGCP composition chain (each dependent resource waits a full poll
+  # to be observed Ready); 10s lets the gateway provision within budget.
   pollInterval: "10s"
 
 # Post-install gate. The gate Job waits for the providers/functions to report

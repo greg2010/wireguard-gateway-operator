@@ -1,7 +1,7 @@
 apiVersion: gcp.m.upbound.io/v1beta1
 kind: ClusterProviderConfig
 metadata:
-  # Referenced by the beacon composition's GCP MRs (providerConfigRef.name: default).
+  # Referenced by the gateway composition's GCP MRs (providerConfigRef.name: default).
   name: default
 spec:
   projectID: {{ .Values.projectID | quote }}

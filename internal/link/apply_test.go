@@ -2,9 +2,13 @@ package link
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestResolveForwards(t *testing.T) {
@@ -44,7 +48,7 @@ func TestResolveForwards(t *testing.T) {
 }
 
 func TestResolveForwardsError(t *testing.T) {
-	resolve := func(_ context.Context, host string) (string, error) {
+	resolve := func(_ context.Context, _ string) (string, error) {
 		return "", fmt.Errorf("nxdomain")
 	}
 	_, err := resolveForwards(context.Background(), []Forward{
@@ -62,8 +66,8 @@ func TestBuildApplyCommandsWithMTU(t *testing.T) {
 	rc := RuntimeConfig{
 		WireGuard: WireGuard{Address: "10.99.0.2/32", MTU: 1380},
 	}
-	const wgConfPath = "/tmp/cyno-wg.conf"
-	const nftRuleset = "table inet cyno { }"
+	const wgConfPath = "/tmp/gateway-wg.conf"
+	const nftRuleset = "table inet gateway { }"
 
 	cmds := buildApplyCommands(rc, wgConfPath, nftRuleset)
 
@@ -95,6 +99,81 @@ func TestBuildApplyCommandsNoMTU(t *testing.T) {
 	assertCommandPlan(t, cmds, want)
 }
 
+// TestBuildReloadCommands pins the non-disruptive reload contract: the reload
+// plan reconciles the running interface with wg syncconf and atomically swaps the
+// ruleset with nft -f, and crucially issues no ip link del or ip link add, so an
+// established tunnel and its handshake survive a config change.
+func TestBuildReloadCommands(t *testing.T) {
+	const (
+		wgConfPath = "/tmp/gateway-wg.conf"
+		nftRuleset = "table inet gateway { }"
+	)
+
+	cmds := buildReloadCommands(wgConfPath, nftRuleset)
+
+	want := []command{
+		{name: "wg", args: []string{"syncconf", "wg0", wgConfPath}},
+		{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
+	}
+	assertCommandPlan(t, cmds, want)
+
+	for _, c := range cmds {
+		if c.name == "ip" {
+			t.Errorf("reload plan must not touch the interface, found ip command: %v", c.args)
+		}
+	}
+}
+
+// TestFirstIPv4 pins the IPv4-selection rule the resolver depends on: the first
+// IPv4 in the slice wins regardless of position, and a slice with no IPv4 reports
+// not-ok so the resolver surfaces an error rather than handing an IPv6 address to
+// the IPv4-only nftables DNAT.
+func TestFirstIPv4(t *testing.T) {
+	tests := []struct {
+		name   string
+		addrs  []net.IP
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "ipv4 first",
+			addrs:  []net.IP{net.ParseIP("10.96.1.10"), net.ParseIP("fd00::1")},
+			want:   "10.96.1.10",
+			wantOK: true,
+		},
+		{
+			name:   "ipv6 then ipv4",
+			addrs:  []net.IP{net.ParseIP("fd00::1"), net.ParseIP("10.96.2.20")},
+			want:   "10.96.2.20",
+			wantOK: true,
+		},
+		{
+			name:   "ipv6 only",
+			addrs:  []net.IP{net.ParseIP("fd00::1"), net.ParseIP("2001:db8::2")},
+			want:   "",
+			wantOK: false,
+		},
+		{
+			name:   "empty",
+			addrs:  nil,
+			want:   "",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := firstIPv4(tt.addrs)
+			if ok != tt.wantOK {
+				t.Fatalf("firstIPv4 ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("firstIPv4 = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func assertCommandPlan(t *testing.T, got, want []command) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -110,5 +189,244 @@ func assertCommandPlan(t *testing.T, got, want []command) {
 		if got[i].stdin != want[i].stdin {
 			t.Errorf("cmd[%d] stdin = %q, want %q", i, got[i].stdin, want[i].stdin)
 		}
+	}
+}
+
+// runRecorder is an injectable runner. It records every command in order and
+// fails the call whose name matches failOn, so a test can drive a mid-plan
+// failure without shelling out.
+type runRecorder struct {
+	mu     sync.Mutex
+	cmds   []command
+	failOn string
+}
+
+func (r *runRecorder) run(_ context.Context, c command) error {
+	r.mu.Lock()
+	r.cmds = append(r.cmds, c)
+	r.mu.Unlock()
+	if c.name == r.failOn {
+		return fmt.Errorf("injected failure for %s %v", c.name, c.args)
+	}
+	return nil
+}
+
+func (r *runRecorder) snapshot() []command {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]command(nil), r.cmds...)
+}
+
+// TestApplyTearsDownInterfaceOnMidPlanFailure pins the self-heal contract: when
+// a plan step after wg0 is created fails, Apply issues an ip link del wg0 so the
+// next reload rebuilds the interface rather than reconciling against a
+// half-configured one. The leading idempotency delete (before any add) does not
+// count; the teardown delete must follow the successful add.
+func TestApplyTearsDownInterfaceOnMidPlanFailure(t *testing.T) {
+	rec := &runRecorder{failOn: "wg"}
+
+	rc := RuntimeConfig{
+		WireGuard: WireGuard{
+			Address: "10.99.0.2/32",
+			Peer: Peer{
+				Endpoint:            "203.0.113.5:51820",
+				AllowedIPs:          []string{"10.99.0.1/32"},
+				PersistentKeepalive: 25,
+			},
+		},
+		Forwards: []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443}},
+	}
+	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
+
+	if err := Apply(context.Background(), rec.run, rc, "priv", "pub", resolve); err == nil {
+		t.Fatal("Apply should propagate the injected mid-plan failure")
+	}
+
+	cmds := rec.snapshot()
+	addIdx := indexOfCommand(cmds, "ip", "link", "add", "wg0", "type", "wireguard")
+	if addIdx < 0 {
+		t.Fatalf("expected wg0 to be created; recorded: %+v", cmds)
+	}
+	delIdx := indexOfCommand(cmds[addIdx+1:], "ip", "link", "del", "wg0")
+	if delIdx < 0 {
+		t.Fatalf("expected teardown ip link del wg0 after the add; recorded: %+v", cmds)
+	}
+}
+
+// indexOfCommand returns the index of the first command in cmds whose name and
+// args exactly match name and args, or -1 if none match.
+func indexOfCommand(cmds []command, name string, args ...string) int {
+	want := strings.Join(args, " ")
+	for i, c := range cmds {
+		if c.name == name && strings.Join(c.args, " ") == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// lookupCall records one invocation of the injected lookup function, capturing
+// the address family and host the resolver passes so a test can assert the query
+// is A-only and absolute.
+type lookupCall struct {
+	network string
+	host    string
+}
+
+// lookupResult is one scripted return from the injected lookup function.
+type lookupResult struct {
+	addrs []net.IP
+	err   error
+}
+
+// scriptedLookup returns a lookup stub that records every call and, on the i-th
+// call (0-based), returns results[i]. Indices past the script reuse the last
+// entry so a fully-failing script keeps failing. The recorder pointer lets the
+// test inspect the calls afterwards.
+func scriptedLookup(rec *[]lookupCall, results []lookupResult) func(context.Context, string, string) ([]net.IP, error) {
+	return func(_ context.Context, network, host string) ([]net.IP, error) {
+		*rec = append(*rec, lookupCall{network: network, host: host})
+		i := len(*rec) - 1
+		if i >= len(results) {
+			i = len(results) - 1
+		}
+		return results[i].addrs, results[i].err
+	}
+}
+
+// TestDefaultResolve pins the resolver contract that keeps a retarget from
+// blackholing the DNAT: queries are A-only and absolute so they skip the ndots
+// search-list walk, a transient failure or empty result is retried, exhausting
+// the retries fails loud, and ctx cancellation aborts the retry wait promptly.
+func TestDefaultResolve(t *testing.T) {
+	ok := lookupResult{addrs: []net.IP{net.ParseIP("10.96.1.10")}}
+	ipv6Only := lookupResult{addrs: []net.IP{net.ParseIP("fd00::1")}}
+	failed := lookupResult{err: fmt.Errorf("nxdomain")}
+	empty := lookupResult{}
+
+	tests := []struct {
+		name      string
+		host      string
+		results   []lookupResult
+		wantIP    string
+		wantErr   bool
+		wantCalls int
+		wantHost  string
+	}{
+		{
+			name:      "absolute_and_a_only_on_first_success",
+			host:      "web.default.svc.cluster.local",
+			results:   []lookupResult{ok},
+			wantIP:    "10.96.1.10",
+			wantCalls: 1,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+		{
+			name:      "already_absolute_host_not_double_dotted",
+			host:      "web.default.svc.cluster.local.",
+			results:   []lookupResult{ok},
+			wantIP:    "10.96.1.10",
+			wantCalls: 1,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+		{
+			name:      "retries_then_succeeds",
+			host:      "web.default.svc.cluster.local",
+			results:   []lookupResult{failed, empty, ok},
+			wantIP:    "10.96.1.10",
+			wantCalls: 3,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+		{
+			name:      "empty_result_is_retryable",
+			host:      "web.default.svc.cluster.local",
+			results:   []lookupResult{empty, ok},
+			wantIP:    "10.96.1.10",
+			wantCalls: 2,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+		{
+			name:      "ipv6_only_is_retryable_then_fails",
+			host:      "web.default.svc.cluster.local",
+			results:   []lookupResult{ipv6Only},
+			wantErr:   true,
+			wantCalls: resolveAttempts,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+		{
+			name:      "exhausts_attempts_then_errors",
+			host:      "web.default.svc.cluster.local",
+			results:   []lookupResult{failed},
+			wantErr:   true,
+			wantCalls: resolveAttempts,
+			wantHost:  "web.default.svc.cluster.local.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls []lookupCall
+			resolve := newResolver(scriptedLookup(&calls, tt.results))
+
+			ip, err := resolve(context.Background(), tt.host)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolve(%q) = %q, want error", tt.host, ip)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("resolve(%q): %v", tt.host, err)
+				}
+				if ip != tt.wantIP {
+					t.Errorf("ip = %q, want %q", ip, tt.wantIP)
+				}
+			}
+
+			if len(calls) != tt.wantCalls {
+				t.Fatalf("lookup call count = %d, want %d", len(calls), tt.wantCalls)
+			}
+			for i, c := range calls {
+				if c.network != "ip4" {
+					t.Errorf("call[%d] network = %q, want ip4", i, c.network)
+				}
+				if c.host != tt.wantHost {
+					t.Errorf("call[%d] host = %q, want %q", i, c.host, tt.wantHost)
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultResolveContextCancellationAborts pins that a cancelled context
+// breaks the retry wait promptly instead of sleeping out resolveRetryDelay. The
+// first lookup fails to push the resolver into the inter-attempt wait, the
+// context is already cancelled, so the call must return well inside one retry
+// delay with the context error.
+func TestDefaultResolveContextCancellationAborts(t *testing.T) {
+	var calls int
+	resolve := newResolver(func(_ context.Context, _, _ string) ([]net.IP, error) {
+		calls++
+		return nil, fmt.Errorf("nxdomain")
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	_, err := resolve(ctx, "web.default.svc.cluster.local")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("resolve should error when context is cancelled")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled in chain", err)
+	}
+	if calls != 1 {
+		t.Errorf("lookup call count = %d, want 1 (one attempt before the aborted wait)", calls)
+	}
+	if elapsed >= resolveRetryDelay {
+		t.Errorf("resolve took %v, want well under the %v retry delay", elapsed, resolveRetryDelay)
 	}
 }

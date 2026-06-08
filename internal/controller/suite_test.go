@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
-	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/api/v1alpha1"
+	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
 
 // testEnv bundles a running envtest control plane and a client wired to the
@@ -34,7 +34,7 @@ func gatewayCRDPath() string {
 	return filepath.Join("..", "..", "k8s", "charts", "wireguard-gateway-operator", "templates", "crds")
 }
 
-// setupEnvtest starts a control plane with the Gateway CRD plus minimal XGateway
+// setupEnvtest starts a control plane with the Gateway CRD plus minimal XGatewayGCP
 // and DNSEndpoint CRDs (the operator's unstructured children), and returns a
 // client on the operator scheme. It skips when KUBEBUILDER_ASSETS is unset, so a
 // machine without envtest assets falls through to the fake-client test instead of
@@ -55,7 +55,7 @@ func setupEnvtest(t *testing.T) *testEnv {
 		ErrorIfCRDPathMissing: true,
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{gatewayCRDPath()},
-			CRDs:  []*apiextensionsv1.CustomResourceDefinition{minimalXGatewayCRD(), minimalDNSEndpointCRD()},
+			CRDs:  []*apiextensionsv1.CustomResourceDefinition{minimalXGatewayGCPCRD(), minimalXGatewayNetworkCRD(), minimalDNSEndpointCRD()},
 		},
 	}
 
@@ -87,19 +87,50 @@ func preserveUnknownProps() *apiextensionsv1.JSONSchemaProps {
 	}
 }
 
-// minimalXGatewayCRD is a namespaced CRD matching the composite's GVK with an
+// minimalXGatewayGCPCRD is a namespaced CRD matching the composite's GVK with an
 // open schema and a status subresource, enough for the reconciler to create the
 // composite and read a patched status.
-func minimalXGatewayCRD() *apiextensionsv1.CustomResourceDefinition {
+func minimalXGatewayGCPCRD() *apiextensionsv1.CustomResourceDefinition {
 	return &apiextensionsv1.CustomResourceDefinition{
-		ObjectMeta: metav1.ObjectMeta{Name: "xgateways.infra.wgnet.dev"},
+		ObjectMeta: metav1.ObjectMeta{Name: "xgatewaygcps.infra.wgnet.dev"},
 		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
 			Group: "infra.wgnet.dev",
 			Names: apiextensionsv1.CustomResourceDefinitionNames{
-				Kind:     "XGateway",
-				ListKind: "XGatewayList",
-				Plural:   "xgateways",
-				Singular: "xgateway",
+				Kind:     "XGatewayGCP",
+				ListKind: "XGatewayGCPList",
+				Plural:   "xgatewaygcps",
+				Singular: "xgatewaygcp",
+			},
+			Scope: apiextensionsv1.NamespaceScoped,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+				Name:    "v1alpha1",
+				Served:  true,
+				Storage: true,
+				Schema: &apiextensionsv1.CustomResourceValidation{
+					OpenAPIV3Schema: preserveUnknownProps(),
+				},
+				Subresources: &apiextensionsv1.CustomResourceSubresources{
+					Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+				},
+			}},
+		},
+	}
+}
+
+// minimalXGatewayNetworkCRD is a namespaced CRD matching the shared-network
+// composite's GVK with an open schema and a status subresource, enough for the
+// reconciler to apply the singleton network and for the refcount teardown to read
+// and delete it.
+func minimalXGatewayNetworkCRD() *apiextensionsv1.CustomResourceDefinition {
+	return &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: "xgatewaynetworks.infra.wgnet.dev"},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "infra.wgnet.dev",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Kind:     "XGatewayNetwork",
+				ListKind: "XGatewayNetworkList",
+				Plural:   "xgatewaynetworks",
+				Singular: "xgatewaynetwork",
 			},
 			Scope: apiextensionsv1.NamespaceScoped,
 			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{

@@ -1,22 +1,10 @@
-{{- /* The WireGuard-key Secret named by spec.wgKeySecretRef must live in the XGateway's namespace; secretDataSecretRef resolves there. */ -}}
+{{- /* The WireGuard-key Secret named by spec.wgKeySecretRef must live in the XGatewayGCP's namespace; secretDataSecretRef resolves there. */ -}}
 {{- $xr := .observed.composite.resource -}}
 {{- $spec := $xr.spec -}}
 {{- $region := $spec.region -}}
 {{- $reservedIP := dig "reservedIP" false $spec -}}
 {{- $saEmail := dig "status" "atProvider" "email" "" (getComposedResource . "service-account") -}}
 {{- $addressIP := dig "status" "atProvider" "address" "" (getComposedResource . "address") -}}
-{{- $subnetReady := false -}}
-{{- range (dig "status" "conditions" (list) (getComposedResource . "subnetwork")) -}}
-{{- if and (eq (dig "type" "" .) "Ready") (eq (dig "status" "" .) "True") -}}
-{{- $subnetReady = true -}}
-{{- end -}}
-{{- end -}}
-{{- $networkReady := false -}}
-{{- range (dig "status" "conditions" (list) (getComposedResource . "network")) -}}
-{{- if and (eq (dig "type" "" .) "Ready") (eq (dig "status" "" .) "True") -}}
-{{- $networkReady = true -}}
-{{- end -}}
-{{- end -}}
 {{- $tcpPorts := list -}}
 {{- $udpPorts := list (toString $spec.wgListenPort) -}}
 {{- range (dig "allowedPorts" (list) $spec) -}}
@@ -38,38 +26,8 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- $instanceReady := and (ne $saEmail "") $subnetReady (or (not $reservedIP) (ne $addressIP "")) -}}
----
-apiVersion: compute.gcp.m.upbound.io/v1beta1
-kind: Network
-metadata:
-  annotations:
-    gotemplating.fn.crossplane.io/composition-resource-name: network
-spec:
-  forProvider:
-    autoCreateSubnetworks: false
-  providerConfigRef:
-    name: default
-    kind: ClusterProviderConfig
-{{- if $networkReady }}
----
-apiVersion: compute.gcp.m.upbound.io/v1beta1
-kind: Subnetwork
-metadata:
-  annotations:
-    gotemplating.fn.crossplane.io/composition-resource-name: subnetwork
-spec:
-  forProvider:
-    ipCidrRange: {{ $spec.subnetCIDR | quote }}
-    region: {{ $region | quote }}
-    privateIpGoogleAccess: true
-    networkSelector:
-      matchControllerRef: true
-  providerConfigRef:
-    name: default
-    kind: ClusterProviderConfig
-{{- end }}
-{{- if $networkReady }}
+{{- $instanceReady := and (ne $saEmail "") (or (not $reservedIP) (ne $addressIP "")) -}}
+{{- if ne $saEmail "" }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1
 kind: Firewall
@@ -81,8 +39,9 @@ spec:
     direction: INGRESS
     sourceRanges:
       - 0.0.0.0/0
-    networkSelector:
-      matchControllerRef: true
+    network: {{ $spec.sharedNetworkName | quote }}
+    targetServiceAccounts:
+      - {{ $saEmail | quote }}
     allow:
       {{- if gt (len $tcpPorts) 0 }}
       - protocol: tcp
@@ -96,7 +55,6 @@ spec:
           {{- range $udpPorts }}
           - {{ . | quote }}
           {{- end }}
-      - protocol: icmp
   providerConfigRef:
     name: default
     kind: ClusterProviderConfig
@@ -199,11 +157,23 @@ spec:
       {{- if ne (dig "secretId" "" $spec) "" }}
       secret-id: {{ $spec.secretId | quote }}
       {{- end }}
+      wg-listen-port: {{ $spec.wgListenPort | toString | quote }}
+      {{- if ne (dig "wgGatewayAddress" "" $spec) "" }}
+      wg-gateway-address: {{ $spec.wgGatewayAddress | quote }}
+      {{- end }}
+      {{- if ne (dig "wgLinkAddress" "" $spec) "" }}
+      wg-link-address: {{ $spec.wgLinkAddress | quote }}
+      {{- end }}
+      {{- if ne (dig "wgSubnet" "" $spec) "" }}
+      wg-subnet: {{ $spec.wgSubnet | quote }}
+      {{- end }}
+      {{- if ne (dig "projectID" "" $spec) "" }}
+      project-id: {{ $spec.projectID | quote }}
+      {{- end }}
       disable-legacy-endpoints: "true"
       block-project-ssh-keys: "true"
     networkInterface:
-      - subnetworkSelector:
-          matchControllerRef: true
+      - network: {{ $spec.sharedNetworkName | quote }}
         accessConfig:
           {{- if $reservedIP }}
           - natIp: {{ $addressIP | quote }}
@@ -226,7 +196,7 @@ spec:
 {{- end }}
 ---
 apiVersion: infra.wgnet.dev/v1alpha1
-kind: XGateway
+kind: XGatewayGCP
 status:
   {{- if ne $address "" }}
   address: {{ $address | quote }}

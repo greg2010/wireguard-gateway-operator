@@ -2,10 +2,12 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -28,39 +30,82 @@ const dataPathDeadline = 90 * time.Second
 const deniedProbeTimeout = 8 * time.Second
 
 // probeTCPThroughGateway issues an HTTP GET to the gateway's public IP on the
-// forwarded TCP port and returns the body. agnhost netexec serves the serving
-// pod's name at /hostname, so a non-empty body is the marker proving the
-// request traversed gateway -> WireGuard tunnel -> in-cluster echo pod.
+// primary forwarded TCP port and returns the body.
 func probeTCPThroughGateway(ctx context.Context, stack *e2eharness.Stack) (string, error) {
-	authority := net.JoinHostPort(stack.Address, strconv.Itoa(stack.TCPPublicPort))
-	url := fmt.Sprintf("http://%s/hostname", authority)
-	client := &http.Client{Timeout: 5 * time.Second}
+	return probeTCPThroughGatewayPort(ctx, stack, stack.TCPPublicPort)
+}
 
+// probeTCPThroughGatewayPort issues an HTTP GET to the gateway's public IP on the
+// given forwarded TCP port and returns the body. agnhost netexec serves the
+// serving pod's name at /hostname, so a non-empty body is the marker proving the
+// request traversed gateway -> WireGuard tunnel -> in-cluster echo pod. It takes
+// an explicit port so subtests can target the NodePort, cross-namespace, and
+// live-added forwards beyond the primary one.
+func probeTCPThroughGatewayPort(ctx context.Context, stack *e2eharness.Stack, port int) (string, error) {
+	return probeTCPThroughGatewayPortUntil(ctx, stack, port, dataPathDeadline)
+}
+
+// probeTCPThroughGatewayPortUntil is probeTCPThroughGatewayPort with an explicit
+// retry budget. A forward added or edited after the gateway flips Ready is not
+// visible on the data path until the link applies the new nftables rule, and the
+// readiness gate (WireGuard handshake freshness) does not trail that apply. Probes
+// of a just-changed forward must therefore allow the same edit/lifecycle budget the
+// suite gives a Ready-after-edit wait, not the shorter dataPathDeadline that assumes
+// the rule is already in place.
+func probeTCPThroughGatewayPortUntil(ctx context.Context, stack *e2eharness.Stack, port int, deadline time.Duration) (string, error) {
 	var body string
-	err := retryUntil(ctx, dataPathDeadline, func(ctx context.Context) error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return fmt.Errorf("build request: %w", err)
-		}
-		resp, err := client.Do(req)
+	err := retryUntil(ctx, deadline, func(ctx context.Context) error {
+		marker, err := httpMarker(ctx, stack, port)
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
-		}
-		body = strings.TrimSpace(string(raw))
+		body = marker
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("tcp probe %s: %w", url, err)
+		return "", fmt.Errorf("tcp probe %s: %w", markerURL(stack, port), err)
 	}
 	return body, nil
+}
+
+// httpMarker issues one HTTP GET to the gateway's public IP on port and returns
+// the trimmed body, the agnhost /hostname serving-pod marker. It is the single
+// source of truth for the data-path request, shared by probeTCPThroughGatewayPort
+// (which retries it to deadline) and probeUntilMarkerChanges (which polls it for a
+// changed marker). A non-200 or transport error is returned so a caller's retry
+// loop keeps polling.
+func httpMarker(ctx context.Context, stack *e2eharness.Stack, port int) (string, error) {
+	url := markerURL(stack, port)
+	// Disable keep-alives so every poll dials a fresh connection rather than
+	// reusing http.DefaultTransport's shared pool, which could mask a data-path
+	// failure by reusing a connection established before a retarget.
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// markerURL builds the agnhost /hostname URL for the gateway's public IP on port.
+func markerURL(stack *e2eharness.Stack, port int) string {
+	authority := net.JoinHostPort(stack.Address, strconv.Itoa(port))
+	return fmt.Sprintf("http://%s/hostname", authority)
 }
 
 // probeUDPThroughGateway sends payload to the gateway's public IP on the forwarded
@@ -116,9 +161,14 @@ func probeTCPDenied(ctx context.Context, stack *e2eharness.Stack, port int) erro
 		conn.Close()
 		return fmt.Errorf("tcp connect to non-forwarded port %s succeeded; want it dropped", addr)
 	}
-	// Any non-success (timeout, or an unexpected refusal) means the port did not
-	// deliver a usable connection, which is the pass condition.
-	return nil
+	// Only a timeout proves the SYN was silently dropped by the firewall. A
+	// non-timeout error such as connection refused (RST) means the port was
+	// reachable but closed, a different posture that must fail the assertion.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return nil
+	}
+	return fmt.Errorf("tcp connect to non-forwarded port %s failed without timing out (want a dropped SYN, got: %w)", addr, err)
 }
 
 // probeUDPDenied asserts that a UDP datagram sent to the gateway's public IP on
@@ -159,6 +209,104 @@ func probeUDPDenied(ctx context.Context, stack *e2eharness.Stack, port int, payl
 		return nil
 	}
 	return fmt.Errorf("udp reply from non-forwarded port %s: %q; want no reply", addr, strings.TrimSpace(string(buf[:n])))
+}
+
+// waitPortDenied polls probeTCPDenied until the port is dropped at the firewall or
+// deadline elapses, returning the last probe error on timeout. A lifecycle subtest
+// that removes or invalidates a forward needs this rather than a single
+// probeTCPDenied: closing the forward re-renders the GCP firewall, whose change
+// takes time to propagate, so the port stays briefly reachable after the operator
+// has re-rendered. The retry waits out that propagation; once the port is closed,
+// probeTCPDenied returns nil and the assertion passes.
+func waitPortDenied(ctx context.Context, stack *e2eharness.Stack, port int, deadline time.Duration) error {
+	dctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	var last error
+	for {
+		last = probeTCPDenied(dctx, stack, port)
+		if last == nil {
+			return nil
+		}
+		select {
+		case <-dctx.Done():
+			return fmt.Errorf("port %d still reachable after %s: %w", port, deadline, last)
+		case <-ticker.C:
+		}
+	}
+}
+
+// pingDenied asserts that an ICMP echo to the gateway's public IP draws NO reply
+// within deniedProbeTimeout. The GCP firewall no longer allows internet-wide
+// ICMP, so a single echo request is dropped.
+//
+// The pass signal is proof that ping actually sent a probe and got nothing back,
+// distinguished from ping failing to run at all. A clean exit means a reply came
+// back (the firewall re-opened ICMP) and must fail. A non-zero exit is ambiguous
+// on its own: every ping variant exits non-zero both on a legitimate no-reply
+// timeout and on a startup error (missing binary, no CAP_NET_RAW / unprivileged
+// ping permission, a rejected flag), and a probe that never left the host proves
+// nothing. So the transmit/receive summary line ("N packets transmitted, 0 ...
+// received") is the authoritative "ran but got no reply" marker; its absence on a
+// non-zero exit means ping never probed and the test must fail rather than read a
+// broken ping host as a drop. A context-deadline kill is also a pass: the run was
+// in flight (it transmitted) and our timeout cut it off before any reply, which is
+// the same no-reply outcome for a ping variant that ignores -W.
+func pingDenied(ctx context.Context, stack *e2eharness.Stack) error {
+	dctx, cancel := context.WithTimeout(ctx, deniedProbeTimeout)
+	defer cancel()
+
+	// -c 1 sends one echo request; -W bounds the per-reply wait (whole seconds);
+	// -n skips reverse DNS so the run never blocks on a resolver. The context is the
+	// outer bound for a variant that ignores -W.
+	waitSecs := strconv.Itoa(int(deniedProbeTimeout / time.Second))
+	out, err := exec.CommandContext(dctx, "ping", "-c", "1", "-W", waitSecs, "-n", stack.Address).CombinedOutput()
+	trimmed := strings.TrimSpace(string(out))
+	if err == nil {
+		return fmt.Errorf("icmp echo to %s got a reply; want it dropped:\n%s", stack.Address, trimmed)
+	}
+	if pingTransmittedNoReply(trimmed) || dctx.Err() == context.DeadlineExceeded {
+		return nil
+	}
+	return fmt.Errorf("ping to %s did not run as expected (no probe sent, so the ICMP drop is unproven); err=%v, output:\n%s", stack.Address, err, trimmed)
+}
+
+// pingTransmittedNoReply reports whether out carries ping's end-of-run summary
+// showing a probe was transmitted and zero replies came back. iputils prints
+// "1 packets transmitted, 0 received"; BSD/macOS prints "1 packets transmitted,
+// 0 packets received". Matching the transmitted count plus zero received is the
+// portable marker that ping ran a probe and was dropped, as opposed to exiting
+// before it sent anything.
+func pingTransmittedNoReply(out string) bool {
+	return strings.Contains(out, "packets transmitted") &&
+		(strings.Contains(out, "0 received") || strings.Contains(out, "0 packets received"))
+}
+
+// probeUntilMarkerChanges polls the data path until the marker differs from
+// before (non-empty), bounded by deadline; proves continuity + convergence to a
+// fresh pod across a backend roll where the old pod can briefly stay in endpoints.
+//
+// It uses retryUntil so each attempt is one httpMarker GET; an unchanged marker
+// is returned as an error to keep polling. before must be non-empty (the
+// pre-roll marker), so the first fresh pod's distinct name satisfies the change.
+func probeUntilMarkerChanges(ctx context.Context, stack *e2eharness.Stack, port int, before string, deadline time.Duration) (string, error) {
+	var after string
+	err := retryUntil(ctx, deadline, func(ctx context.Context) error {
+		marker, err := httpMarker(ctx, stack, port)
+		if err != nil {
+			return err
+		}
+		if marker == before {
+			return fmt.Errorf("marker still %q; want a fresh pod", before)
+		}
+		after = marker
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("tcp probe %s: %w", markerURL(stack, port), err)
+	}
+	return after, nil
 }
 
 // retryUntil invokes fn every second until it returns nil or deadline elapses,

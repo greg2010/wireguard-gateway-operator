@@ -8,7 +8,6 @@ rules:
   - ""
   resources:
   - configmaps
-  - serviceaccounts
   verbs:
   - create
   - delete
@@ -24,6 +23,15 @@ rules:
   verbs:
   - create
   - patch
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - services
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -69,7 +77,8 @@ rules:
 - apiGroups:
   - infra.wgnet.dev
   resources:
-  - xgateways
+  - xgatewaygcps
+  - xgatewaynetworks
   verbs:
   - create
   - delete
@@ -81,26 +90,14 @@ rules:
 - apiGroups:
   - infra.wgnet.dev
   resources:
-  - xgateways/status
+  - xgatewaygcps/status
+  - xgatewaynetworks/status
   verbs:
   - get
 - apiGroups:
   - networking.k8s.io
   resources:
   - networkpolicies
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
-  - rolebindings
-  - roles
   verbs:
   - create
   - delete

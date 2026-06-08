@@ -56,6 +56,13 @@ spec:
                   to in-cluster pods.
                 items:
                   properties:
+                    namespace:
+                      description: |-
+                        Namespace of the target Service. Defaults to the Gateway's namespace.
+                        Cross-namespace forwards require the target namespace to carry the opt-in
+                        label.
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
                     port:
                       description: |-
                         Port is the public port opened on the gateway VM and DNAT'd through the
@@ -73,9 +80,12 @@ spec:
                       type: string
                     service:
                       description: |-
-                        Service is the in-cluster Service DNS name the link DNATs the public port
-                        to.
+                        Service is the bare in-cluster Service name (not an FQDN); see Namespace for
+                        cross-namespace targets. Constrained to a single DNS-1035 label so a
+                        dotted FQDN cannot be smuggled in to reach a Service the Namespace gate
+                        would otherwise govern.
                       minLength: 1
+                      pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     targetPort:
                       description: TargetPort is the port on Service; it defaults
@@ -89,30 +99,128 @@ spec:
                   - protocol
                   - service
                   type: object
+                maxItems: 64
                 type: array
               gcp:
                 properties:
+                  diskSizeGB:
+                    default: 20
+                    description: DiskSizeGB is the gateway VM boot disk size in GB.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  image:
+                    default: projects/kinvolk-public/global/images/family/flatcar-stable
+                    description: |-
+                      Image is the gateway VM boot image. The gateway boots Flatcar because its
+                      userData is Flatcar Ignition; this defaults to the GCP Flatcar stable family.
+                    type: string
                   machineType:
                     default: e2-small
+                    type: string
+                  projectID:
+                    description: |-
+                      ProjectID is the GCP project that owns the gateway VM and its Secret Manager
+                      secret. The boot keyfetch reads it from instance metadata to resolve the
+                      secret URL.
+                    minLength: 1
                     type: string
                   region:
                     minLength: 1
                     type: string
+                  reservedIP:
+                    default: true
+                    description: |-
+                      ReservedIP allocates a static external IP so the address survives an
+                      instance replace.
+                    type: boolean
+                  spot:
+                    default: false
+                    description: Spot runs the gateway VM as a preemptible spot instance.
+                    type: boolean
                   zone:
                     minLength: 1
                     type: string
                 required:
+                - projectID
                 - region
                 - zone
+                type: object
+              provider:
+                default: gcp
+                description: |-
+                  Provider selects the provider-specific Crossplane Composition that
+                  provisions the gateway VM, matched by the composite's compositionSelector.
+                  Only gcp is supported today.
+                enum:
+                - gcp
+                type: string
+              wireguard:
+                default: {}
+                description: |-
+                  Wireguard carries the provider-agnostic WireGuard tunnel parameters. Every
+                  value defaults via the CRD, so the block may be omitted to get the standard
+                  tunnel.
+                properties:
+                  gatewayAddress:
+                    default: 10.99.0.1
+                    description: GatewayAddress is the gateway VM's wg0 address (without
+                      CIDR suffix).
+                    pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                    type: string
+                  keepalive:
+                    default: 25
+                    description: Keepalive is the link's persistent-keepalive interval
+                      in seconds.
+                    format: int32
+                    type: integer
+                  linkAddress:
+                    default: 10.99.0.2
+                    description: LinkAddress is the link end's wg0 address (without
+                      CIDR suffix).
+                    pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                    type: string
+                  listenPort:
+                    default: 51820
+                    description: ListenPort is the gateway VM's WireGuard UDP listen
+                      port.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  mtu:
+                    default: 1380
+                    description: MTU is the link's wg0 MTU.
+                    format: int32
+                    type: integer
+                  reconcileInterval:
+                    default: 10s
+                    description: ReconcileInterval is how often the link re-reads
+                      the XGatewayGCP address.
+                    type: string
+                  subnet:
+                    default: 10.99.0.0/29
+                    description: |-
+                      Subnet is the tunnel CIDR; its suffix sizes both interface addresses and it
+                      is the peer's sole allowed IP range.
+                    pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/(3[0-2]|[12]?[0-9])$
+                    type: string
                 type: object
             required:
             - gcp
             type: object
+            x-kubernetes-validations:
+            - message: each forward must use a unique port and protocol combination
+              rule: '!has(self.forwards) || self.forwards.all(f1, self.forwards.exists_one(f2,
+                f2.port == f1.port && f2.protocol == f1.protocol))'
+            - message: a UDP forward must not use the WireGuard listen port (spec.wireguard.listenPort)
+              rule: '!has(self.forwards) || self.forwards.all(f, !(f.protocol == ''UDP''
+                && f.port == self.wireguard.listenPort))'
           status:
             properties:
               address:
                 description: Address is the gateway VM's public ingress IP, mirrored
-                  from the XGateway.
+                  from the XGatewayGCP.
                 type: string
               conditions:
                 items:

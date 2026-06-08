@@ -135,9 +135,9 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 }
 
 func TestEmptyPeerEndpointAllowed(t *testing.T) {
-	// The reconcile loop supplies the endpoint at runtime from
-	// XGateway.status.address, so an absent endpoint in the on-disk config must
-	// validate. The wg0 address is still required.
+	// The operator writes the endpoint into the mounted config file once it
+	// observes the gateway address, so an absent endpoint in the on-disk config
+	// must still validate. The wg0 address is required regardless.
 	body := `{"wireguard":{"address":"10.0.0.2/32","peer":{"allowedIPs":["10.99.0.1/32"]}}}`
 	path := writeRuntimeConfig(t, body)
 	rc, err := LoadRuntimeConfig(path)

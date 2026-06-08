@@ -1,4 +1,6 @@
-table inet cyno {
+add table inet gateway
+flush table inet gateway
+table inet gateway {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
 {{- range $f := . }}

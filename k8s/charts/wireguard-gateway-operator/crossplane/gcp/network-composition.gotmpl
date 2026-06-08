@@ -1,0 +1,14 @@
+{{- $spec := .observed.composite.resource.spec -}}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Network
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: network
+    crossplane.io/external-name: {{ $spec.name | quote }}
+spec:
+  forProvider:
+    autoCreateSubnetworks: true
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig

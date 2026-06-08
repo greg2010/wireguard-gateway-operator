@@ -45,6 +45,15 @@ Call with (dict "ctx" . "component" "<component>").
 {{- end }}
 
 {{/*
+Shared GCP VPC name. Release-derived (unlike the chart-name-based component
+names) because the VPC is a GCP-global resource: clusters sharing one project
+must not collide. An explicit operator.sharedNetworkName pins it.
+*/}}
+{{- define "wireguard-gateway-operator.sharedNetworkName" -}}
+{{- .Values.operator.sharedNetworkName | default (printf "wgnet-%s" .Release.Name) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
 Operator container image reference (repository:tag). Runs the manager.
 */}}
 {{- define "wireguard-gateway-operator.operatorImage" -}}

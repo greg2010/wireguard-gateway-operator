@@ -2,98 +2,34 @@ package link
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	dynamicfake "k8s.io/client-go/dynamic/fake"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
-// testLogger returns a no-op sugared logger; reconcile's logging is incidental
-// to its behaviour, so tests do not assert on log output.
+// testLogger returns a no-op sugared logger; the reload loop's logging is
+// incidental to its behaviour, so tests do not assert on log output.
 func testLogger(t *testing.T) *zap.SugaredLogger {
 	t.Helper()
 	return zap.NewNop().Sugar()
 }
 
-var xgatewayGVK = xgatewayGVR.GroupVersion().WithKind("XGateway")
-
-// newFakeDynamic builds a dynamic fake client that knows the XGateway GVR->List
-// mapping and is seeded with objs. The list kind is pinned and objects are
-// seeded through the tracker under xgatewayGVR explicitly: the fake client's
-// preset path guesses the resource name from the kind, and that heuristic
-// pluralizes "XGateway" to "xgatewaies" rather than the real "xgateways",
-// which would file seeds under a GVR no client call ever reads.
-func newFakeDynamic(t *testing.T, objs ...*unstructured.Unstructured) dynamic.Interface {
+// observedLogger returns a sugared logger backed by an in-memory observer so a
+// test can assert on emitted log entries, paired with the recorded logs.
+func observedLogger(t testing.TB) (*zap.SugaredLogger, *observer.ObservedLogs) {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	scheme.AddKnownTypeWithName(xgatewayGVK, &unstructured.Unstructured{})
-	scheme.AddKnownTypeWithName(xgatewayGVR.GroupVersion().WithKind("XGatewayList"), &unstructured.UnstructuredList{})
-	c := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
-		scheme,
-		map[schema.GroupVersionResource]string{
-			xgatewayGVR: "XGatewayList",
-		},
-	)
-	for _, obj := range objs {
-		if err := c.Tracker().Create(xgatewayGVR, obj, obj.GetNamespace()); err != nil {
-			t.Fatalf("seed xgateway %s/%s: %v", obj.GetNamespace(), obj.GetName(), err)
-		}
-	}
-	return c
+	core, logs := observer.New(zapcore.DebugLevel)
+	return zap.New(core).Sugar(), logs
 }
 
-// newXGateway builds an unstructured XGateway in ns/name. When address is
-// non-empty it is set at status.address; otherwise no status is written, to
-// model the case where the provision Job has not yet observed the gateway's IP.
-func newXGateway(ns, name, address string) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": xgatewayGVR.GroupVersion().String(),
-		"kind":       "XGateway",
-		"metadata": map[string]any{
-			"name":      name,
-			"namespace": ns,
-		},
-	}}
-	if address != "" {
-		_ = unstructured.SetNestedField(u.Object, address, "status", "address")
-	}
-	return u
-}
-
-// ipSource is an injectable readIP backing store: a mutex-guarded string and
-// optional error the reconcile loop reads each tick. Tests mutate it to model
-// the XGateway transitioning from unprovisioned to provisioned, or its IP
-// changing, without driving a fake dynamic client through the loop.
-type ipSource struct {
-	mu  sync.Mutex
-	ip  string
-	err error
-}
-
-func newIPSource(ip string) *ipSource {
-	return &ipSource{ip: ip}
-}
-
-func (s *ipSource) set(ip string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.ip = ip
-}
-
-func (s *ipSource) read(_ context.Context) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ip, s.err
-}
-
-// applyRecorder is an injectable applyFunc that records the peer endpoint of
-// each apply and signals each call on a channel so tests can wait deterministically
+// applyRecorder is an injectable applyFunc that records the peer endpoint of each
+// apply and signals each call on a channel so tests can wait deterministically
 // rather than sleeping. It never shells out.
 type applyRecorder struct {
 	mu        sync.Mutex
@@ -141,159 +77,279 @@ func assertNoApply(t *testing.T, r *applyRecorder, d time.Duration) {
 	}
 }
 
-func testRuntimeConfig() RuntimeConfig {
-	return RuntimeConfig{
+// configJSON renders a RuntimeConfig JSON body with the given endpoint and a
+// single forward, the on-disk shape watchAndReload reads. An empty endpoint
+// models the operator not having observed the gateway address yet.
+func configJSON(endpoint, service string) string {
+	ep := ""
+	if endpoint != "" {
+		ep = `"endpoint":"` + endpoint + `",`
+	}
+	return `{"wireguard":{"address":"10.99.0.2/32","peer":{` + ep +
+		`"allowedIPs":["10.99.0.1/32"],"persistentKeepalive":25}},` +
+		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","service":"` + service +
+		`","targetPort":8443}]}`
+}
+
+// writeConfig writes body to path with 0600 perms, failing the test on error.
+func writeConfig(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config %s: %v", path, err)
+	}
+}
+
+// startWatchAndReload writes an initial config file, starts watchAndReload in a
+// goroutine against the file's directory, and returns the config path, a cancel
+// func, and a done channel carrying the loop's return value so tests can assert
+// it does not exit early and observe its final error.
+func startWatchAndReload(t *testing.T, body string, r *applyRecorder) (string, context.CancelFunc, <-chan error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfig(t, path, body)
+
+	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchAndReload(ctx, cfg, "priv", "pub", r.apply, testLogger(t))
+	}()
+	return path, cancel, done
+}
+
+func TestWatchAndReloadInitialApply(t *testing.T) {
+	rec := newApplyRecorder()
+	_, cancel, done := startWatchAndReload(t, configJSON("203.0.113.5:51820", "web.default.svc"), rec)
+	defer cancel()
+
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("initial apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+	// An unchanged config must not re-apply on the safety-net ticks.
+	assertNoApply(t, rec, 100*time.Millisecond)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
+func TestWatchAndReloadEndpointChange(t *testing.T) {
+	rec := newApplyRecorder()
+	path, cancel, done := startWatchAndReload(t, configJSON("203.0.113.5:51820", "web.default.svc"), rec)
+	defer cancel()
+
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("initial apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+
+	writeConfig(t, path, configJSON("203.0.113.9:51820", "web.default.svc"))
+
+	if ep := waitApply(t, rec); ep != "203.0.113.9:51820" {
+		t.Fatalf("post-change apply endpoint = %q, want 203.0.113.9:51820", ep)
+	}
+	assertNoApply(t, rec, 100*time.Millisecond)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
+func TestWatchAndReloadForwardsChange(t *testing.T) {
+	rec := newApplyRecorder()
+	path, cancel, done := startWatchAndReload(t, configJSON("203.0.113.5:51820", "web.default.svc"), rec)
+	defer cancel()
+
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("initial apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+
+	// Endpoint unchanged, forwards changed: the digest differs, so it must re-apply.
+	writeConfig(t, path, configJSON("203.0.113.5:51820", "api.default.svc"))
+
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("post-forwards-change apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+	assertNoApply(t, rec, 100*time.Millisecond)
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
+func TestWatchAndReloadEmptyEndpointWaits(t *testing.T) {
+	rec := newApplyRecorder()
+	path, cancel, done := startWatchAndReload(t, configJSON("", "web.default.svc"), rec)
+	defer cancel()
+
+	// No endpoint yet: the loop must wait across several safety-net ticks, not
+	// apply or exit.
+	assertNoApply(t, rec, 150*time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("watchAndReload exited while waiting for endpoint: %v", err)
+	default:
+	}
+
+	// Once the operator fills the endpoint in, the next reload applies.
+	writeConfig(t, path, configJSON("203.0.113.5:51820", "web.default.svc"))
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("apply endpoint after endpoint appears = %q, want 203.0.113.5:51820", ep)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
+func TestWatchAndReloadCancelReturnsNil(t *testing.T) {
+	rec := newApplyRecorder()
+	_, cancel, done := startWatchAndReload(t, configJSON("203.0.113.5:51820", "web.default.svc"), rec)
+	defer cancel()
+
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("initial apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("watchAndReload returned %v on cancel, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchAndReload did not return after cancel")
+	}
+}
+
+func TestConfigDigestStableAndSensitive(t *testing.T) {
+	base := RuntimeConfig{
 		WireGuard: WireGuard{
 			Address: "10.99.0.2/32",
 			Peer: Peer{
+				Endpoint:            "203.0.113.5:51820",
 				AllowedIPs:          []string{"10.99.0.1/32"},
 				PersistentKeepalive: 25,
 			},
 		},
+		Forwards: []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web", TargetPort: 8443}},
+	}
+
+	d1, err := configDigest(base)
+	if err != nil {
+		t.Fatalf("configDigest: %v", err)
+	}
+	d2, err := configDigest(base)
+	if err != nil {
+		t.Fatalf("configDigest: %v", err)
+	}
+	if d1 != d2 {
+		t.Errorf("digest not stable: %q then %q", d1, d2)
+	}
+
+	changed := base
+	changed.WireGuard.Peer.Endpoint = "203.0.113.9:51820"
+	dc, err := configDigest(changed)
+	if err != nil {
+		t.Fatalf("configDigest: %v", err)
+	}
+	if dc == d1 {
+		t.Errorf("endpoint change produced identical digest %q", d1)
 	}
 }
 
-// startReconcile runs reconcile in a goroutine with an injected readIP and
-// returns a cancel func plus a done channel carrying its return value, so tests
-// can assert it does not exit early and observe its final error.
-func startReconcile(t *testing.T, readIP func(context.Context) (string, error), r *applyRecorder, interval time.Duration) (context.CancelFunc, <-chan error) {
+// eventually polls cond until it is true or the deadline passes, failing the
+// test on timeout with msg. It keeps the fsnotify assertions deterministic
+// without sleeping on a fixed duration.
+func eventually(t testing.TB, cond func() bool, msg string) {
 	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within deadline: %s", msg)
+}
+
+// TestWatchAndReloadReAddsWatchOnDirRemoval covers the watch-lost branch: when
+// the watched config directory is removed, the loop logs the loss, re-adds the
+// watch, and keeps functioning so a recreated config still drives an apply.
+//
+// inotify auto-drops the watch on IN_DELETE_SELF and the loop re-adds the
+// directory the instant it processes that event, when the directory may not yet
+// exist again; the re-add is therefore best-effort. The safety-net ticker is the
+// guaranteed recovery path in that case, so the interval is kept short enough to
+// backstop the recovery apply rather than at its production default. The
+// watch-lost warning is still attributed to the fsnotify path: the initial apply
+// is synchronous (it precedes the ticker loop) and directory removal delivers
+// IN_DELETE_SELF well inside one tick, so the warning is observed before any tick
+// could fire.
+func TestWatchAndReloadReAddsWatchOnDirRemoval(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "configdir")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir watched dir: %v", err)
+	}
+	path := filepath.Join(dir, "config.json")
+	writeConfig(t, path, configJSON("203.0.113.5:51820", "web.default.svc"))
+
+	rec := newApplyRecorder()
+	log, logs := observedLogger(t)
+	cfg := Config{ConfigPath: path, ReconcileInterval: 200 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
-	log := testLogger(t)
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- reconcile(ctx, testRuntimeConfig(), "priv", "pub", readIP, 51820, interval, r.apply, log)
+		done <- watchAndReload(ctx, cfg, "priv", "pub", rec.apply, log)
 	}()
-	return cancel, done
-}
-
-func TestReconcileEmptyThenPopulated(t *testing.T) {
-	src := newIPSource("")
-	rec := newApplyRecorder()
-	cancel, done := startReconcile(t, src.read, rec, 20*time.Millisecond)
-	defer cancel()
-
-	// No gateway IP yet: the loop must wait, not apply or exit.
-	assertNoApply(t, rec, 150*time.Millisecond)
-	select {
-	case err := <-done:
-		t.Fatalf("reconcile returned early while waiting for gateway ip: %v", err)
-	default:
-	}
-
-	src.set("203.0.113.5")
 
 	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
-		t.Fatalf("apply endpoint = %q, want 203.0.113.5:51820", ep)
+		t.Fatalf("initial apply endpoint = %q, want 203.0.113.5:51820", ep)
+	}
+
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove watched dir: %v", err)
+	}
+	eventually(t, func() bool {
+		return logs.FilterMessage("config dir watch lost, re-adding").Len() > 0
+	}, "expected a watch-lost warning after removing the watched dir")
+
+	// Recreate the dir with a changed config; the loop must recover and apply it,
+	// via either the re-added watch or the safety-net ticker.
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("recreate watched dir: %v", err)
+	}
+	writeConfig(t, path, configJSON("203.0.113.9:51820", "web.default.svc"))
+	if ep := waitRecoveryApply(t, rec, "203.0.113.9:51820"); ep != "203.0.113.9:51820" {
+		t.Fatalf("recovery apply endpoint = %q, want 203.0.113.9:51820", ep)
 	}
 
 	cancel()
 	if err := <-done; err != nil {
-		t.Fatalf("reconcile returned error on cancel: %v", err)
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
 	}
 }
 
-func TestReconcileIPChange(t *testing.T) {
-	src := newIPSource("203.0.113.5")
-	rec := newApplyRecorder()
-	cancel, done := startReconcile(t, src.read, rec, 20*time.Millisecond)
-	defer cancel()
-
-	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
-		t.Fatalf("first apply endpoint = %q, want 203.0.113.5:51820", ep)
-	}
-	// Unchanged IP must not re-apply.
-	assertNoApply(t, rec, 100*time.Millisecond)
-
-	src.set("203.0.113.9")
-
-	if ep := waitApply(t, rec); ep != "203.0.113.9:51820" {
-		t.Fatalf("second apply endpoint = %q, want 203.0.113.9:51820", ep)
-	}
-	assertNoApply(t, rec, 100*time.Millisecond)
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("reconcile returned error on cancel: %v", err)
-	}
-}
-
-func TestReconcileIdempotentUnchanged(t *testing.T) {
-	src := newIPSource("203.0.113.5")
-	rec := newApplyRecorder()
-	cancel, done := startReconcile(t, src.read, rec, 20*time.Millisecond)
-	defer cancel()
-
-	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
-		t.Fatalf("apply endpoint = %q, want 203.0.113.5:51820", ep)
-	}
-	// Several more ticks with an unchanged IP must produce no further applies.
-	assertNoApply(t, rec, 200*time.Millisecond)
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("reconcile returned error on cancel: %v", err)
-	}
-
-	if got := rec.snapshot(); len(got) != 1 {
-		t.Fatalf("apply count = %d (%v), want exactly 1", len(got), got)
-	}
-}
-
-func TestReconcileNotFoundTolerated(t *testing.T) {
-	// readIP perpetually reports the gateway as unobserved (the not-found case
-	// collapses to "" at the reader); the loop must wait, never apply or exit.
-	src := newIPSource("")
-	rec := newApplyRecorder()
-	cancel, done := startReconcile(t, src.read, rec, 20*time.Millisecond)
-	defer cancel()
-
-	assertNoApply(t, rec, 200*time.Millisecond)
-	select {
-	case err := <-done:
-		t.Fatalf("reconcile exited while gateway ip unobserved: %v", err)
-	default:
-	}
-
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatalf("reconcile returned error on cancel: %v", err)
-	}
-}
-
-func TestReadGatewayIP(t *testing.T) {
-	tcs := []struct {
-		name string
-		seed []*unstructured.Unstructured
-		want string
-	}{
-		{
-			name: "present",
-			seed: []*unstructured.Unstructured{newXGateway("cyno-system", "gateway", "203.0.113.5")},
-			want: "203.0.113.5",
-		},
-		{
-			name: "empty_status",
-			seed: []*unstructured.Unstructured{newXGateway("cyno-system", "gateway", "")},
-			want: "",
-		},
-		{
-			name: "not_found",
-			seed: nil,
-			want: "",
-		},
-	}
-
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			dyn := newFakeDynamic(t, tc.seed...)
-			got, err := readGatewayIP(context.Background(), dyn, "gateway", "cyno-system")
-			if err != nil {
-				t.Fatalf("readGatewayIP: %v", err)
+// waitRecoveryApply drains apply notifications until it sees want or the deadline
+// passes. After a directory-removal recovery a stale-config apply may precede the
+// recreated config's apply, so a single waitApply could observe the wrong
+// endpoint; this skips intermediate endpoints and waits for the expected one.
+func waitRecoveryApply(t testing.TB, r *applyRecorder, want string) string {
+	t.Helper()
+	deadline := time.After(4 * time.Second)
+	for {
+		select {
+		case ep := <-r.calls:
+			if ep == want {
+				return ep
 			}
-			if got != tc.want {
-				t.Fatalf("address = %q, want %q", got, tc.want)
-			}
-		})
+		case <-deadline:
+			t.Fatalf("timed out waiting for recovery apply %q; recorded so far: %v", want, r.snapshot())
+			return ""
+		}
 	}
 }

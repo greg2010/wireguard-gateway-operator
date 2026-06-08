@@ -1,13 +1,13 @@
 apiVersion: apiextensions.crossplane.io/v2
 kind: CompositeResourceDefinition
 metadata:
-  name: xgateways.infra.wgnet.dev
+  name: xgatewaygcps.infra.wgnet.dev
 spec:
   scope: Namespaced
   group: infra.wgnet.dev
   names:
-    kind: XGateway
-    plural: xgateways
+    kind: XGatewayGCP
+    plural: xgatewaygcps
   versions:
     - name: v1alpha1
       served: true
@@ -26,12 +26,13 @@ spec:
                 diskSizeGB: { type: integer }
                 spot: { type: boolean }
                 userData: { type: string }
-                subnetCIDR: { type: string }
+                sharedNetworkName: { type: string }
                 reservedIP: { type: boolean }
-                dnsHostnames:
-                  type: array
-                  items: { type: string }
+                projectID: { type: string }
                 wgListenPort: { type: integer }
+                wgGatewayAddress: { type: string }
+                wgLinkAddress: { type: string }
+                wgSubnet: { type: string }
                 allowedPorts:
                   type: array
                   items:
@@ -48,7 +49,7 @@ spec:
                     name: { type: string }
                     key: { type: string }
                   required: [name, key]
-              required: [region, zone, machineType, subnetCIDR, wgListenPort]
+              required: [region, zone, machineType, sharedNetworkName, wgListenPort]
             status:
               type: object
               properties:

@@ -12,16 +12,17 @@ import (
 
 // operatorValues is the subset of the wireguard-gateway-operator chart values the
 // e2e overlay sets. It is written to a temp file and passed to helm as -f,
-// layered over the chart's own values.yaml. The chart installs the operator (not
-// per-Gateway resources), so the overlay only sets the run's images, the GCP
-// project, and a run-unique name prefix; every per-Gateway field (gcp region/zone,
-// forwards, dnsHostnames) is expressed on the Gateway CR the suite creates, not
-// here. WG params (incl. listenPort) keep their chart defaults.
+// layered over the chart's own values.yaml. The chart installs the operator once
+// per cluster: the overlay sets the run's images and pins nameOverride so the
+// operator Deployment has a deterministic name the suite waits on. The operator is
+// always cluster-scoped, so the one operator reconciles Gateways in every test
+// namespace and the overlay sets no scope toggle. Every per-Gateway field (gcp
+// region/zone, forwards, dnsHostnames) is expressed on the Gateway CR the suite
+// creates, not here. WG params (incl. listenPort) keep their chart defaults.
 type operatorValues struct {
 	NameOverride string        `yaml:"nameOverride"`
 	Operator     operatorBlock `yaml:"operator"`
 	Link         imageBlock    `yaml:"link"`
-	GCP          gcpValues     `yaml:"gcp"`
 }
 
 type operatorBlock struct {
@@ -37,41 +38,36 @@ type imageValues struct {
 	Tag        string `yaml:"tag"`
 }
 
-type gcpValues struct {
-	ProjectID string `yaml:"projectID"`
-}
-
-// valuesParams bundles the per-run inputs that shape the overlay.
+// valuesParams bundles the inputs that shape the once-per-cluster operator
+// overlay.
 type valuesParams struct {
-	// namePrefix is the run-unique prefix threaded into nameOverride so the
-	// operator's chart-rendered objects (Deployment, RBAC, ConfigMap) are named
-	// per run and two concurrent runs never collide.
-	namePrefix string
-	env        Env
+	// nameOverride pins the chart name so the operator Deployment has a
+	// deterministic name the suite waits on after the single install.
+	nameOverride string
 	// operatorImage and linkImage are the run's freshly built, kind-loaded images.
 	operatorImage k8s.ImageRef
 	linkImage     k8s.ImageRef
 }
 
-// writeValues renders the operator chart overlay for the run and writes it to a
-// temp file, returning the path. The caller passes the path to helm via -f.
+// writeValues renders the operator chart overlay for the single install and
+// writes it to a temp file, returning the path. The caller passes the path to
+// helm via -f.
 func writeValues(dir string, p valuesParams) (string, error) {
 	v := operatorValues{
-		NameOverride: p.namePrefix,
+		NameOverride: p.nameOverride,
 		Operator: operatorBlock{
 			Image: imageValues{Repository: p.operatorImage.Repository, Tag: p.operatorImage.Tag},
 		},
 		Link: imageBlock{
 			Image: imageValues{Repository: p.linkImage.Repository, Tag: p.linkImage.Tag},
 		},
-		GCP: gcpValues{ProjectID: p.env.ProjectID},
 	}
 
 	data, err := yaml.Marshal(v)
 	if err != nil {
 		return "", fmt.Errorf("marshal operator values: %w", err)
 	}
-	path := filepath.Join(dir, p.namePrefix+"-values.yaml")
+	path := filepath.Join(dir, p.nameOverride+"-values.yaml")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return "", fmt.Errorf("write operator values %s: %w", path, err)
 	}

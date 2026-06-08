@@ -26,10 +26,12 @@ var wgConfTemplate = template.Must(template.New("wgconf").Parse(wgConfTemplateTe
 // RenderWGConf renders a wg(8) setconf-compatible configuration for wg0. The
 // output is suitable for `wg setconf`, which understands only [Interface]
 // PrivateKey/ListenPort and [Peer] keys: Address and MTU are interface
-// properties applied via ip(8) and are deliberately omitted here. ListenPort
-// and PersistentKeepalive are emitted only when greater than zero. privKey and
-// peerPubKey are base64 WireGuard keys read from mounted Secret files, not from
-// rc. It returns an error only if template execution fails.
+// properties applied via ip(8) and are deliberately omitted here. ListenPort is
+// emitted only when greater than zero. PersistentKeepalive is always emitted,
+// including the value 0, so that `wg syncconf` clears a previously-set keepalive
+// when the config drops it. privKey and peerPubKey are base64 WireGuard keys
+// read from mounted Secret files, not from rc. It returns an error only if
+// template execution fails.
 func RenderWGConf(rc RuntimeConfig, privKey, peerPubKey string) (string, error) {
 	p := rc.WireGuard.Peer
 	data := struct {
@@ -60,9 +62,14 @@ var nftablesTemplateText string
 
 var nftablesTemplate = template.Must(template.New("nftables").Parse(nftablesTemplateText))
 
-// RenderNftables renders the inet "cyno" table that DNATs configured public
+// RenderNftables renders the inet "gateway" table that DNATs configured public
 // ports arriving on wg0 to in-cluster ClusterIPs and masquerades the forwarded
 // traffic toward the cluster so backends reply to the link pod.
+//
+// The document is self-replacing: it opens with `add table inet gateway` then
+// `flush table inet gateway`, so a single `nft -f` ensures the table exists,
+// empties it, and repopulates it in one atomic transaction. Re-applying the same
+// or a changed ruleset is therefore idempotent and never accumulates stale rules.
 //
 // The forward filter chain defaults to drop and accepts forwarded packets by
 // their post-DNAT destination (ClusterIP and target port): the prerouting nat

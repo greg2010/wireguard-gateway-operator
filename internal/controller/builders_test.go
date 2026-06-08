@@ -15,39 +15,32 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/api/v1alpha1"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
+	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
 
-// testConfig is the operator-global config the builder tests fold into Gateways.
+// testConfig is the operator-level config the builder tests fold into Gateways.
 func testConfig() Config {
 	return Config{
-		Namespace:           "wg-system",
 		LinkImage:           "registry.example.com/gateway-link:test",
 		LinkImagePullPolicy: "IfNotPresent",
-		WGSubnet:            "10.99.0.0/29",
-		WGLinkAddress:       "10.99.0.2",
-		WGListenPort:        51820,
-		WGKeepalive:         25,
-		WGMTU:               1380,
-		WGReconcileInterval: 0,
-		GCPSubnetCIDR:       "10.200.0.0/24",
-		GCPImage:            "projects/test/global/images/flatcar",
-		GCPDiskSizeGB:       20,
-		GCPReservedIP:       true,
-		GCPSpot:             false,
 		UserData:            "#ignition\n",
 		RequeueInterval:     0,
+		SharedNetworkName:   "wgnet-test",
+		PodNamespace:        "gateway-operator",
 	}
 }
 
-// newGateway builds a Gateway fixture with the given forwards and hostnames.
+// newGateway builds a Gateway fixture with the given forwards and hostnames. It
+// sets the required spec.gcp.ProjectID and leaves every defaulted spec.gcp and
+// spec.wireguard field unset so the builders exercise their defaulting accessors.
 func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostnames []string) *wgnetv1alpha1.Gateway {
 	return &wgnetv1alpha1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: wgnetv1alpha1.GatewaySpec{
 			GCP: wgnetv1alpha1.GatewayGCPSpec{
+				ProjectID:   "test-project",
 				Region:      "us-central1",
 				Zone:        "us-central1-a",
 				MachineType: "e2-small",
@@ -71,19 +64,6 @@ func assertNestedString(t *testing.T, u *unstructured.Unstructured, want string,
 	}
 	if got != want {
 		t.Errorf("%v = %q, want %q", path, got, want)
-	}
-}
-
-// assertSameStringSet fails unless got and want hold the same elements ignoring
-// order.
-func assertSameStringSet(t *testing.T, label string, got, want []string) {
-	t.Helper()
-	g := append([]string(nil), got...)
-	w := append([]string(nil), want...)
-	slices.Sort(g)
-	slices.Sort(w)
-	if !slices.Equal(g, w) {
-		t.Errorf("%s = %v, want %v", label, got, want)
 	}
 }
 
@@ -143,7 +123,7 @@ func TestGCPID(t *testing.T) {
 	})
 }
 
-func TestBuildXGateway(t *testing.T) {
+func TestBuildXGatewayGCP(t *testing.T) {
 	cfg := testConfig()
 	gw := newGateway("edge", "wg-system",
 		[]wgnetv1alpha1.Forward{
@@ -153,16 +133,16 @@ func TestBuildXGateway(t *testing.T) {
 		[]string{"edge.example.com"},
 	)
 
-	u, err := buildXGateway(gw, cfg)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
 	if err != nil {
-		t.Fatalf("buildXGateway: %v", err)
+		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
 
-	if got := u.GetAPIVersion(); got != xgatewayAPIVersion {
-		t.Errorf("apiVersion = %q, want %q", got, xgatewayAPIVersion)
+	if got := u.GetAPIVersion(); got != xgatewayGCPAPIVersion {
+		t.Errorf("apiVersion = %q, want %q", got, xgatewayGCPAPIVersion)
 	}
-	if got := u.GetKind(); got != xgatewayKind {
-		t.Errorf("kind = %q, want %q", got, xgatewayKind)
+	if got := u.GetKind(); got != xgatewayGCPKind {
+		t.Errorf("kind = %q, want %q", got, xgatewayGCPKind)
 	}
 	if got := u.GetName(); got != "edge" {
 		t.Errorf("name = %q, want edge", got)
@@ -174,15 +154,29 @@ func TestBuildXGateway(t *testing.T) {
 	assertNestedString(t, u, "us-central1", "spec", "region")
 	assertNestedString(t, u, "us-central1-a", "spec", "zone")
 	assertNestedString(t, u, "e2-small", "spec", "machineType")
-	assertNestedString(t, u, cfg.GCPSubnetCIDR, "spec", "subnetCIDR")
 	assertNestedString(t, u, cfg.UserData, "spec", "userData")
-	assertNestedString(t, u, cfg.GCPImage, "spec", "image")
 
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != int64(cfg.WGListenPort) {
-		t.Errorf("wgListenPort = %d, want %d", got, cfg.WGListenPort)
+	// sharedNetworkName flows from operator config: every Gateway attaches to the
+	// one shared VPC the operator provisions.
+	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "sharedNetworkName")
+
+	// The GCP and WireGuard composite inputs now flow from gw.Spec (here all
+	// defaulted) rather than the operator config.
+	assertNestedString(t, u, "test-project", "spec", "projectID")
+	assertNestedString(t, u, effectiveGCPImage(gw), "spec", "image")
+	assertNestedString(t, u, effectiveWGGatewayAddress(gw), "spec", "wgGatewayAddress")
+	assertNestedString(t, u, effectiveWGLinkAddress(gw), "spec", "wgLinkAddress")
+	assertNestedString(t, u, effectiveWGSubnet(gw), "spec", "wgSubnet")
+
+	wantWGPort := int64(effectiveWireguardPort(gw))
+	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != wantWGPort {
+		t.Errorf("wgListenPort = %d, want %d", got, wantWGPort)
 	}
-	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "reservedIP"); got != cfg.GCPReservedIP {
-		t.Errorf("reservedIP = %v, want %v", got, cfg.GCPReservedIP)
+	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "diskSizeGB"); got != int64(effectiveGCPDiskSizeGB(gw)) {
+		t.Errorf("diskSizeGB = %d, want %d", got, effectiveGCPDiskSizeGB(gw))
+	}
+	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "reservedIP"); got != effectiveGCPReservedIP(gw) {
+		t.Errorf("reservedIP = %v, want %v", got, effectiveGCPReservedIP(gw))
 	}
 
 	id := gcpID(gw.Namespace, gw.Name)
@@ -190,14 +184,6 @@ func TestBuildXGateway(t *testing.T) {
 	assertNestedString(t, u, id, "spec", "secretId")
 	assertNestedString(t, u, wg.BundleKey, "spec", "wgKeySecretRef", "key")
 	assertNestedString(t, u, bundleSecretName(gw), "spec", "wgKeySecretRef", "name")
-
-	hostnames, _, err := unstructured.NestedStringSlice(u.Object, "spec", "dnsHostnames")
-	if err != nil {
-		t.Fatalf("read dnsHostnames: %v", err)
-	}
-	if len(hostnames) != 1 || hostnames[0] != "edge.example.com" {
-		t.Errorf("dnsHostnames = %v, want [edge.example.com]", hostnames)
-	}
 
 	ports, _, err := unstructured.NestedSlice(u.Object, "spec", "allowedPorts")
 	if err != nil {
@@ -227,27 +213,56 @@ func TestBuildXGateway(t *testing.T) {
 	}
 
 	if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "status"); found {
-		t.Errorf("buildXGateway must not set status; serviceAccountEmail is GCP-observed")
+		t.Errorf("buildXGatewayGCP must not set status; serviceAccountEmail is GCP-observed")
 	}
 }
 
-func TestBuildXGatewayOptionalFields(t *testing.T) {
+// TestBuildXGatewayGCPOptionalFields pins the fields the builder omits when
+// unconfigured: the operator-level userData (empty config) and allowedPorts (no
+// forwards). image and diskSizeGB are no longer omittable: they carry CRD
+// defaults and the builder always sets them from gw.Spec via the defaulting
+// accessors.
+func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
 	cfg := testConfig()
-	cfg.GCPImage = ""
-	cfg.GCPDiskSizeGB = 0
 	cfg.UserData = ""
 
 	gw := newGateway("edge", "wg-system", nil, nil)
 
-	u, err := buildXGateway(gw, cfg)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
 	if err != nil {
-		t.Fatalf("buildXGateway: %v", err)
+		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
 
-	for _, field := range []string{"image", "diskSizeGB", "userData", "dnsHostnames", "allowedPorts"} {
+	for _, field := range []string{"userData", "allowedPorts"} {
 		if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", field); found {
 			t.Errorf("spec.%s set, want omitted when unconfigured/empty", field)
 		}
+	}
+
+	// image and diskSizeGB are always present once defaulting is applied.
+	for _, field := range []string{"image", "diskSizeGB"} {
+		if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", field); !found {
+			t.Errorf("spec.%s absent, want always set from defaulted gw.Spec", field)
+		}
+	}
+}
+
+// TestBuildXGatewayGCPWireguardListenPort pins the split-brain fix at the
+// operator boundary: a non-default spec.wireguard.listenPort flows verbatim onto
+// the composite's wgListenPort, so the single per-Gateway value reaches the
+// instance metadata and the gateway VM boots on the port the link dials.
+func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
+	cfg := testConfig()
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.Wireguard.ListenPort = 51999
+
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	if err != nil {
+		t.Fatalf("buildXGatewayGCP: %v", err)
+	}
+
+	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != 51999 {
+		t.Errorf("wgListenPort = %d, want 51999 (non-default spec.wireguard.listenPort)", got)
 	}
 }
 
@@ -290,14 +305,13 @@ func TestBuildLinkSecret(t *testing.T) {
 }
 
 func TestBuildLinkConfigMap(t *testing.T) {
-	cfg := testConfig()
 	gw := newGateway("edge", "wg-system",
 		[]wgnetv1alpha1.Forward{
 			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443},
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, cfg)
+	cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -309,35 +323,74 @@ func TestBuildLinkConfigMap(t *testing.T) {
 	if !ok {
 		t.Fatalf("configmap missing %q", linkConfigKey)
 	}
-	var rc linkRuntimeConfig
+	var rc link.RuntimeConfig
 	decodeJSON(t, raw, &rc)
 
 	if rc.WireGuard.Address != "10.99.0.2/29" {
 		t.Errorf("wireguard.address = %q, want 10.99.0.2/29", rc.WireGuard.Address)
 	}
-	if rc.WireGuard.MTU != cfg.WGMTU {
-		t.Errorf("wireguard.mtu = %d, want %d", rc.WireGuard.MTU, cfg.WGMTU)
+	wantMTU := int(effectiveWGMTU(gw))
+	if rc.WireGuard.MTU != wantMTU {
+		t.Errorf("wireguard.mtu = %d, want %d", rc.WireGuard.MTU, wantMTU)
 	}
-	if rc.WireGuard.Peer.PersistentKeepalive != cfg.WGKeepalive {
-		t.Errorf("peer.persistentKeepalive = %d, want %d", rc.WireGuard.Peer.PersistentKeepalive, cfg.WGKeepalive)
+	wantKeepalive := int(effectiveWGKeepalive(gw))
+	if rc.WireGuard.Peer.PersistentKeepalive != wantKeepalive {
+		t.Errorf("peer.persistentKeepalive = %d, want %d", rc.WireGuard.Peer.PersistentKeepalive, wantKeepalive)
 	}
-	if len(rc.WireGuard.Peer.AllowedIPs) != 1 || rc.WireGuard.Peer.AllowedIPs[0] != cfg.WGSubnet {
-		t.Errorf("peer.allowedIPs = %v, want [%s]", rc.WireGuard.Peer.AllowedIPs, cfg.WGSubnet)
+	wantSubnet := effectiveWGSubnet(gw)
+	if len(rc.WireGuard.Peer.AllowedIPs) != 1 || rc.WireGuard.Peer.AllowedIPs[0] != wantSubnet {
+		t.Errorf("peer.allowedIPs = %v, want [%s]", rc.WireGuard.Peer.AllowedIPs, wantSubnet)
 	}
 
-	wantForwards := []linkForward{
-		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Service: "web", TargetPort: 8443},
-		{Name: "udp-1194", PublicPort: 1194, Protocol: "udp", Service: "vpn", TargetPort: 1194},
+	if rc.WireGuard.Peer.Endpoint != "" {
+		t.Errorf("peer.endpoint = %q, want empty when address is unknown", rc.WireGuard.Peer.Endpoint)
+	}
+
+	wantForwards := []link.Forward{
+		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Service: "web.wg-system.svc.cluster.local", TargetPort: 8443},
+		{Name: "udp-1194", PublicPort: 1194, Protocol: "udp", Service: "vpn.wg-system.svc.cluster.local", TargetPort: 1194},
 	}
 	if !slices.Equal(rc.Forwards, wantForwards) {
 		t.Errorf("forwards = %+v, want %+v", rc.Forwards, wantForwards)
 	}
 }
 
+// TestBuildLinkConfigMapEndpoint pins the operator-supplied peer endpoint: a
+// known gateway address is rendered as address:wireguardPort, and an empty
+// address leaves the endpoint unset so the link waits for the operator to observe
+// the IP and reload in place.
+func TestBuildLinkConfigMapEndpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		address      string
+		wantEndpoint string
+	}{
+		{"address set renders host:port", "203.0.113.5", "203.0.113.5:51820"},
+		{"empty address leaves endpoint unset", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system",
+				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
+
+			cm, err := buildLinkConfigMap(gw, tt.address, gw.Spec.Forwards)
+			if err != nil {
+				t.Fatalf("buildLinkConfigMap: %v", err)
+			}
+			var rc link.RuntimeConfig
+			decodeJSON(t, cm.Data[linkConfigKey], &rc)
+
+			if rc.WireGuard.Peer.Endpoint != tt.wantEndpoint {
+				t.Errorf("peer.endpoint = %q, want %q", rc.WireGuard.Peer.Endpoint, tt.wantEndpoint)
+			}
+		})
+	}
+}
+
 // TestBuildLinkConfigMapTargetPortDefault covers the target-port defaulting rule:
 // an unset TargetPort mirrors Port, while a set one is preserved verbatim.
 func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
-	cfg := testConfig()
 	tests := []struct {
 		name           string
 		targetPort     int32
@@ -354,11 +407,11 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 					{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: tt.targetPort},
 				}, nil)
 
-			cm, err := buildLinkConfigMap(gw, cfg)
+			cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
-			var rc linkRuntimeConfig
+			var rc link.RuntimeConfig
 			decodeJSON(t, cm.Data[linkConfigKey], &rc)
 
 			if len(rc.Forwards) != 1 {
@@ -378,14 +431,13 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 // and requires service plus an in-range target port, so this also pins the
 // defaulting and casing the builder must satisfy.
 func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
-	cfg := testConfig()
 	gw := newGateway("edge", "wg-system",
 		[]wgnetv1alpha1.Forward{
 			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443},
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, cfg)
+	cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -401,16 +453,78 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 	}
 
 	wantForwards := []link.Forward{
-		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Service: "web", TargetPort: 8443},
-		{Name: "udp-1194", PublicPort: 1194, Protocol: "udp", Service: "vpn", TargetPort: 1194},
+		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Service: "web.wg-system.svc.cluster.local", TargetPort: 8443},
+		{Name: "udp-1194", PublicPort: 1194, Protocol: "udp", Service: "vpn.wg-system.svc.cluster.local", TargetPort: 1194},
 	}
 	if !slices.Equal(rc.Forwards, wantForwards) {
 		t.Errorf("loaded forwards = %+v, want %+v", rc.Forwards, wantForwards)
 	}
 }
 
+// TestEffectiveForwardNamespace pins the namespace-defaulting rule the FQDN
+// builder and the cross-namespace gate both depend on: an unset Forward.Namespace
+// resolves to the Gateway's namespace, while an explicit one is honored verbatim.
+func TestEffectiveForwardNamespace(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	tests := []struct {
+		name    string
+		forward wgnetv1alpha1.Forward
+		want    string
+	}{
+		{"unset defaults to gateway namespace", wgnetv1alpha1.Forward{Service: "web"}, "wg-system"},
+		{"explicit namespace honored", wgnetv1alpha1.Forward{Service: "web", Namespace: "prod"}, "prod"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := effectiveForwardNamespace(tt.forward, gw); got != tt.want {
+				t.Errorf("effectiveForwardNamespace = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildLinkConfigMapServiceFQDN pins that the link's runtime config carries a
+// fully-qualified Service name, defaulting to the Gateway namespace and honoring an
+// explicit cross-namespace target. Building the FQDN in the operator makes backend
+// resolution explicit and identical for same- and cross-namespace forwards.
+func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
+	tests := []struct {
+		name        string
+		forward     wgnetv1alpha1.Forward
+		wantService string
+	}{
+		{
+			name:        "same namespace defaults to gateway namespace",
+			forward:     wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			wantService: "web.wg-system.svc.cluster.local",
+		},
+		{
+			name:        "explicit cross namespace",
+			forward:     wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "db", Namespace: "prod"},
+			wantService: "db.prod.svc.cluster.local",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", []wgnetv1alpha1.Forward{tt.forward}, nil)
+			cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
+			if err != nil {
+				t.Fatalf("buildLinkConfigMap: %v", err)
+			}
+			var rc link.RuntimeConfig
+			decodeJSON(t, cm.Data[linkConfigKey], &rc)
+			if len(rc.Forwards) != 1 {
+				t.Fatalf("forwards = %d, want 1", len(rc.Forwards))
+			}
+			if got := rc.Forwards[0].Service; got != tt.wantService {
+				t.Errorf("forward service = %q, want %q", got, tt.wantService)
+			}
+		})
+	}
+}
+
 // hasOpenEgressPort reports whether any egress rule permits proto/port to a
-// 0.0.0.0/0 peer. The link's forward and apiserver rules use that open CIDR so
+// 0.0.0.0/0 peer. The link's forward and WireGuard rules use that open CIDR so
 // the policy holds whether the CNI matches on the Service ClusterIP or the
 // resolved pod IP.
 func hasOpenEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
@@ -462,11 +576,11 @@ func hasDNSEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Pro
 }
 
 // TestBuildLinkNetworkPolicy pins the egress allowlist kindnet enforces: DNS, the
-// WireGuard underlay, the apiserver on 443, and one rule per forward at its
-// effective target port. The unset-TargetPort case must default to the public
-// port so the policy tracks the DNAT target the link actually dials.
+// WireGuard underlay, and one rule per forward at its effective target port. The
+// unset-TargetPort case must default to the public port so the policy tracks the
+// DNAT target the link actually dials. The link holds no cluster credentials, so
+// there must be no apiserver (TCP/443) egress.
 func TestBuildLinkNetworkPolicy(t *testing.T) {
-	cfg := testConfig()
 	tests := []struct {
 		name      string
 		forwards  []wgnetv1alpha1.Forward
@@ -499,7 +613,7 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system", tt.forwards, nil)
 
-			np := buildLinkNetworkPolicy(gw, cfg)
+			np := buildLinkNetworkPolicy(gw, gw.Spec.Forwards)
 
 			if np.Name != "edge-link" {
 				t.Errorf("networkpolicy name = %q, want edge-link", np.Name)
@@ -512,11 +626,12 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 			if !hasDNSEgress(egress, corev1.ProtocolUDP) || !hasDNSEgress(egress, corev1.ProtocolTCP) {
 				t.Errorf("egress missing kube-dns UDP/TCP 53 rules: %+v", egress)
 			}
-			if !hasOpenEgressPort(egress, corev1.ProtocolUDP, int32(cfg.WGListenPort)) {
-				t.Errorf("egress missing WireGuard UDP %d rule: %+v", cfg.WGListenPort, egress)
+			wgPort := effectiveWireguardPort(gw)
+			if !hasOpenEgressPort(egress, corev1.ProtocolUDP, wgPort) {
+				t.Errorf("egress missing WireGuard UDP %d rule: %+v", wgPort, egress)
 			}
-			if !hasOpenEgressPort(egress, corev1.ProtocolTCP, 443) {
-				t.Errorf("egress missing apiserver TCP 443 rule: %+v", egress)
+			if hasOpenEgressPort(egress, corev1.ProtocolTCP, 443) {
+				t.Errorf("egress permits apiserver TCP 443; link holds no cluster credentials: %+v", egress)
 			}
 			for _, w := range tt.wantPorts {
 				if !hasOpenEgressPort(egress, w.proto, w.port) {
@@ -527,39 +642,10 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 	}
 }
 
-func TestBuildLinkRole(t *testing.T) {
-	gw := newGateway("edge", "wg-system", nil, nil)
-	role := buildLinkRole(gw)
-
-	if len(role.Rules) != 1 {
-		t.Fatalf("role rules = %d, want 1", len(role.Rules))
-	}
-	rule := role.Rules[0]
-	assertSameStringSet(t, "apiGroups", rule.APIGroups, []string{"infra.wgnet.dev"})
-	assertSameStringSet(t, "resources", rule.Resources, []string{"xgateways"})
-	assertSameStringSet(t, "verbs", rule.Verbs, []string{"get", "list", "watch"})
-}
-
-func TestBuildLinkRoleBinding(t *testing.T) {
-	gw := newGateway("edge", "wg-system", nil, nil)
-	rb := buildLinkRoleBinding(gw)
-
-	if rb.RoleRef.Name != "edge-link" || rb.RoleRef.Kind != "Role" {
-		t.Errorf("roleRef = %+v, want Role/edge-link", rb.RoleRef)
-	}
-	if len(rb.Subjects) != 1 {
-		t.Fatalf("subjects = %d, want 1", len(rb.Subjects))
-	}
-	s := rb.Subjects[0]
-	if s.Kind != "ServiceAccount" || s.Name != "edge-link" || s.Namespace != "wg-system" {
-		t.Errorf("subject = %+v, want ServiceAccount edge-link/wg-system", s)
-	}
-}
-
 func TestBuildLinkDeployment(t *testing.T) {
 	cfg := testConfig()
-	cfg.WGReconcileInterval = 10_000_000_000 // 10s
 	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.Wireguard.ReconcileInterval = "10s"
 
 	dep := buildLinkDeployment(gw, cfg)
 
@@ -630,13 +716,10 @@ func TestBuildLinkDeployment(t *testing.T) {
 		env[e.Name] = e.Value
 	}
 	wantEnv := map[string]string{
-		"GATEWAY_NAME":                "edge",
-		"GATEWAY_NAMESPACE":           "wg-system",
-		"GATEWAY_WG_LISTEN_PORT":      "51820",
 		"GATEWAY_RECONCILE_INTERVAL":  "10s",
-		"GATEWAY_CONFIG_PATH":         "/etc/cyno/config.json",
-		"GATEWAY_WG_KEY_PATH":         "/etc/cyno/wg/" + wg.LinkPrivateKey,
-		"GATEWAY_WG_PEER_PUBKEY_PATH": "/etc/cyno/wg/" + wg.LinkPeerPublicKey,
+		"GATEWAY_CONFIG_PATH":         "/etc/gateway/config/config.json",
+		"GATEWAY_WG_KEY_PATH":         "/etc/gateway/wg/" + wg.LinkPrivateKey,
+		"GATEWAY_WG_PEER_PUBKEY_PATH": "/etc/gateway/wg/" + wg.LinkPeerPublicKey,
 	}
 	for k, want := range wantEnv {
 		if env[k] != want {
@@ -644,11 +727,115 @@ func TestBuildLinkDeployment(t *testing.T) {
 		}
 	}
 
+	// The config ConfigMap must be mounted as a live directory, never with a
+	// subPath: a subPath mount is copied once at container start and never
+	// refreshed by the kubelet, which defeats the link's in-place reload of the
+	// operator-injected gateway endpoint. GATEWAY_CONFIG_PATH must point at the
+	// file inside that directory.
+	mounts := map[string]corev1.VolumeMount{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m
+	}
+	configMount, ok := mounts["config"]
+	if !ok {
+		t.Fatal("config volume mount missing")
+	}
+	if configMount.MountPath != "/etc/gateway/config" {
+		t.Errorf("config mount path = %q, want /etc/gateway/config", configMount.MountPath)
+	}
+	if configMount.SubPath != "" {
+		t.Errorf("config mount has subPath %q, want none (subPath defeats in-place reload)", configMount.SubPath)
+	}
+	if env["GATEWAY_CONFIG_PATH"] != "/etc/gateway/config/config.json" {
+		t.Errorf("GATEWAY_CONFIG_PATH = %q, want /etc/gateway/config/config.json", env["GATEWAY_CONFIG_PATH"])
+	}
+
+	// The link no longer reads the XGatewayGCP, so the cluster-lookup env is gone and
+	// no ServiceAccount token is projected into the pod.
+	for _, gone := range []string{"GATEWAY_NAME", "GATEWAY_NAMESPACE", "GATEWAY_WG_LISTEN_PORT"} {
+		if _, present := env[gone]; present {
+			t.Errorf("env[%q] present, want removed (link holds no cluster credentials)", gone)
+		}
+	}
+	if podSpec.ServiceAccountName != "" {
+		t.Errorf("serviceAccountName = %q, want empty (no link RBAC)", podSpec.ServiceAccountName)
+	}
+	if podSpec.AutomountServiceAccountToken == nil || *podSpec.AutomountServiceAccountToken {
+		t.Errorf("automountServiceAccountToken = %v, want false", podSpec.AutomountServiceAccountToken)
+	}
+
 	// The link must not receive the stale CYNO_* env the deleted chart used.
 	for _, e := range c.Env {
 		if strings.HasPrefix(e.Name, "CYNO_") {
 			t.Errorf("unexpected legacy env %q on link container", e.Name)
 		}
+	}
+
+	// In-place reload means no config-checksum roll trigger.
+	if _, ok := dep.Spec.Template.Annotations["checksum/config"]; ok {
+		t.Error("pod template carries checksum/config; in-place reload needs no roll trigger")
+	}
+}
+
+// TestBuildXGatewayGCPProviderSelector pins the multi-cloud scoping contract: the
+// composite carries a spec.crossplane.compositionSelector matchLabels provider
+// that defaults to gcp and honors an explicitly set provider, so a second
+// provider's Composition can be dropped in without collision. The selector lives
+// under spec.crossplane because the XRD is apiextensions.crossplane.io/v2, which
+// nests the composition-machinery fields there rather than at the v1 spec root.
+func TestBuildXGatewayGCPProviderSelector(t *testing.T) {
+	cfg := testConfig()
+	tests := []struct {
+		name     string
+		provider wgnetv1alpha1.CloudProvider
+		want     string
+	}{
+		{"defaults to gcp when empty", "", "gcp"},
+		{"honors explicit provider", wgnetv1alpha1.ProviderGCP, "gcp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.Provider = tt.provider
+
+			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+			if err != nil {
+				t.Fatalf("buildXGatewayGCP: %v", err)
+			}
+			assertNestedString(t, u, tt.want, "spec", "crossplane", "compositionSelector", "matchLabels", "provider")
+		})
+	}
+}
+
+// TestBuildXGatewayNetwork pins the singleton shared-VPC composite: it is named
+// and spec'd from cfg.SharedNetworkName, lives in cfg.PodNamespace alongside the
+// operator pod, pins the gcp Composition via compositionSelector, and carries no
+// ownerReference so deleting any one Gateway never garbage-collects the shared
+// network.
+func TestBuildXGatewayNetwork(t *testing.T) {
+	cfg := testConfig()
+
+	u := buildXGatewayNetwork(cfg)
+
+	if got := u.GetAPIVersion(); got != xgatewayGCPAPIVersion {
+		t.Errorf("apiVersion = %q, want %q", got, xgatewayGCPAPIVersion)
+	}
+	if got := u.GetKind(); got != xgatewayNetworkKind {
+		t.Errorf("kind = %q, want %q", got, xgatewayNetworkKind)
+	}
+	if got := u.GetName(); got != cfg.SharedNetworkName {
+		t.Errorf("name = %q, want %q", got, cfg.SharedNetworkName)
+	}
+	if got := u.GetNamespace(); got != cfg.PodNamespace {
+		t.Errorf("namespace = %q, want %q", got, cfg.PodNamespace)
+	}
+
+	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "name")
+	assertNestedString(t, u, "gcp", "spec", "crossplane", "compositionSelector", "matchLabels", "provider")
+
+	if refs := u.GetOwnerReferences(); len(refs) != 0 {
+		t.Errorf("ownerReferences = %d, want 0 (shared network is refcount-managed, not Gateway-owned)", len(refs))
 	}
 }
 

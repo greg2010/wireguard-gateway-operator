@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"fmt"
 	"strings"
 	"time"
@@ -28,20 +30,21 @@ type resourceCount struct {
 	names string
 }
 
-// assertNoOrphans polls every GCP resource family the gateway composition
-// creates, filtered to the run's namePrefix, until all reach zero or the
-// deadline elapses. A non-zero residual after the deadline is returned as an
-// error naming the leaked resources.
+// assertNoOrphans polls every GCP resource family the gateway provisions,
+// until all reach zero or the deadline elapses. A non-zero residual after the
+// deadline is returned as an error naming the leaked resources.
 //
-// Filtering is by name prefix because the composition does not stamp GCP labels
-// on the managed resources; the suite makes the prefix unique per run via the
-// chart nameOverride and the serviceAccountId / secretId values.
-func assertNoOrphans(ctx context.Context, auth gcpAuth, namePrefix string, timeout time.Duration, log *zap.Logger) error {
+// The compute resources (network, subnet, firewall, address, instance) inherit
+// the XR name and so match the run's namePrefix. The operator-derived GCP
+// ServiceAccount and Secret-Manager Secret instead carry the hash-derived gw-
+// ID, which never begins with namePrefix; they are matched by that derived ID.
+func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, namePrefix string, timeout time.Duration, log *zap.Logger) error {
+	derivedID := gcpID(namespace, gatewayName)
 	start := time.Now()
 	deadline := start.Add(timeout)
 	var last []resourceCount
 	for {
-		counts, err := countResources(ctx, auth, namePrefix)
+		counts, err := countResources(ctx, auth, namePrefix, derivedID)
 		if err != nil {
 			return fmt.Errorf("count gcp resources: %w", err)
 		}
@@ -64,28 +67,77 @@ func assertNoOrphans(ctx context.Context, auth gcpAuth, namePrefix string, timeo
 	}
 }
 
-// countResources queries each GCP resource family for names beginning with
-// namePrefix and returns the per-family counts.
-func countResources(ctx context.Context, auth gcpAuth, namePrefix string) ([]resourceCount, error) {
+// serialConsoleOutput returns the gateway VM's serial-port-1 console output,
+// where the keyfetch boot unit logs (it writes to journal+console). It resolves
+// the instance by namePrefix, the run-unique prefix every compute resource
+// inherits, and reads the console via gcloud. It is best-effort diagnostics: a
+// missing instance (already drained, or never created) yields a descriptive
+// string rather than an error, so a failed handshake whose VM is gone still
+// surfaces whatever booted.
+func serialConsoleOutput(ctx context.Context, auth gcpAuth, zone, namePrefix string) (string, error) {
+	names, err := listNames(ctx, auth,
+		[]string{"compute", "instances", "list"}, "name~^"+namePrefix, "name")
+	if err != nil {
+		return "", fmt.Errorf("list instances: %w", err)
+	}
+	if len(names) == 0 {
+		return "no gateway instance found for prefix " + namePrefix, nil
+	}
+
+	out, err := runGcloud(ctx, auth,
+		"compute", "instances", "get-serial-port-output", names[0],
+		"--project", auth.projectID,
+		"--zone", zone,
+		"--port", "1",
+	)
+	if err != nil {
+		return "", fmt.Errorf("get-serial-port-output %s: %w", names[0], err)
+	}
+	return out, nil
+}
+
+// gcpID replicates the operator's gcpID in
+// internal/controller/builders.go byte-for-byte; it is unexported there, so the
+// harness must duplicate it to match the SA/secret external-names the operator
+// derives.
+func gcpID(namespace, name string) string {
+	sum := sha256.Sum256([]byte(namespace + "/" + name))
+	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
+	id := "gw-" + strings.ToLower(enc)
+	if len(id) > 30 {
+		id = id[:30]
+	}
+	return id
+}
+
+// countResources queries each GCP resource family the gateway provisions and
+// returns the per-family counts. Compute resources are matched against
+// namePrefix; the operator-derived ServiceAccount and Secret are matched
+// against derivedID, the hash external-name the operator assigns them.
+func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID string) ([]resourceCount, error) {
 	queries := []struct {
 		kind string
 		args []string
-		// nameFilter is the gcloud --filter expression matching the run prefix
-		// against the resource's identifying field.
+		// nameFilter is the gcloud --filter expression selecting this family's
+		// run-owned resources by its identifying field.
 		nameFilter string
+		// field is the resource attribute gcloud emits per match. It is the
+		// attribute nameFilter also matches against, so the count and the names
+		// in the failure message stay consistent.
+		field string
 	}{
-		{"instance", []string{"compute", "instances", "list"}, "name~^" + namePrefix},
-		{"address", []string{"compute", "addresses", "list"}, "name~^" + namePrefix},
-		{"firewall-rule", []string{"compute", "firewall-rules", "list"}, "name~^" + namePrefix},
-		{"network", []string{"compute", "networks", "list"}, "name~^" + namePrefix},
-		{"subnetwork", []string{"compute", "networks", "subnets", "list"}, "name~^" + namePrefix},
-		{"service-account", []string{"iam", "service-accounts", "list"}, "email~^" + namePrefix},
-		{"secret", []string{"secrets", "list"}, "name~^" + namePrefix},
+		{"instance", []string{"compute", "instances", "list"}, "name~^" + namePrefix, "name"},
+		{"address", []string{"compute", "addresses", "list"}, "name~^" + namePrefix, "name"},
+		{"firewall-rule", []string{"compute", "firewall-rules", "list"}, "name~^" + namePrefix, "name"},
+		{"network", []string{"compute", "networks", "list"}, "name~^" + namePrefix, "name"},
+		{"subnetwork", []string{"compute", "networks", "subnets", "list"}, "name~^" + namePrefix, "name"},
+		{"service-account", []string{"iam", "service-accounts", "list"}, "email~^" + derivedID + "@", "email"},
+		{"secret", []string{"secrets", "list"}, "name~/secrets/" + derivedID + "$", "name"},
 	}
 
 	var out []resourceCount
 	for _, q := range queries {
-		names, err := listNames(ctx, auth, q.args, q.nameFilter)
+		names, err := listNames(ctx, auth, q.args, q.nameFilter, q.field)
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %w", q.kind, err)
 		}
@@ -94,21 +146,23 @@ func countResources(ctx context.Context, auth gcpAuth, namePrefix string) ([]res
 	return out, nil
 }
 
-// listNames runs `gcloud <args> --filter=<f> --format='value(name)'` with the
-// run's project and key, returning the non-empty result lines.
-func listNames(ctx context.Context, auth gcpAuth, args []string, filter string) ([]string, error) {
+// listNames runs `gcloud <args> --filter=<f> --format='value(<field>)'` with the
+// run's project and key, returning the non-empty result lines. field is the
+// resource attribute the filter matches against, so the emitted values name
+// exactly the matched resources.
+func listNames(ctx context.Context, auth gcpAuth, args []string, filter, field string) ([]string, error) {
 	full := append([]string{}, args...)
 	full = append(full,
 		"--project", auth.projectID,
 		"--filter", filter,
-		"--format", "value(name)",
+		"--format", "value("+field+")",
 	)
 	out, err := runGcloud(ctx, auth, full...)
 	if err != nil {
 		return nil, fmt.Errorf("gcloud %s: %w\n%s", strings.Join(args, " "), err, out)
 	}
 	var names []string
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if s := strings.TrimSpace(line); s != "" {
 			names = append(names, s)
 		}

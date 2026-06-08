@@ -1,6 +1,6 @@
-// Package k8s holds the cyno e2e harness drivers for the kind cluster, the
+// Package k8s holds the gateway e2e harness drivers for the kind cluster, the
 // Kubernetes API client (typed + dynamic), and the helm releases that deploy
-// Crossplane and the cyno chart.
+// Crossplane and the gateway chart.
 package k8s
 
 import (
@@ -17,14 +17,28 @@ import (
 )
 
 // e2eClusterName is the kind cluster the e2e suite provisions.
-const e2eClusterName = "cyno-e2e"
+const e2eClusterName = "gateway-e2e"
 
-// linkForwardSysctlPatch allowlists the unsafe net.ipv4.ip_forward sysctl on the
-// node kubelet. The link pod sets it via its pod-level securityContext, which the
-// kubelet rejects unless the sysctl is in allowedUnsafeSysctls.
-const linkForwardSysctlPatch = `kind: KubeletConfiguration
+// kubeletConfigPatch tunes the node kubelet for the e2e link pod. It is a kind
+// kubeadmConfigPatch document that kind merges into the kubelet's
+// KubeletConfiguration.
+//
+// allowedUnsafeSysctls allowlists net.ipv4.ip_forward, which the link pod sets via
+// its pod-level securityContext; the kubelet rejects the unsafe sysctl unless it is
+// allowlisted here.
+//
+// syncFrequency and configMapAndSecretChangeDetectionStrategy make mounted-ConfigMap
+// updates prompt. The link reads its forward config from a mounted ConfigMap via
+// fsnotify and applies nftables DNAT in place; the kubelet's default mounted-volume
+// sync lag (~1m) otherwise delays a post-Ready forward edit reaching the link long
+// enough to race the data-path probe deadline. Watch detection plus a 10s sync floor
+// caps that lag at ~10s.
+const kubeletConfigPatch = `apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
 allowedUnsafeSysctls:
 - "net.ipv4.ip_forward"
+syncFrequency: 10s
+configMapAndSecretChangeDetectionStrategy: Watch
 `
 
 // KindCluster manages the e2e kind cluster lifecycle via the kind Go API.
@@ -68,7 +82,7 @@ func (k *KindCluster) Ensure(_ context.Context) error {
 	config := &v1alpha4.Cluster{
 		Nodes: []v1alpha4.Node{{
 			Role:                 v1alpha4.ControlPlaneRole,
-			KubeadmConfigPatches: []string{linkForwardSysctlPatch},
+			KubeadmConfigPatches: []string{kubeletConfigPatch},
 		}},
 	}
 	if err := k.provider.Create(k.name,

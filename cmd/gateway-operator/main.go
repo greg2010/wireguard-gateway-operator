@@ -1,6 +1,6 @@
 // Command gateway-operator is the controller-runtime manager that runs the
 // GatewayReconciler. It reconciles user-facing Gateway CRs into their Crossplane
-// XGateway composite, WireGuard key Secrets, the in-cluster link Deployment and
+// XGatewayGCP composite, WireGuard key Secrets, the in-cluster link Deployment and
 // RBAC, and an optional DNSEndpoint.
 package main
 
@@ -12,14 +12,13 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/api/v1alpha1"
 	"github.com/greg2010/wireguard-gateway-operator/internal/config"
 	"github.com/greg2010/wireguard-gateway-operator/internal/controller"
 	"github.com/greg2010/wireguard-gateway-operator/internal/logger"
+	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
 
 // leaderElectionID is the stable lock name the operator's leader election uses.
@@ -79,12 +78,7 @@ func run() error {
 		HealthProbeBindAddress:  mgrCfg.HealthProbeBindAddress,
 		LeaderElection:          mgrCfg.LeaderElection,
 		LeaderElectionID:        leaderElectionID,
-		LeaderElectionNamespace: reconcilerCfg.Namespace,
-	}
-	if reconcilerCfg.Namespace != "" {
-		options.Cache = cache.Options{
-			DefaultNamespaces: map[string]cache.Config{reconcilerCfg.Namespace: {}},
-		}
+		LeaderElectionNamespace: reconcilerCfg.PodNamespace,
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
@@ -106,7 +100,7 @@ func run() error {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Config:   reconcilerCfg,
-		Recorder: mgr.GetEventRecorderFor("gateway-operator"),
+		Recorder: mgr.GetEventRecorder("gateway-operator"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		log.Errorw("set up reconciler", "error", err)
@@ -114,7 +108,6 @@ func run() error {
 	}
 
 	log.Infow("starting manager",
-		"namespace", reconcilerCfg.Namespace,
 		"leaderElection", mgrCfg.LeaderElection,
 		"metricsAddr", mgrCfg.MetricsBindAddress,
 		"healthAddr", mgrCfg.HealthProbeBindAddress,

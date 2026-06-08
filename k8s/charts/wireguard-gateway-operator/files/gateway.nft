@@ -1,7 +1,7 @@
-table inet cyno {
+table inet gateway {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
-		iif "eth0" meta l4proto { tcp, udp } th dport != {{ .Values.wireguard.listenPort }} dnat ip to {{ .Values.wireguard.linkAddress }}
+		iif "eth0" meta l4proto { tcp, udp } th dport != __WG_LISTEN_PORT__ dnat ip to __WG_LINK_ADDRESS__
 	}
 
 	chain postrouting {

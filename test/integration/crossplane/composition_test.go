@@ -1,4 +1,4 @@
-// Package crossplane exercises the shipped GCP XGateway composition template
+// Package crossplane exercises the shipped GCP XGatewayGCP composition template
 // against the real function-go-templating function image over gRPC.
 //
 // The test does not stand up Crossplane or a Kubernetes API server: it drives
@@ -21,11 +21,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
+	"sigs.k8s.io/yaml"
 )
-
-// functionImage is the prebuilt function-go-templating function. Keep this
-// digest in sync with k8s/infra/crossplane/crossplane-providers/values.yaml.
-const functionImage = "xpkg.crossplane.io/crossplane-contrib/function-go-templating@sha256:86f02d0b0e22725015d4be7f4d25bebee47e27300f496ad55630bc64be5f8c9a"
 
 const (
 	// functionPort is the plaintext gRPC port function-go-templating listens on
@@ -63,6 +60,17 @@ const (
 	// onto the instance metadata as secret-id, which the gateway VM's keyfetch
 	// reads to pull the WireGuard key from Secret Manager.
 	gatewaySecretID = "gateway-wg"
+
+	// testProjectID is spec.projectID for the fixtures. The template stamps it onto
+	// the instance metadata as project-id, which the gateway VM's keyfetch reads to
+	// build the Secret Manager URL.
+	testProjectID = "wgnet-test-project"
+
+	// sharedNetworkName is spec.sharedNetworkName for the per-gateway fixtures: the
+	// name of the VPC the separate shared-network composition creates. The template
+	// stamps it verbatim onto the Firewall and the instance NIC, so the per-gateway
+	// composition no longer creates or observes its own Network or Subnetwork.
+	sharedNetworkName = "wgnet-test"
 )
 
 // runFunction holds the gRPC client and the shipped template source, shared by
@@ -72,9 +80,9 @@ type runFunction struct {
 	template string
 }
 
-func TestXGatewayComposition(t *testing.T) {
-	if os.Getenv("CYNO_INTEGRATION") == "" {
-		t.Skip("set CYNO_INTEGRATION to run the composition integration test")
+func TestXGatewayGCPComposition(t *testing.T) {
+	if os.Getenv("GATEWAY_INTEGRATION") == "" {
+		t.Skip("set GATEWAY_INTEGRATION to run the composition integration test")
 	}
 
 	rf := newRunFunction(t)
@@ -88,15 +96,19 @@ func TestXGatewayComposition(t *testing.T) {
 		{
 			name: "reserved IP with mixed tcp/udp ports renders full stack",
 			spec: map[string]any{
-				"region":       testRegion,
-				"zone":         testRegion + "-a",
-				"machineType":  "e2-small",
-				"image":        "projects/wgnet/global/images/gateway",
-				"diskSizeGB":   30,
-				"subnetCIDR":   "10.10.0.0/24",
-				"reservedIP":   true,
-				"userData":     "#cloud-config\n",
-				"wgListenPort": 51820,
+				"region":            testRegion,
+				"zone":              testRegion + "-a",
+				"machineType":       "e2-small",
+				"image":             "projects/wgnet/global/images/gateway",
+				"diskSizeGB":        30,
+				"sharedNetworkName": sharedNetworkName,
+				"reservedIP":        true,
+				"userData":          "#cloud-config\n",
+				"wgListenPort":      51820,
+				"wgGatewayAddress":  "10.99.0.1",
+				"wgLinkAddress":     "10.99.0.2",
+				"wgSubnet":          "10.99.0.0/29",
+				"projectID":         testProjectID,
 				"allowedPorts": []any{
 					map[string]any{"port": 443, "protocol": "tcp"},
 					map[string]any{"port": 80, "protocol": "tcp"},
@@ -115,16 +127,6 @@ func TestXGatewayComposition(t *testing.T) {
 					"kind":       "ServiceAccount",
 					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
 				}),
-				// Subnetwork and Firewall gate on a Ready network; supply it so
-				// the full stack renders.
-				"network": observedReady(t, "network", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Network",
-				}),
-				"subnetwork": observedReady(t, "subnetwork", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Subnetwork",
-				}),
 				"address": observedResource(t, "address", map[string]any{
 					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
 					"kind":       "Address",
@@ -138,13 +140,18 @@ func TestXGatewayComposition(t *testing.T) {
 				if got := nestedString(t, fw, "spec", "forProvider", "direction"); got != "INGRESS" {
 					t.Errorf("firewall direction = %q, want INGRESS", got)
 				}
+				if got := nestedString(t, fw, "spec", "forProvider", "network"); got != sharedNetworkName {
+					t.Errorf("firewall network = %q, want shared network %q", got, sharedNetworkName)
+				}
+				targetSAs := nestedSlice(t, fw, "spec", "forProvider", "targetServiceAccounts")
+				assertSameSet(t, "firewall targetServiceAccounts", toStrings(t, targetSAs), []string{saEmail})
 				allow := nestedSlice(t, fw, "spec", "forProvider", "allow")
 				tcpPorts := allowPorts(t, allow, "tcp")
 				assertSameSet(t, "firewall tcp ports", tcpPorts, []string{"443", "80"})
 				udpPorts := allowPorts(t, allow, "udp")
 				assertSameSet(t, "firewall udp ports", udpPorts, []string{"1194", "51820"})
-				if !hasProtocol(allow, "icmp") {
-					t.Errorf("firewall allow missing icmp rule, got %v", allow)
+				if hasProtocol(allow, "icmp") {
+					t.Errorf("firewall allow must not open icmp to the internet, got %v", allow)
 				}
 
 				addr := desiredResource(t, resp, "address")
@@ -178,6 +185,22 @@ func TestXGatewayComposition(t *testing.T) {
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "secret-id"); got != gatewaySecretID {
 					t.Errorf("instance metadata secret-id = %q, want %q", got, gatewaySecretID)
 				}
+				// The per-Gateway WireGuard and project values flow onto the instance
+				// metadata; the gateway VM's keyfetch reads them at boot to render the
+				// netdev, nftables, wg0 address, and Secret Manager URL. This is the
+				// split-brain fix at the composition boundary.
+				wantMeta := map[string]string{
+					"wg-listen-port":     "51820",
+					"wg-gateway-address": "10.99.0.1",
+					"wg-link-address":    "10.99.0.2",
+					"wg-subnet":          "10.99.0.0/29",
+					"project-id":         testProjectID,
+				}
+				for key, want := range wantMeta {
+					if got := nestedString(t, inst, "spec", "forProvider", "metadata", key); got != want {
+						t.Errorf("instance metadata %s = %q, want %q", key, got, want)
+					}
+				}
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "disable-legacy-endpoints"); got != "true" {
 					t.Errorf("instance metadata disable-legacy-endpoints = %q, want true", got)
 				}
@@ -190,6 +213,8 @@ func TestXGatewayComposition(t *testing.T) {
 				scopes := nestedSlice(t, inst, "spec", "forProvider", "serviceAccount", "scopes")
 				assertSameSet(t, "instance serviceAccount.scopes", toStrings(t, scopes), []string{"https://www.googleapis.com/auth/cloud-platform"})
 
+				assertSharedNetworkNIC(t, inst)
+
 				natIP := nestedString(t, inst,
 					"spec", "forProvider", "networkInterface", "0", "accessConfig", "0", "natIp")
 				if natIP != reservedAddr {
@@ -198,7 +223,7 @@ func TestXGatewayComposition(t *testing.T) {
 
 				instRes := resp.GetDesired().GetResources()["instance"]
 				if instRes.GetReady() == fnv1.Ready_READY_FALSE {
-					t.Errorf("instance Ready = READY_FALSE, want not-false once SA email, subnet and address are known")
+					t.Errorf("instance Ready = READY_FALSE, want not-false once SA email and address are known")
 				}
 
 				status := compositeStatus(t, resp)
@@ -213,14 +238,14 @@ func TestXGatewayComposition(t *testing.T) {
 		{
 			name: "no reservation reads ephemeral natIp back from instance",
 			spec: map[string]any{
-				"region":           testRegion,
-				"zone":             testRegion + "-a",
-				"machineType":      "e2-small",
-				"subnetCIDR":       "10.10.0.0/24",
-				"reservedIP":       false,
-				"wgListenPort":     51820,
-				"serviceAccountId": "gateway",
-				"secretId":         gatewaySecretID,
+				"region":            testRegion,
+				"zone":              testRegion + "-a",
+				"machineType":       "e2-small",
+				"sharedNetworkName": sharedNetworkName,
+				"reservedIP":        false,
+				"wgListenPort":      51820,
+				"serviceAccountId":  "gateway",
+				"secretId":          gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
@@ -231,10 +256,6 @@ func TestXGatewayComposition(t *testing.T) {
 					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
 					"kind":       "ServiceAccount",
 					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
-				"subnetwork": observedReady(t, "subnetwork", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Subnetwork",
 				}),
 				"instance": observedResource(t, "instance", map[string]any{
 					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
@@ -259,6 +280,7 @@ func TestXGatewayComposition(t *testing.T) {
 				}
 
 				inst := desiredResource(t, resp, "instance")
+				assertSharedNetworkNIC(t, inst)
 				nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")
 				if len(nics) == 0 {
 					t.Fatalf("instance has no networkInterface")
@@ -288,15 +310,15 @@ func TestXGatewayComposition(t *testing.T) {
 		{
 			name: "spot emits SPOT scheduling block",
 			spec: map[string]any{
-				"region":           testRegion,
-				"zone":             testRegion + "-a",
-				"machineType":      "e2-small",
-				"subnetCIDR":       "10.10.0.0/24",
-				"reservedIP":       false,
-				"spot":             true,
-				"wgListenPort":     51820,
-				"serviceAccountId": "gateway",
-				"secretId":         gatewaySecretID,
+				"region":            testRegion,
+				"zone":              testRegion + "-a",
+				"machineType":       "e2-small",
+				"sharedNetworkName": sharedNetworkName,
+				"reservedIP":        false,
+				"spot":              true,
+				"wgListenPort":      51820,
+				"serviceAccountId":  "gateway",
+				"secretId":          gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
@@ -307,10 +329,6 @@ func TestXGatewayComposition(t *testing.T) {
 					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
 					"kind":       "ServiceAccount",
 					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
-				"subnetwork": observedReady(t, "subnetwork", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Subnetwork",
 				}),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
@@ -327,35 +345,89 @@ func TestXGatewayComposition(t *testing.T) {
 		{
 			name: "instance and iam withheld until SA email is observed",
 			spec: map[string]any{
-				"region":           testRegion,
-				"zone":             testRegion + "-a",
-				"machineType":      "e2-small",
-				"subnetCIDR":       "10.10.0.0/24",
-				"reservedIP":       false,
-				"wgListenPort":     51820,
-				"serviceAccountId": "gateway",
-				"secretId":         gatewaySecretID,
+				"region":            testRegion,
+				"zone":              testRegion + "-a",
+				"machineType":       "e2-small",
+				"sharedNetworkName": sharedNetworkName,
+				"reservedIP":        false,
+				"wgListenPort":      51820,
+				"serviceAccountId":  "gateway",
+				"secretId":          gatewaySecretID,
+				"wgKeySecretRef": map[string]any{
+					"name": "gateway-wg-key",
+					"key":  "private",
+				},
+			},
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				if _, ok := resp.GetDesired().GetResources()["service-account"]; !ok {
+					t.Errorf("service-account must always be desired")
+				}
+				assertWithheld(t, resp, "firewall")
+				assertWithheld(t, resp, "instance")
+				assertWithheld(t, resp, "secret-iam")
+			},
+		},
+		{
+			// The split-brain fix at the composition boundary: a non-default
+			// wgListenPort and a distinct projectID flow verbatim onto the rendered
+			// instance metadata, so the single per-Gateway value reaches the gateway
+			// VM's keyfetch rather than a stale chart-baked one.
+			name: "non-default wgListenPort and projectID reach instance metadata",
+			spec: map[string]any{
+				"region":            testRegion,
+				"zone":              testRegion + "-a",
+				"machineType":       "e2-small",
+				"sharedNetworkName": sharedNetworkName,
+				"reservedIP":        false,
+				"wgListenPort":      51999,
+				"wgGatewayAddress":  "10.50.0.1",
+				"wgLinkAddress":     "10.50.0.2",
+				"wgSubnet":          "10.50.0.0/29",
+				"projectID":         "other-project",
+				"serviceAccountId":  "gateway",
+				"secretId":          gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
 				},
 			},
 			observed: map[string]*fnv1.Resource{
-				"subnetwork": observedReady(t, "subnetwork", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Subnetwork",
+				"service-account": observedResource(t, "service-account", map[string]any{
+					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
+					"kind":       "ServiceAccount",
+					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
 				}),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
-				if _, ok := resp.GetDesired().GetResources()["network"]; !ok {
-					t.Errorf("network must always be desired")
+				inst := desiredResource(t, resp, "instance")
+				wantMeta := map[string]string{
+					"wg-listen-port":     "51999",
+					"wg-gateway-address": "10.50.0.1",
+					"wg-link-address":    "10.50.0.2",
+					"wg-subnet":          "10.50.0.0/29",
+					"project-id":         "other-project",
 				}
-				if _, ok := resp.GetDesired().GetResources()["service-account"]; !ok {
-					t.Errorf("service-account must always be desired")
+				for key, want := range wantMeta {
+					if got := nestedString(t, inst, "spec", "forProvider", "metadata", key); got != want {
+						t.Errorf("instance metadata %s = %q, want %q", key, got, want)
+					}
 				}
-				assertWithheld(t, resp, "instance")
-				assertWithheld(t, resp, "secret-iam")
+				assertSharedNetworkNIC(t, inst)
+
+				// The non-default listen port must also open at the GCP firewall so the
+				// WireGuard underlay is reachable on the port the VM listens on.
+				fw := desiredResource(t, resp, "firewall")
+				if got := nestedString(t, fw, "spec", "forProvider", "network"); got != sharedNetworkName {
+					t.Errorf("firewall network = %q, want shared network %q", got, sharedNetworkName)
+				}
+				targetSAs := nestedSlice(t, fw, "spec", "forProvider", "targetServiceAccounts")
+				assertSameSet(t, "firewall targetServiceAccounts", toStrings(t, targetSAs), []string{saEmail})
+				allow := nestedSlice(t, fw, "spec", "forProvider", "allow")
+				udpPorts := allowPorts(t, allow, "udp")
+				assertSameSet(t, "firewall udp ports", udpPorts, []string{"51999"})
 			},
 		},
 	}
@@ -380,6 +452,50 @@ func TestXGatewayComposition(t *testing.T) {
 	}
 }
 
+// TestXGatewayNetworkComposition renders the shared-network composition and
+// asserts it emits exactly one Network MR named for the requested VPC with
+// autoCreateSubnetworks enabled. This is the VPC the per-gateway composition
+// attaches every gateway instance and firewall onto.
+func TestXGatewayNetworkComposition(t *testing.T) {
+	if os.Getenv("GATEWAY_INTEGRATION") == "" {
+		t.Skip("set GATEWAY_INTEGRATION to run the composition integration test")
+	}
+
+	rf := newRunFunction(t)
+	template := loadNetworkTemplate(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req := rf.buildRequestFor(t, template, "XGatewayNetwork", map[string]any{
+		"name": sharedNetworkName,
+	}, nil)
+	resp, err := rf.client.RunFunction(ctx, req)
+	if err != nil {
+		t.Fatalf("RunFunction: %v", err)
+	}
+	for _, res := range resp.GetResults() {
+		if res.GetSeverity() == fnv1.Severity_SEVERITY_FATAL {
+			t.Fatalf("function returned fatal result: %s", res.GetMessage())
+		}
+	}
+
+	if got := desiredKeys(resp); len(got) != 1 || got[0] != "network" {
+		t.Fatalf("desired resources = %v, want exactly [network]", got)
+	}
+
+	network := desiredResource(t, resp, "network")
+	if got := nestedString(t, network, "kind"); got != "Network" {
+		t.Errorf("desired resource kind = %q, want Network", got)
+	}
+	if got := nestedString(t, network, "metadata", "annotations", "crossplane.io/external-name"); got != sharedNetworkName {
+		t.Errorf("network external-name = %q, want %q", got, sharedNetworkName)
+	}
+	if got := nestedBool(t, network, "spec", "forProvider", "autoCreateSubnetworks"); !got {
+		t.Errorf("network autoCreateSubnetworks = false, want true")
+	}
+}
+
 // newRunFunction starts the function container once, dials it over plaintext
 // gRPC, and loads the shipped template. The container is terminated when t
 // finishes.
@@ -389,10 +505,10 @@ func newRunFunction(t *testing.T) *runFunction {
 
 	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        functionImage,
+			Image:        goTemplatingImage(t),
 			Cmd:          []string{"--insecure"},
 			ExposedPorts: []string{functionPort},
-			Labels:       map[string]string{"cyno.test": "integration"},
+			Labels:       map[string]string{"gateway.test": "integration"},
 			WaitingFor: wait.ForListeningPort(functionPort).
 				WithStartupTimeout(2 * time.Minute),
 		},
@@ -424,11 +540,21 @@ func newRunFunction(t *testing.T) *runFunction {
 	}
 }
 
-// buildRequest assembles a RunFunctionRequest carrying the GoTemplate input,
-// the XR built from spec, and any observed composed resources. The XR always
-// uses xrName so the function's observed-resource keying lines up with the
-// crossplane.io/composite label on observed fixtures.
+// buildRequest assembles a RunFunctionRequest for the per-gateway XGatewayGCP
+// composition, carrying the GoTemplate input, the XR built from spec, and any
+// observed composed resources. The XR always uses xrName so the function's
+// observed-resource keying lines up with the crossplane.io/composite label on
+// observed fixtures.
 func (rf *runFunction) buildRequest(t *testing.T, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
+	t.Helper()
+	return rf.buildRequestFor(t, rf.template, "XGatewayGCP", spec, observed)
+}
+
+// buildRequestFor assembles a RunFunctionRequest for an arbitrary composition
+// template and XR kind in the infra.wgnet.dev group, letting a single running
+// function container render either the per-gateway or the shared-network
+// composition.
+func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
 	t.Helper()
 
 	input, err := structpb.NewStruct(map[string]any{
@@ -436,7 +562,7 @@ func (rf *runFunction) buildRequest(t *testing.T, spec map[string]any, observed 
 		"kind":       "GoTemplate",
 		"source":     "Inline",
 		"inline": map[string]any{
-			"template": rf.template,
+			"template": template,
 		},
 	})
 	if err != nil {
@@ -445,7 +571,7 @@ func (rf *runFunction) buildRequest(t *testing.T, spec map[string]any, observed 
 
 	xr := toStruct(t, map[string]any{
 		"apiVersion": "infra.wgnet.dev/v1alpha1",
-		"kind":       "XGateway",
+		"kind":       kind,
 		"metadata":   map[string]any{"name": xrName},
 		"spec":       spec,
 	})
@@ -480,36 +606,72 @@ func observedResource(t *testing.T, name string, body map[string]any) *fnv1.Reso
 	return &fnv1.Resource{Resource: toStruct(t, body)}
 }
 
-// observedReady is observedResource with a Ready=True condition stamped on the
-// observed body, modelling a composed resource the provider has reconciled.
-func observedReady(t *testing.T, name string, body map[string]any) *fnv1.Resource {
+// loadTemplate reads the shipped per-gateway composition template relative to
+// this test file so the test always validates the bytes the chart ships.
+func loadTemplate(t *testing.T) string {
 	t.Helper()
-	status, ok := body["status"].(map[string]any)
-	if !ok {
-		status = map[string]any{}
-	}
-	status["conditions"] = []any{
-		map[string]any{"type": "Ready", "status": "True"},
-	}
-	body["status"] = status
-	return observedResource(t, name, body)
+	return readChartTemplate(t, "gcp/composition.gotmpl")
 }
 
-// loadTemplate reads the shipped composition template relative to this test
-// file so the test always validates the bytes the chart ships.
-func loadTemplate(t *testing.T) string {
+// loadNetworkTemplate reads the shipped shared-network composition template,
+// the separate composition that owns the VPC the per-gateway composition wires
+// each instance and firewall onto.
+func loadNetworkTemplate(t *testing.T) string {
+	t.Helper()
+	return readChartTemplate(t, "gcp/network-composition.gotmpl")
+}
+
+// readChartTemplate reads a template at the given path relative to the crossplane
+// chart directory, resolving it relative to this test file so it does not depend
+// on the process working directory.
+func readChartTemplate(t *testing.T, relPath string) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
-	path := filepath.Join(repoRoot, "k8s", "charts", "wireguard-gateway-operator", "crossplane", "gcp", "composition.gotmpl")
+	path := filepath.Join(repoRoot, "k8s", "charts", "wireguard-gateway-operator", "crossplane", relPath)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read template %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// goTemplatingImage returns the function-go-templating package the providers
+// chart pins, making that values file the single source of truth for the digest
+// the test boots. The path is resolved relative to this test file so it does not
+// depend on the process working directory.
+func goTemplatingImage(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..",
+		"k8s", "infra", "crossplane", "crossplane-providers", "values.yaml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read providers values %s: %v", path, err)
+	}
+
+	var values struct {
+		Functions struct {
+			GoTemplating struct {
+				Package string `json:"package"`
+			} `json:"goTemplating"`
+		} `json:"functions"`
+	}
+	if err := yaml.Unmarshal(b, &values); err != nil {
+		t.Fatalf("parse providers values %s: %v", path, err)
+	}
+
+	pkg := values.Functions.GoTemplating.Package
+	if pkg == "" {
+		t.Fatalf("functions.goTemplating.package empty in %s", path)
+	}
+	return pkg
 }
 
 func toStruct(t *testing.T, m map[string]any) *structpb.Struct {
@@ -543,6 +705,31 @@ func assertWithheld(t *testing.T, resp *fnv1.RunFunctionResponse, name string) {
 	}
 	if res.GetReady() != fnv1.Ready_READY_FALSE {
 		t.Errorf("resource %q is desired with Ready=%v, want absent or READY_FALSE", name, res.GetReady())
+	}
+}
+
+// assertSharedNetworkNIC asserts the instance's primary NIC attaches directly to
+// the shared VPC by name and carries no subnetwork wiring, the shape the
+// shared-VPC refactor requires now that the per-gateway composition no longer
+// creates a Subnetwork.
+func assertSharedNetworkNIC(t *testing.T, inst map[string]any) {
+	t.Helper()
+	nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")
+	if len(nics) == 0 {
+		t.Fatalf("instance has no networkInterface")
+	}
+	nic0, ok := nics[0].(map[string]any)
+	if !ok {
+		t.Fatalf("networkInterface[0] is %T, want map", nics[0])
+	}
+	if got, _ := nic0["network"].(string); got != sharedNetworkName {
+		t.Errorf("instance networkInterface[0].network = %q, want shared network %q", got, sharedNetworkName)
+	}
+	if _, ok := nic0["subnetwork"]; ok {
+		t.Errorf("instance networkInterface[0] must not pin a subnetwork, got %v", nic0["subnetwork"])
+	}
+	if _, ok := nic0["subnetworkSelector"]; ok {
+		t.Errorf("instance networkInterface[0] must not pin a subnetworkSelector, got %v", nic0["subnetworkSelector"])
 	}
 }
 

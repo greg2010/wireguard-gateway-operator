@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# setup-gcp-project.sh — stand up a GCP project for running cyno e2e/deploy.
+# setup-gcp-project.sh — stand up a GCP project for running gateway e2e/deploy.
 #
 # Reads config from $REPO_ROOT/.env (see .env.example). Idempotent: every step
 # checks current state before acting, so re-running is safe. Creates the
-# project (optionally linking billing), enables the required APIs, and creates
-# the provider-gcp service account with the roles cyno's Crossplane
-# compositions need. Obtain credentials afterwards with get-gcp-creds.sh.
+# project (optionally linking billing) and enables the required APIs. Create the
+# service account next with setup-gcp-sa.sh, then obtain credentials with
+# get-gcp-creds.sh.
 
 set -euo pipefail
 
@@ -29,9 +29,6 @@ require() {
 }
 
 require GCP_PROJECT_ID
-require CROSSPLANE_SA_NAME
-
-SA_EMAIL="${CROSSPLANE_SA_NAME}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "Configuring GCP project '${GCP_PROJECT_ID}'..."
 
@@ -62,34 +59,8 @@ gcloud services enable \
   cloudresourcemanager.googleapis.com \
   --project="$GCP_PROJECT_ID"
 
-if gcloud iam service-accounts describe "$SA_EMAIL" \
-    --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
-  echo "  service account ${SA_EMAIL} already exists"
-else
-  echo "  creating service account ${SA_EMAIL}"
-  gcloud iam service-accounts create "$CROSSPLANE_SA_NAME" \
-    --project="$GCP_PROJECT_ID" \
-    --display-name="cyno provider-gcp"
-fi
-
-# Roles: add-iam-policy-binding is idempotent, so loop unconditionally.
-echo "  binding roles to ${SA_EMAIL}"
-for role in \
-  roles/compute.admin \
-  roles/iam.serviceAccountAdmin \
-  roles/iam.serviceAccountUser \
-  roles/secretmanager.admin; do
-  echo "    ${role}"
-  gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="$role" \
-    --condition=None \
-    >/dev/null
-done
-
 echo ""
 echo "Project ready."
 echo "  Project:         ${GCP_PROJECT_ID}"
-echo "  Service account: ${SA_EMAIL}"
 echo "  Region / zone:   ${GCP_REGION:-unset} / ${GCP_ZONE:-unset}"
-echo "  Next:            run scripts/get-gcp-creds.sh to obtain credentials"
+echo "  Next:            run scripts/setup-gcp-sa.sh to create the service account"

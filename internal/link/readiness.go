@@ -72,7 +72,7 @@ func (r *readiness) handler(w http.ResponseWriter, req *http.Request) {
 // ok is false when no peer has a non-zero handshake.
 func freshestHandshake(wgShowOutput string) (time.Time, bool) {
 	var newest int64
-	for _, line := range strings.Split(wgShowOutput, "\n") {
+	for line := range strings.SplitSeq(wgShowOutput, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue

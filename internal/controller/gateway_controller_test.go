@@ -2,37 +2,45 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/api/v1alpha1"
+	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
+	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
 
 // reconcileConfig is the operator config the controller tests reconcile with.
+// PodNamespace is "default" because every envtest control plane provisions that
+// namespace, so the singleton shared network applies cleanly in every test that
+// runs a real reconcile, including the manager-backed transition tests that create
+// only per-subtest gateway namespaces.
 func reconcileConfig() Config {
 	return Config{
 		LinkImage:           "registry.example.com/gateway-link:test",
 		LinkImagePullPolicy: "IfNotPresent",
-		WGSubnet:            "10.99.0.0/29",
-		WGLinkAddress:       "10.99.0.2",
-		WGListenPort:        51820,
-		WGKeepalive:         25,
-		WGMTU:               1380,
-		GCPSubnetCIDR:       "10.200.0.0/24",
-		GCPReservedIP:       true,
 		UserData:            "#ignition\n",
+		SharedNetworkName:   "wgnet-test",
+		PodNamespace:        "default",
 		// Zero requeue keeps the test from depending on wall-clock requeue timing;
 		// the test re-invokes Reconcile explicitly.
 		RequeueInterval: 0,
@@ -88,6 +96,19 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 		t.Fatalf("create namespace: %v", err)
 	}
 
+	// sampleGateway's forwards target these Services; forward classification now
+	// requires each backend Service to exist with a real ClusterIP that publishes
+	// the forward's target port and protocol before the reconciler provisions
+	// children, so the lifecycle path must create them with matching ports.
+	for _, svc := range []*corev1.Service{
+		portedClusterIPService("wg-system", "web", 443, corev1.ProtocolTCP),
+		portedClusterIPService("wg-system", "vpn", 1194, corev1.ProtocolUDP),
+	} {
+		if err := te.client.Create(ctx, svc); err != nil && !apierrors.IsAlreadyExists(err) {
+			t.Fatalf("create service %s: %v", svc.Name, err)
+		}
+	}
+
 	gw := sampleGateway("edge", "wg-system")
 	if err := te.client.Create(ctx, gw); err != nil {
 		t.Fatalf("create gateway: %v", err)
@@ -96,6 +117,7 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 	gen, calls := countingKeyGen()
 	r := &GatewayReconciler{
 		Client:      te.client,
+		APIReader:   te.client,
 		Scheme:      te.scheme,
 		Config:      reconcileConfig(),
 		GenerateKey: gen,
@@ -147,8 +169,8 @@ func TestReconcileLifecycle(t *testing.T) {
 		}
 	})
 
-	t.Run("xgateway created and owner-ref'd", func(t *testing.T) {
-		xg := newXGateway()
+	t.Run("xgatewaygcp created and owner-ref'd", func(t *testing.T) {
+		xg := newXGatewayGCP()
 		mustGet(ctx, t, cl, key, xg)
 		assertNestedString(t, xg, "us-central1", "spec", "region")
 		assertNestedString(t, xg, bundleSecretName(gw), "spec", "wgKeySecretRef", "name")
@@ -164,21 +186,24 @@ func TestReconcileLifecycle(t *testing.T) {
 		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &cm)
 		assertOwnedByGateway(t, &cm, gw)
 
-		var sa corev1.ServiceAccount
-		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &sa)
-		assertOwnedByGateway(t, &sa, gw)
+		var np networkingv1.NetworkPolicy
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &np)
+		assertOwnedByGateway(t, &np, gw)
 
-		var role rbacv1.Role
-		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &role)
-		assertOwnedByGateway(t, &role, gw)
-
-		var rb rbacv1.RoleBinding
-		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &rb)
-		assertOwnedByGateway(t, &rb, gw)
+		// The link no longer runs under a dedicated ServiceAccount/Role/RoleBinding;
+		// the operator must not create them.
+		for _, probe := range []client.Object{
+			&corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{},
+		} {
+			err := cl.Get(ctx, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, probe)
+			if !apierrors.IsNotFound(err) {
+				t.Errorf("link %T get = %v, want NotFound (no link RBAC)", probe, err)
+			}
+		}
 	})
 
-	t.Run("status mirrored after composite reports address", func(t *testing.T) {
-		setXGatewayStatus(ctx, t, cl, key, "203.0.113.9", "sa@example.iam.gserviceaccount.com")
+	t.Run("status mirrored and endpoint rendered after composite reports address", func(t *testing.T) {
+		setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.9", "sa@example.iam.gserviceaccount.com")
 		setLinkDeploymentAvailable(ctx, t, cl, key)
 		drainReconcile(ctx, t, r, key)
 
@@ -193,6 +218,16 @@ func TestReconcileLifecycle(t *testing.T) {
 		if c := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady); c == nil || c.Status != metav1.ConditionTrue {
 			t.Errorf("Ready condition = %+v, want True", c)
 		}
+
+		// Once the composite reports an address, the reconciler renders it as the
+		// link's WireGuard peer endpoint so the link reloads in place.
+		var cm corev1.ConfigMap
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &cm)
+		var rc link.RuntimeConfig
+		decodeJSON(t, cm.Data[linkConfigKey], &rc)
+		if want := "203.0.113.9:51820"; rc.WireGuard.Peer.Endpoint != want {
+			t.Errorf("link configmap peer.endpoint = %q, want %q", rc.WireGuard.Peer.Endpoint, want)
+		}
 	})
 
 	t.Run("dns endpoint created once address known", func(t *testing.T) {
@@ -206,7 +241,7 @@ func TestReconcileLifecycle(t *testing.T) {
 		assertOwnedByGatewayUnstructured(t, ep, gw)
 	})
 
-	t.Run("delete removes xgateway and releases finalizer", func(t *testing.T) {
+	t.Run("delete removes xgatewaygcp and releases finalizer", func(t *testing.T) {
 		var live wgnetv1alpha1.Gateway
 		mustGet(ctx, t, cl, key, &live)
 		if err := cl.Delete(ctx, &live); err != nil {
@@ -221,9 +256,15 @@ func TestReconcileLifecycle(t *testing.T) {
 			return apierrors.IsNotFound(cl.Get(ctx, key, &after))
 		})
 
-		xg := newXGateway()
+		xg := newXGatewayGCP()
 		if err := cl.Get(ctx, key, xg); !apierrors.IsNotFound(err) {
-			t.Errorf("xgateway get after gateway purge = %v, want NotFound", err)
+			t.Errorf("xgatewaygcp get after gateway purge = %v, want NotFound", err)
+		}
+
+		// edge is the only Gateway, so its teardown is the last delete: the refcount
+		// path must have deleted the shared network too.
+		if err := cl.Get(ctx, sharedNetworkKey(r), newXGatewayNetwork()); !apierrors.IsNotFound(err) {
+			t.Errorf("shared network get after last gateway purge = %v, want NotFound", err)
 		}
 	})
 }
@@ -256,7 +297,7 @@ func TestReconcileIdempotent(t *testing.T) {
 
 			drainReconcile(ctx, t, r, key)
 			if tc.address != "" {
-				setXGatewayStatus(ctx, t, cl, key, tc.address, tc.saEmail)
+				setXGatewayGCPStatus(ctx, t, cl, key, tc.address, tc.saEmail)
 				setLinkDeploymentAvailable(ctx, t, cl, key)
 				drainReconcile(ctx, t, r, key)
 			}
@@ -292,6 +333,558 @@ func TestReconcileIdempotent(t *testing.T) {
 	}
 }
 
+// sharedNetworkKey is the object key of the singleton shared network the
+// reconciler r ensures, derived from its config so it cannot drift from what the
+// reconciler applies.
+func sharedNetworkKey(r *GatewayReconciler) client.ObjectKey {
+	return client.ObjectKey{Name: r.Config.SharedNetworkName, Namespace: r.Config.PodNamespace}
+}
+
+// reconcileUntilGone drives Reconcile until the Gateway at key is purged from the
+// API server, the same way the lifecycle delete subtest does. The refcount
+// teardown spans several reconciles (delete the per-gateway composite, observe it
+// gone, then for the last Gateway delete the shared network and wait for it to
+// vanish), so a fixed iteration count would be brittle; polling Reconcile until
+// the finalizer is released is deterministic against that multi-pass drain.
+func reconcileUntilGone(ctx context.Context, t *testing.T, r *GatewayReconciler, cl client.Client, key client.ObjectKey) {
+	t.Helper()
+	eventually(ctx, t, "gateway "+key.String()+" purged after delete", func() bool {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile delete %s: %v", key, err)
+		}
+		return apierrors.IsNotFound(cl.Get(ctx, key, &wgnetv1alpha1.Gateway{}))
+	})
+}
+
+// TestReconcileSharedNetworkRefcount asserts the shared network's lifecycle is
+// refcounted across Gateways: it survives a non-last Gateway's teardown and is
+// removed only when the last Gateway is deleted. Two Gateways share one network,
+// so deleting the first must leave the network in place while deleting the second
+// (the last) must tear it down. It runs against a real API server because the
+// reconciler applies the network with server-side apply, which only a real control
+// plane models, so it skips when envtest assets are unavailable.
+func TestReconcileSharedNetworkRefcount(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	const ns = "wg-system"
+	mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+	mustCreate(ctx, t, cl, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+	mustCreate(ctx, t, cl, portedClusterIPService(ns, "vpn", 1194, corev1.ProtocolUDP))
+
+	gen, _ := countingKeyGen()
+	r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+
+	gw1 := sampleGateway("gw-one", ns)
+	gw2 := sampleGateway("gw-two", ns)
+	mustCreate(ctx, t, cl, gw1)
+	mustCreate(ctx, t, cl, gw2)
+	key1 := client.ObjectKeyFromObject(gw1)
+	key2 := client.ObjectKeyFromObject(gw2)
+
+	drainReconcile(ctx, t, r, key1)
+	drainReconcile(ctx, t, r, key2)
+
+	// Both Gateways converged, so the singleton shared network exists exactly once.
+	if err := cl.Get(ctx, sharedNetworkKey(r), newXGatewayNetwork()); err != nil {
+		t.Fatalf("shared network get after both gateways provisioned = %v, want present", err)
+	}
+
+	// Deleting the first of two Gateways is not the last delete: the network must
+	// survive and gw-one must be fully purged.
+	mustDeleteGateway(ctx, t, cl, key1)
+	reconcileUntilGone(ctx, t, r, cl, key1)
+	if err := cl.Get(ctx, sharedNetworkKey(r), newXGatewayNetwork()); err != nil {
+		t.Errorf("shared network get after first of two gateways deleted = %v, want still present", err)
+	}
+
+	// Deleting the second Gateway is the last delete: the refcount path must tear
+	// the shared network down and only then release gw-two's finalizer.
+	mustDeleteGateway(ctx, t, cl, key2)
+	reconcileUntilGone(ctx, t, r, cl, key2)
+	if err := cl.Get(ctx, sharedNetworkKey(r), newXGatewayNetwork()); !apierrors.IsNotFound(err) {
+		t.Errorf("shared network get after last gateway deleted = %v, want NotFound", err)
+	}
+}
+
+// mustDeleteGateway re-reads the live Gateway at key and deletes it, so the delete
+// carries the server's current resourceVersion rather than a stale fixture copy.
+func mustDeleteGateway(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) {
+	t.Helper()
+	var live wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &live)
+	if err := cl.Delete(ctx, &live); err != nil {
+		t.Fatalf("delete gateway %s: %v", key, err)
+	}
+}
+
+// newGatewayCELFixture builds a Gateway carrying the given forwards and an
+// explicit spec.wireguard.listenPort, for the admission-time CEL validation test.
+// A zero wgPort is left unset so the CRD default applies, exercising the rules
+// against the defaulted port.
+func newGatewayCELFixture(name, namespace string, wgPort int32, forwards []wgnetv1alpha1.Forward) *wgnetv1alpha1.Gateway {
+	gw := newGateway(name, namespace, forwards, nil)
+	gw.Spec.Wireguard.ListenPort = wgPort
+	return gw
+}
+
+// newGatewayNoWireguard builds a Gateway as an unstructured object with the
+// spec.wireguard key entirely absent, so the CRD's spec.wireguard default and the
+// CEL rules run against a fully defaulted block. A typed fixture cannot express
+// this: encoding/json's omitempty does not drop a non-pointer struct, so a typed
+// Gateway always marshals spec.wireguard as a present (if empty) object.
+func newGatewayNoWireguard(name, namespace string, forwards []wgnetv1alpha1.Forward) *unstructured.Unstructured {
+	rawForwards := make([]any, 0, len(forwards))
+	for _, f := range forwards {
+		rawForwards = append(rawForwards, map[string]any{
+			"port":     int64(f.Port),
+			"protocol": string(f.Protocol),
+			"service":  f.Service,
+		})
+	}
+
+	spec := map[string]any{
+		"gcp": map[string]any{
+			"projectID": "test-project",
+			"region":    "us-central1",
+			"zone":      "us-central1-a",
+		},
+	}
+	if len(rawForwards) > 0 {
+		spec["forwards"] = rawForwards
+	}
+
+	gw := &unstructured.Unstructured{Object: map[string]any{"spec": spec}}
+	gw.SetGroupVersionKind(wgnetv1alpha1.GroupVersion.WithKind("Gateway"))
+	gw.SetName(name)
+	gw.SetNamespace(namespace)
+	return gw
+}
+
+// TestGatewayCELValidation exercises the spec-level CEL rules at admission: the
+// per-(port,protocol) uniqueness rule and the rule barring a UDP forward on the
+// WireGuard listen port. Each case creates its own namespace and Gateway; the
+// rules fire at admission, so no Services or reconcile are needed. Accepted
+// Gateways must create cleanly; rejected ones must fail with an Invalid error
+// carrying the CEL message. The on-disk generated CRD must already carry the
+// rules for this to pass, which is what makes the manifests regen the green step.
+func TestGatewayCELValidation(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	tcp := wgnetv1alpha1.ProtocolTCP
+	udp := wgnetv1alpha1.ProtocolUDP
+
+	tests := []struct {
+		name string
+		// omitWireguard builds the Gateway with spec.wireguard absent so the rules
+		// run against the CRD-defaulted block; otherwise wgPort sets the listen port
+		// explicitly (zero leaves it unset for the default).
+		omitWireguard bool
+		wgPort        int32
+		forwards      []wgnetv1alpha1.Forward
+		accept        bool
+	}{
+		{
+			name:   "duplicate port and protocol rejected",
+			wgPort: 0,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 443, Protocol: tcp, Service: "a"},
+				{Port: 443, Protocol: tcp, Service: "b"},
+			},
+			accept: false,
+		},
+		{
+			name:   "same port differing protocol accepted",
+			wgPort: 0,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 443, Protocol: tcp, Service: "a"},
+				{Port: 443, Protocol: udp, Service: "b"},
+			},
+			accept: true,
+		},
+		{
+			name:   "udp forward on defaulted wireguard port rejected",
+			wgPort: 0,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 51820, Protocol: udp, Service: "a"},
+			},
+			accept: false,
+		},
+		{
+			name:          "udp forward on omitted wireguard port rejected",
+			omitWireguard: true,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 51820, Protocol: udp, Service: "a"},
+			},
+			accept: false,
+		},
+		{
+			name:   "udp forward on explicit wireguard port rejected",
+			wgPort: 51821,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 51821, Protocol: udp, Service: "a"},
+			},
+			accept: false,
+		},
+		{
+			name:   "udp forward on default port accepted when wireguard port moved",
+			wgPort: 51821,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 51820, Protocol: udp, Service: "a"},
+			},
+			accept: true,
+		},
+		{
+			name:   "tcp forward on wireguard port accepted",
+			wgPort: 51820,
+			forwards: []wgnetv1alpha1.Forward{
+				{Port: 51820, Protocol: tcp, Service: "a"},
+			},
+			accept: true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("cel-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+
+			var gw client.Object
+			if tt.omitWireguard {
+				gw = newGatewayNoWireguard(ns, ns, tt.forwards)
+			} else {
+				gw = newGatewayCELFixture(ns, ns, tt.wgPort, tt.forwards)
+			}
+			err := cl.Create(ctx, gw)
+
+			if tt.accept {
+				if err != nil {
+					t.Fatalf("create accepted Gateway: %v", err)
+				}
+				if delErr := cl.Delete(ctx, gw); delErr != nil {
+					t.Errorf("delete Gateway: %v", delErr)
+				}
+				return
+			}
+
+			if !apierrors.IsInvalid(err) {
+				t.Fatalf("create rejected Gateway: err = %v, want Invalid", err)
+			}
+		})
+	}
+}
+
+// TestGatewayWireguardDefaulting verifies spec.wireguard is optional: a Gateway
+// that omits the block entirely must be admitted (no `Required value`) and read
+// back with every sub-field carrying its CRD default. This is the admission-time
+// guard against the regression where spec.wireguard was a required object and a
+// Gateway relying on the defaults was rejected.
+func TestGatewayWireguardDefaulting(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	const ns = "wg-default"
+	mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+
+	gw := newGatewayNoWireguard(ns, ns, nil)
+	if err := cl.Create(ctx, gw); err != nil {
+		t.Fatalf("create Gateway with omitted spec.wireguard: %v", err)
+	}
+
+	var got wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: ns}, &got)
+
+	wantWG := wgnetv1alpha1.GatewayWireguardSpec{
+		ListenPort:        51820,
+		Subnet:            "10.99.0.0/29",
+		GatewayAddress:    "10.99.0.1",
+		LinkAddress:       "10.99.0.2",
+		Keepalive:         25,
+		MTU:               1380,
+		ReconcileInterval: "10s",
+	}
+	if got.Spec.Wireguard != wantWG {
+		t.Errorf("defaulted spec.wireguard = %+v, want %+v", got.Spec.Wireguard, wantWG)
+	}
+}
+
+// portedClusterIPService builds a ClusterIP Service in ns publishing port/proto;
+// the envtest API server assigns spec.clusterIP on create, so classification sees
+// a routable VIP. The published port must match a forward's effective target port
+// for the target-port-listens check to pass.
+func portedClusterIPService(ns, name string, port int32, proto corev1.Protocol) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{Port: port, Protocol: proto}},
+		},
+	}
+}
+
+// portedNodePortService builds a NodePort Service publishing port/proto; like
+// ClusterIP it carries a real ClusterIP, so classification must accept it when the
+// published port matches the forward.
+func portedNodePortService(ns, name string, port int32, proto corev1.Protocol) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{{Port: port, Protocol: proto}},
+		},
+	}
+}
+
+// externalNameService builds an ExternalName Service, which has no ClusterIP and
+// must be rejected by forward classification.
+func externalNameService(ns, name string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: "example.com",
+		},
+	}
+}
+
+// headlessService builds a headless ClusterIP Service (clusterIP None), which has
+// no stable VIP and must be rejected by forward classification.
+func headlessService(ns, name string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.ServiceSpec{
+			Type:      corev1.ServiceTypeClusterIP,
+			ClusterIP: corev1.ClusterIPNone,
+			Ports:     []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP}},
+		},
+	}
+}
+
+// TestClassifyForwards exercises the single-forward classification path end to end
+// against a real API server: the cross-namespace consent gate, the Service-type
+// checks, and the target-port-listens check that decide whether a forward is
+// valid. With one forward, a valid forward provisions and an invalid one (the only
+// forward, so zero valid) provisions nothing, so the outcomes mirror the prior
+// all-or-nothing gate. Each row uses its own gateway and target namespaces so the
+// cases stay isolated under one envtest control plane.
+//
+// Accepted forwards must let provisioning proceed (the bundle Secret appears and
+// the Ready reason is the provisioning state, not a denial). Denied forwards must
+// leave Ready=False with the specific reason and provision nothing. Transient
+// reasons (a not-yet-created Service, a not-yet-published target port) requeue
+// after validationRequeueAfter rather than failing permanently.
+func TestClassifyForwards(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	type outcome struct {
+		// accepted means classification passed and provisioning ran.
+		accepted bool
+		// wantReason is the expected Ready reason on a denial (ignored when accepted).
+		wantReason string
+		// wantRequeue is the expected RequeueAfter from the reconcile that ran
+		// classification; zero means none asserted.
+		wantRequeue time.Duration
+	}
+
+	tests := []struct {
+		name string
+		// setup creates the prerequisite namespaces/services for the case in the
+		// given gateway namespace and returns the forward under test.
+		setup func(t *testing.T, gwNS string) wgnetv1alpha1.Forward
+		want  outcome
+	}{
+		{
+			name: "same-namespace ClusterIP service accepted",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 443, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{accepted: true},
+		},
+		{
+			name: "NodePort service accepted",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, portedNodePortService(gwNS, "web", 443, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{accepted: true},
+		},
+		{
+			name: "target port matching a published service port accepted",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 8443, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443}
+			},
+			want: outcome{accepted: true},
+		},
+		{
+			name: "ExternalName service rejected",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, externalNameService(gwNS, "web"))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{wantReason: reasonUnsupportedServiceType},
+		},
+		{
+			name: "headless service rejected",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, headlessService(gwNS, "web"))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{wantReason: reasonUnsupportedServiceType},
+		},
+		{
+			name: "target port not among published ports rejected",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 80, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{wantReason: reasonTargetPortNotListening, wantRequeue: validationRequeueAfter},
+		},
+		{
+			name: "target port published under a different protocol rejected",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 443, corev1.ProtocolUDP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{wantReason: reasonTargetPortNotListening, wantRequeue: validationRequeueAfter},
+		},
+		{
+			name: "cross-namespace with consent label accepted",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				target := gwNS + "-target"
+				mustCreate(ctx, t, cl, namespaceWithLabels(target, map[string]string{
+					crossNamespaceIngressLabel: crossNamespaceIngressValue,
+				}))
+				mustCreate(ctx, t, cl, portedClusterIPService(target, "web", 443, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: target}
+			},
+			want: outcome{accepted: true},
+		},
+		{
+			name: "cross-namespace without consent label denied",
+			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				target := gwNS + "-target"
+				mustCreate(ctx, t, cl, namespaceWithLabels(target, nil))
+				mustCreate(ctx, t, cl, portedClusterIPService(target, "web", 443, corev1.ProtocolTCP))
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: target}
+			},
+			want: outcome{wantReason: reasonCrossNamespaceForwardDenied},
+		},
+		{
+			name: "cross-namespace target namespace missing denied",
+			setup: func(_ *testing.T, gwNS string) wgnetv1alpha1.Forward {
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: gwNS + "-ghost"}
+			},
+			want: outcome{wantReason: reasonTargetNamespaceNotFound, wantRequeue: validationRequeueAfter},
+		},
+		{
+			name: "backend service not found requeues",
+			setup: func(_ *testing.T, _ string) wgnetv1alpha1.Forward {
+				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
+			},
+			want: outcome{wantReason: reasonServiceNotFound, wantRequeue: validationRequeueAfter},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gwNS := fmt.Sprintf("vf-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(gwNS, nil))
+
+			forward := tt.setup(t, gwNS)
+			gw := newGateway(gwNS, gwNS, []wgnetv1alpha1.Forward{forward}, nil)
+			mustCreate(ctx, t, cl, gw)
+
+			gen, _ := countingKeyGen()
+			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+			key := client.ObjectKeyFromObject(gw)
+
+			result := reconcileToClassification(ctx, t, r, key)
+
+			var got wgnetv1alpha1.Gateway
+			mustGet(ctx, t, cl, key, &got)
+			cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+
+			bundleExists := !apierrors.IsNotFound(
+				cl.Get(ctx, client.ObjectKey{Namespace: gwNS, Name: bundleSecretName(gw)}, &corev1.Secret{}))
+
+			if tt.want.accepted {
+				if !bundleExists {
+					t.Errorf("accepted forward did not provision: bundle Secret absent")
+				}
+				if cond != nil && isValidationDenialReason(cond.Reason) {
+					t.Errorf("accepted forward carries denial reason %q", cond.Reason)
+				}
+				return
+			}
+
+			if bundleExists {
+				t.Errorf("denied forward provisioned children: bundle Secret present")
+			}
+			if cond == nil || cond.Status != metav1.ConditionFalse {
+				t.Fatalf("Ready condition = %+v, want False", cond)
+			}
+			if cond.Reason != tt.want.wantReason {
+				t.Errorf("Ready reason = %q, want %q (message: %q)", cond.Reason, tt.want.wantReason, cond.Message)
+			}
+			if tt.want.wantRequeue != 0 && result.RequeueAfter != tt.want.wantRequeue {
+				t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, tt.want.wantRequeue)
+			}
+		})
+	}
+}
+
+// isValidationDenialReason reports whether reason is one of the forward-validation
+// denial reasons, used to assert an accepted forward did not land in a denied
+// state.
+func isValidationDenialReason(reason string) bool {
+	switch reason {
+	case reasonCrossNamespaceForwardDenied, reasonTargetNamespaceNotFound,
+		reasonUnsupportedServiceType, reasonServiceNotFound, reasonTargetPortNotListening:
+		return true
+	default:
+		return false
+	}
+}
+
+// reconcileToClassification reconciles past the finalizer-add pass (which requeues
+// before classification runs) and returns the result of the pass that actually
+// classifies the forwards. The first reconcile adds the finalizer and requeues;
+// the second classifies, so its result carries any classification requeue.
+func reconcileToClassification(ctx context.Context, t *testing.T, r *GatewayReconciler, key client.ObjectKey) ctrl.Result {
+	t.Helper()
+	req := ctrl.Request{NamespacedName: key}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (finalizer pass): %v", err)
+	}
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile (classification pass): %v", err)
+	}
+	return result
+}
+
+// namespaceWithLabels builds a Namespace carrying the given labels.
+func namespaceWithLabels(name string, labels map[string]string) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
+}
+
+// mustCreate creates obj, tolerating an already-exists result so a shared envtest
+// control plane can be reused across rows.
+func mustCreate(ctx context.Context, t *testing.T, cl client.Client, obj client.Object) {
+	t.Helper()
+	if err := cl.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create %T %s/%s: %v", obj, obj.GetNamespace(), obj.GetName(), err)
+	}
+}
+
 // mustGet fetches obj at key, failing the test on error.
 func mustGet(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, obj client.Object) {
 	t.Helper()
@@ -300,11 +893,11 @@ func mustGet(ctx context.Context, t *testing.T, cl client.Client, key client.Obj
 	}
 }
 
-// setXGatewayStatus patches the composite's status subresource with an observed
+// setXGatewayGCPStatus patches the composite's status subresource with an observed
 // address and serviceAccountEmail, simulating Crossplane's status write.
-func setXGatewayStatus(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, address, saEmail string) {
+func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, address, saEmail string) {
 	t.Helper()
-	xg := newXGateway()
+	xg := newXGatewayGCP()
 	mustGet(ctx, t, cl, key, xg)
 	if err := unstructured.SetNestedField(xg.Object, address, "status", "address"); err != nil {
 		t.Fatalf("set status.address: %v", err)
@@ -313,7 +906,7 @@ func setXGatewayStatus(ctx context.Context, t *testing.T, cl client.Client, key 
 		t.Fatalf("set status.serviceAccountEmail: %v", err)
 	}
 	if err := cl.Status().Update(ctx, xg); err != nil {
-		t.Fatalf("update xgateway status: %v", err)
+		t.Fatalf("update xgatewaygcp status: %v", err)
 	}
 }
 
@@ -358,4 +951,663 @@ func assertOwnedByGateway(t *testing.T, obj metav1.Object, gw *wgnetv1alpha1.Gat
 func assertOwnedByGatewayUnstructured(t *testing.T, u *unstructured.Unstructured, gw *wgnetv1alpha1.Gateway) {
 	t.Helper()
 	assertOwnedByGateway(t, u, gw)
+}
+
+// recordedEvent captures one events.EventRecorder.Eventf call so a test can
+// assert on the emitted event.
+type recordedEvent struct {
+	regarding runtime.Object
+	eventtype string
+	reason    string
+	action    string
+	note      string
+}
+
+// fakeEventRecorder is a hand fake of events.EventRecorder that records every
+// Eventf call. The interface has a single method, so a generated mock would add
+// nothing over capturing the args directly.
+type fakeEventRecorder struct {
+	events []recordedEvent
+}
+
+func (f *fakeEventRecorder) Eventf(regarding runtime.Object, _ runtime.Object, eventtype, reason, action, note string, args ...interface{}) {
+	f.events = append(f.events, recordedEvent{
+		regarding: regarding,
+		eventtype: eventtype,
+		reason:    reason,
+		action:    action,
+		note:      fmt.Sprintf(note, args...),
+	})
+}
+
+// TestReconcilerFailEmitsEvent covers the reconcile-failure path: fail must emit a
+// Warning event describing the failure when a recorder is wired, and must not
+// panic when the recorder is nil. The status write fail performs needs a real API
+// server, so the test runs against envtest.
+func TestReconcilerFailEmitsEvent(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "wg-system"}}
+	mustCreate(ctx, t, cl, ns)
+
+	tests := []struct {
+		name         string
+		gateway      string
+		withRecorder bool
+		wantEvents   int
+	}{
+		{name: "records warning event when recorder wired", gateway: "fail-recorded", withRecorder: true, wantEvents: 1},
+		{name: "no panic when recorder nil", gateway: "fail-nil-recorder", withRecorder: false, wantEvents: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway(tt.gateway, "wg-system", nil, nil)
+			mustCreate(ctx, t, cl, gw)
+
+			rec := &fakeEventRecorder{}
+			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig()}
+			if tt.withRecorder {
+				r.Recorder = rec
+			}
+
+			cause := fmt.Errorf("boom")
+			_, err := r.fail(ctx, gw, "ensure xgatewaygcp", cause)
+			if err == nil {
+				t.Fatalf("fail returned nil error; want the wrapped cause surfaced")
+			}
+			if !errors.Is(err, cause) {
+				t.Errorf("fail error = %v; want it to wrap %v", err, cause)
+			}
+
+			if len(rec.events) != tt.wantEvents {
+				t.Fatalf("recorded %d events; want %d", len(rec.events), tt.wantEvents)
+			}
+			if tt.wantEvents == 0 {
+				return
+			}
+
+			ev := rec.events[0]
+			if ev.eventtype != corev1.EventTypeWarning {
+				t.Errorf("event type = %q; want %q", ev.eventtype, corev1.EventTypeWarning)
+			}
+			if ev.reason != reasonReconcileFailed {
+				t.Errorf("event reason = %q; want %q", ev.reason, reasonReconcileFailed)
+			}
+			if ev.action != actionReconcile {
+				t.Errorf("event action = %q; want %q", ev.action, actionReconcile)
+			}
+			if evGW, ok := ev.regarding.(*wgnetv1alpha1.Gateway); !ok || evGW.Name != tt.gateway {
+				t.Errorf("event regarding = %#v; want Gateway %q", ev.regarding, tt.gateway)
+			}
+			if !strings.Contains(ev.note, "ensure xgatewaygcp") || !strings.Contains(ev.note, "boom") {
+				t.Errorf("event note = %q; want it to describe the wrapped failure", ev.note)
+			}
+
+			var got wgnetv1alpha1.Gateway
+			mustGet(ctx, t, cl, client.ObjectKeyFromObject(gw), &got)
+			cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonReconcileFailed {
+				t.Errorf("Ready condition = %#v; want False/%s", cond, reasonReconcileFailed)
+			}
+		})
+	}
+}
+
+// linkConfigForwards reads the link ConfigMap the reconciler rendered for the
+// Gateway at key and returns its runtime forwards, failing the test if the
+// ConfigMap or its config key is absent. It is the assertion surface for "which
+// forwards did the operator actually expose", since the link config carries
+// exactly the valid subset.
+func linkConfigForwards(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) []link.Forward {
+	t.Helper()
+	var cm corev1.ConfigMap
+	cmKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
+	if err := cl.Get(ctx, cmKey, &cm); err != nil {
+		t.Fatalf("get link configmap %s: %v", cmKey, err)
+	}
+	raw, ok := cm.Data[linkConfigKey]
+	if !ok {
+		t.Fatalf("link configmap %s missing %q", cmKey, linkConfigKey)
+	}
+	var rc link.RuntimeConfig
+	decodeJSON(t, raw, &rc)
+	return rc.Forwards
+}
+
+// forwardServiceNames returns the Service FQDNs of the given runtime forwards, the
+// stable field for asserting which forwards a link config carries.
+func forwardServiceNames(forwards []link.Forward) []string {
+	names := make([]string, 0, len(forwards))
+	for _, f := range forwards {
+		names = append(names, f.Service)
+	}
+	return names
+}
+
+// TestMixedForwards covers the per-forward classification contract that
+// distinguishes the new gate from the prior all-or-nothing one: a Gateway with one
+// valid and one invalid forward provisions, exposes only the valid forward in the
+// link config, and reports Ready=False carrying the invalid forward's reason. The
+// invalid forward here is a missing backend Service (ServiceNotFound).
+func TestMixedForwards(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	const ns = "mixed"
+	mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+	mustCreate(ctx, t, cl, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+
+	gw := newGateway("mixed-gw", ns, []wgnetv1alpha1.Forward{
+		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+		{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "absent"},
+	}, nil)
+	mustCreate(ctx, t, cl, gw)
+
+	gen, _ := countingKeyGen()
+	r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+	key := client.ObjectKeyFromObject(gw)
+
+	result := reconcileToClassification(ctx, t, r, key)
+
+	// A valid forward exists, so the Gateway provisions: the bundle Secret appears.
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &corev1.Secret{}); err != nil {
+		t.Fatalf("mixed Gateway did not provision (bundle Secret absent): %v", err)
+	}
+
+	// The link config carries only the valid forward, not the invalid one.
+	got := forwardServiceNames(linkConfigForwards(ctx, t, cl, key))
+	want := []string{"web." + ns + ".svc.cluster.local"}
+	if !slices.Equal(got, want) {
+		t.Errorf("link config forwards = %v, want %v (only the valid forward)", got, want)
+	}
+
+	// Ready=False with the invalid forward's reason.
+	var live wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &live)
+	cond := apimeta.FindStatusCondition(live.Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("Ready condition = %+v, want False", cond)
+	}
+	if cond.Reason != reasonServiceNotFound {
+		t.Errorf("Ready reason = %q, want %q (message: %q)", cond.Reason, reasonServiceNotFound, cond.Message)
+	}
+	// The invalid forward's reason is transient, so the reconcile requeues.
+	if result.RequeueAfter != validationRequeueAfter {
+		t.Errorf("RequeueAfter = %v, want %v (transient invalid forward)", result.RequeueAfter, validationRequeueAfter)
+	}
+}
+
+// startManager builds a controller manager on the envtest config, registers the
+// GatewayReconciler through SetupWithManager so the Service and Namespace watches
+// are live, and starts it in a goroutine. It returns the manager's client. The
+// reconciler watches all namespaces so one manager can
+// serve gateways the transition subtests create in distinct namespaces, and uses a
+// deterministic key generator and zero steady-state requeue so the test's signal
+// is the watch-driven reconvergence, not a timed poll. The manager is stopped via
+// t.Cleanup.
+func startManager(ctx context.Context, t *testing.T, te *testEnv) client.Client {
+	t.Helper()
+
+	mgr, err := ctrl.NewManager(te.cfg, ctrl.Options{
+		Scheme: te.scheme,
+		// Disable the metrics listener so parallel managers in one test binary do
+		// not contend for a port.
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	gen, _ := countingKeyGen()
+	r := &GatewayReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Config:      reconcileConfig(),
+		GenerateKey: gen,
+	}
+	if err := r.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup reconciler with manager: %v", err)
+	}
+
+	mgrCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := mgr.Start(mgrCtx); err != nil {
+			// Start returns an error on a genuine manager failure; a cancel-driven
+			// shutdown returns nil, so a non-nil error here is a real problem worth
+			// surfacing without racing the test goroutine's t.Fatalf.
+			t.Errorf("manager start: %v", err)
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	if !mgr.GetCache().WaitForCacheSync(mgrCtx) {
+		t.Fatal("manager cache failed to sync")
+	}
+	return mgr.GetClient()
+}
+
+// pollUntil polls cond until it returns true or timeout elapses, failing with msg
+// on timeout. It is the manager-backed transition test's await primitive: a longer
+// deadline than the package eventually helper, since a watch-driven reconcile plus
+// the status patches it triggers take longer to converge than a direct reconcile.
+func pollUntil(ctx context.Context, t *testing.T, timeout time.Duration, msg string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("%s: context done: %v", msg, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for %s", msg)
+}
+
+// transitionTimeout bounds each manager-backed transition wait. It covers a watch
+// event firing, a reconcile running, and (for the ready waits) the composite and
+// link Deployment statuses being patched, so it is generous relative to the direct
+// reconcile waits elsewhere.
+const transitionTimeout = 30 * time.Second
+
+// gatewayReadyReason fetches the Gateway at key with cl and returns its Ready
+// condition status and reason, or empty strings if the condition is absent.
+func gatewayReadyReason(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) (metav1.ConditionStatus, string) {
+	t.Helper()
+	var gw wgnetv1alpha1.Gateway
+	if err := cl.Get(ctx, key, &gw); err != nil {
+		t.Fatalf("get gateway %s: %v", key, err)
+	}
+	cond := apimeta.FindStatusCondition(gw.Status.Conditions, conditionReady)
+	if cond == nil {
+		return "", ""
+	}
+	return cond.Status, cond.Reason
+}
+
+// driveProvisionedReady makes a provisioned Gateway reach the readiness
+// preconditions envtest cannot supply on its own: it waits for the operator to
+// create the composite and link Deployment, patches the composite's observed
+// address, and marks the link Deployment Available. The operator's status-driven
+// watches then flip the Gateway Ready=True (when no forward is invalid). It is
+// idempotent and may be called repeatedly as a subtest re-provisions. Writes go
+// through the direct client so the patches are not delayed by cache propagation.
+func driveProvisionedReady(ctx context.Context, t *testing.T, direct client.Client, key client.ObjectKey) {
+	t.Helper()
+
+	pollUntil(ctx, t, transitionTimeout, "composite created for "+key.String(), func() bool {
+		return !apierrors.IsNotFound(direct.Get(ctx, key, newXGatewayGCP()))
+	})
+	setXGatewayGCPStatus(ctx, t, direct, key, "203.0.113.20", "sa@example.iam.gserviceaccount.com")
+
+	depKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
+	pollUntil(ctx, t, transitionTimeout, "link deployment created for "+key.String(), func() bool {
+		return !apierrors.IsNotFound(direct.Get(ctx, depKey, &appsv1.Deployment{}))
+	})
+	setLinkDeploymentAvailable(ctx, t, direct, key)
+}
+
+// TestForwardValidationTransitions runs a real manager so the Service and
+// Namespace watches enqueue, then drives backend changes and asserts the link
+// config and the Gateway Ready condition reconverge without a manual reconcile.
+// Each subtest uses its own namespace so the cases stay isolated under one manager.
+// Writes and reads use the direct envtest client so assertions see etcd state
+// without cache lag; the operator under test reconciles through its own cached
+// client.
+func TestForwardValidationTransitions(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	direct := te.client
+	startManager(ctx, t, te)
+
+	t.Run("service created after gateway", func(t *testing.T) {
+		const ns = "tr-svc-create"
+		mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+
+		gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+		}, nil)
+		mustCreate(ctx, t, direct, gw)
+		key := client.ObjectKeyFromObject(gw)
+
+		// No backend Service yet: the operator must not provision, and Ready=False
+		// carries ServiceNotFound.
+		pollUntil(ctx, t, transitionTimeout, "ServiceNotFound before backend exists", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonServiceNotFound
+		})
+		if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("bundle Secret get = %v, want NotFound (no valid forward, not provisioned)", err)
+		}
+
+		// Creating the backend Service must trigger the Service watch, re-classify
+		// the forward as valid, and provision it.
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+		pollUntil(ctx, t, transitionTimeout, "forward present after service created", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 1 && rc.Forwards[0].Service == "web."+ns+".svc.cluster.local"
+		})
+
+		driveProvisionedReady(ctx, t, direct, key)
+		pollUntil(ctx, t, transitionTimeout, "Ready=True after backend created", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionTrue && reason == reasonReady
+		})
+	})
+
+	t.Run("service deleted removes only that forward", func(t *testing.T) {
+		const ns = "tr-svc-delete"
+		mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "api", 8080, corev1.ProtocolTCP))
+
+		gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			{Port: 8080, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "api"},
+		}, nil)
+		mustCreate(ctx, t, direct, gw)
+		key := client.ObjectKeyFromObject(gw)
+
+		// Both forwards valid: the link config carries both and the Gateway is Ready.
+		pollUntil(ctx, t, transitionTimeout, "both forwards present", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 2
+		})
+		driveProvisionedReady(ctx, t, direct, key)
+		pollUntil(ctx, t, transitionTimeout, "Ready=True with both forwards", func() bool {
+			status, _ := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionTrue
+		})
+
+		// Deleting the "web" backend must drop only its forward; "api" stays, the
+		// Gateway keeps its VM, and Ready=False carries the ServiceNotFound reason.
+		if err := direct.Delete(ctx, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP)); err != nil {
+			t.Fatalf("delete web service: %v", err)
+		}
+		pollUntil(ctx, t, transitionTimeout, "only api forward remains after web deleted", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 1 && rc.Forwards[0].Service == "api."+ns+".svc.cluster.local"
+		})
+		pollUntil(ctx, t, transitionTimeout, "Ready=False/ServiceNotFound after web deleted", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonServiceNotFound
+		})
+		// The Gateway stays provisioned: deleting one backend does not tear the VM
+		// down.
+		if err := direct.Get(ctx, key, newXGatewayGCP()); err != nil {
+			t.Fatalf("composite get after one backend deleted = %v, want still present", err)
+		}
+	})
+
+	t.Run("consent label toggles cross-namespace forward", func(t *testing.T) {
+		const gwNS = "tr-consent"
+		target := gwNS + "-target"
+		mustCreate(ctx, t, direct, namespaceWithLabels(gwNS, nil))
+		mustCreate(ctx, t, direct, namespaceWithLabels(target, nil))
+		mustCreate(ctx, t, direct, portedClusterIPService(target, "web", 443, corev1.ProtocolTCP))
+
+		gw := newGateway("gw", gwNS, []wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: target},
+		}, nil)
+		mustCreate(ctx, t, direct, gw)
+		key := client.ObjectKeyFromObject(gw)
+
+		// Unlabelled target: the cross-namespace forward is denied and, as the only
+		// forward, the Gateway does not provision.
+		pollUntil(ctx, t, transitionTimeout, "CrossNamespaceForwardDenied while unlabelled", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonCrossNamespaceForwardDenied
+		})
+
+		// Adding the consent label must trigger the Namespace watch and let the
+		// forward through.
+		setNamespaceLabel(ctx, t, direct, target, crossNamespaceIngressLabel, crossNamespaceIngressValue)
+		pollUntil(ctx, t, transitionTimeout, "cross-ns forward present after label added", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: gwNS, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 1 && rc.Forwards[0].Service == "web."+target+".svc.cluster.local"
+		})
+		driveProvisionedReady(ctx, t, direct, key)
+		pollUntil(ctx, t, transitionTimeout, "Ready=True after consent label added", func() bool {
+			status, _ := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionTrue
+		})
+
+		// Removing the label must re-deny the forward; the Gateway keeps its VM
+		// (now provisioned) and reports Ready=False with the denial reason.
+		removeNamespaceLabel(ctx, t, direct, target, crossNamespaceIngressLabel)
+		pollUntil(ctx, t, transitionTimeout, "Ready=False/denied after label removed", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonCrossNamespaceForwardDenied
+		})
+		pollUntil(ctx, t, transitionTimeout, "no forwards after label removed", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: gwNS, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 0
+		})
+	})
+
+	t.Run("target port appearing admits the forward", func(t *testing.T) {
+		const ns = "tr-targetport"
+		mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+		// The Service exists but publishes the wrong port, so the forward's target
+		// port (443) is not listening.
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 80, corev1.ProtocolTCP))
+
+		gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+		}, nil)
+		mustCreate(ctx, t, direct, gw)
+		key := client.ObjectKeyFromObject(gw)
+
+		pollUntil(ctx, t, transitionTimeout, "TargetPortNotListening before port published", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonTargetPortNotListening
+		})
+		if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &corev1.Secret{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("bundle Secret get = %v, want NotFound (target port not listening, not provisioned)", err)
+		}
+
+		// Publishing port 443 on the Service must trigger the Service watch and admit
+		// the forward.
+		addServicePort(ctx, t, direct, ns, "web", 443, corev1.ProtocolTCP)
+		pollUntil(ctx, t, transitionTimeout, "forward present after target port published", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 1
+		})
+		driveProvisionedReady(ctx, t, direct, key)
+		pollUntil(ctx, t, transitionTimeout, "Ready=True after target port published", func() bool {
+			status, _ := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionTrue
+		})
+	})
+
+	t.Run("target port disappearing revokes the forward", func(t *testing.T) {
+		const ns = "tr-targetport-revoke"
+		mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+		// The Service publishes the forward's target port (443) plus an unrelated
+		// port, so removing 443 leaves the Service present: the revocation reason must
+		// be TargetPortNotListening, not ServiceNotFound.
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+		addServicePort(ctx, t, direct, ns, "web", 9000, corev1.ProtocolTCP)
+
+		gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+		}, nil)
+		mustCreate(ctx, t, direct, gw)
+		key := client.ObjectKeyFromObject(gw)
+
+		// Target port published: the forward is valid, provisions, and reaches Ready.
+		pollUntil(ctx, t, transitionTimeout, "forward present while target port published", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 1
+		})
+		driveProvisionedReady(ctx, t, direct, key)
+		pollUntil(ctx, t, transitionTimeout, "Ready=True with target port published", func() bool {
+			status, _ := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionTrue
+		})
+
+		// Removing the target port must trigger the Service watch and revoke the
+		// forward: Ready=False/TargetPortNotListening, the link config empties, and
+		// the Gateway keeps its VM.
+		removeServicePort(ctx, t, direct, ns, "web", 443, corev1.ProtocolTCP)
+		pollUntil(ctx, t, transitionTimeout, "Ready=False/TargetPortNotListening after target port removed", func() bool {
+			status, reason := gatewayReadyReason(ctx, t, direct, key)
+			return status == metav1.ConditionFalse && reason == reasonTargetPortNotListening
+		})
+		pollUntil(ctx, t, transitionTimeout, "no forwards after target port removed", func() bool {
+			var cm corev1.ConfigMap
+			if err := direct.Get(ctx, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm); err != nil {
+				return false
+			}
+			var rc link.RuntimeConfig
+			if err := jsonUnmarshalString(cm.Data[linkConfigKey], &rc); err != nil {
+				return false
+			}
+			return len(rc.Forwards) == 0
+		})
+		if err := direct.Get(ctx, key, newXGatewayGCP()); err != nil {
+			t.Fatalf("composite get after target port removed = %v, want still present", err)
+		}
+	})
+}
+
+// jsonUnmarshalString unmarshals raw into v, returning the error so a poll
+// predicate can treat a not-yet-written ConfigMap as "keep waiting" rather than
+// failing the whole test the way decodeJSON would.
+func jsonUnmarshalString(raw string, v any) error {
+	return json.Unmarshal([]byte(raw), v)
+}
+
+// setNamespaceLabel sets label=value on the named namespace via a read-modify-
+// write with the direct client, so the operator's Namespace watch fires.
+func setNamespaceLabel(ctx context.Context, t *testing.T, cl client.Client, name, label, value string) {
+	t.Helper()
+	var ns corev1.Namespace
+	mustGet(ctx, t, cl, client.ObjectKey{Name: name}, &ns)
+	if ns.Labels == nil {
+		ns.Labels = map[string]string{}
+	}
+	ns.Labels[label] = value
+	if err := cl.Update(ctx, &ns); err != nil {
+		t.Fatalf("set namespace %s label %s: %v", name, label, err)
+	}
+}
+
+// removeNamespaceLabel deletes label from the named namespace via a read-modify-
+// write with the direct client, so the operator's Namespace watch fires.
+func removeNamespaceLabel(ctx context.Context, t *testing.T, cl client.Client, name, label string) {
+	t.Helper()
+	var ns corev1.Namespace
+	mustGet(ctx, t, cl, client.ObjectKey{Name: name}, &ns)
+	delete(ns.Labels, label)
+	if err := cl.Update(ctx, &ns); err != nil {
+		t.Fatalf("remove namespace %s label %s: %v", name, label, err)
+	}
+}
+
+// addServicePort appends a published port/proto to the named Service via a
+// read-modify-write with the direct client, so the operator's Service watch fires
+// and re-classification sees the newly published port. A multi-port Service
+// requires every port to be named, so it assigns a deterministic name to each
+// port (the pre-existing one included) before writing.
+func addServicePort(ctx context.Context, t *testing.T, cl client.Client, ns, name string, port int32, proto corev1.Protocol) {
+	t.Helper()
+	var svc corev1.Service
+	mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: name}, &svc)
+	svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{Port: port, Protocol: proto})
+	for i := range svc.Spec.Ports {
+		svc.Spec.Ports[i].Name = fmt.Sprintf("p%d", svc.Spec.Ports[i].Port)
+	}
+	if err := cl.Update(ctx, &svc); err != nil {
+		t.Fatalf("add port %d to service %s/%s: %v", port, ns, name, err)
+	}
+}
+
+// removeServicePort drops the port matching port/proto from the named Service via a
+// read-modify-write with the direct client, so the operator's Service watch fires
+// and re-classification sees the port disappear. It rebuilds the port list minus
+// the removed entry, then renames the survivors deterministically to keep a
+// multi-port Service's name-uniqueness invariant satisfied. It fails the test if no
+// matching port was present.
+func removeServicePort(ctx context.Context, t *testing.T, cl client.Client, ns, name string, port int32, proto corev1.Protocol) {
+	t.Helper()
+	var svc corev1.Service
+	mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: name}, &svc)
+	kept := make([]corev1.ServicePort, 0, len(svc.Spec.Ports))
+	for _, p := range svc.Spec.Ports {
+		if p.Port == port && p.Protocol == proto {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if len(kept) == len(svc.Spec.Ports) {
+		t.Fatalf("remove port %d/%s from service %s/%s: no matching port", port, proto, ns, name)
+	}
+	for i := range kept {
+		kept[i].Name = fmt.Sprintf("p%d", kept[i].Port)
+	}
+	svc.Spec.Ports = kept
+	if err := cl.Update(ctx, &svc); err != nil {
+		t.Fatalf("remove port %d from service %s/%s: %v", port, ns, name, err)
+	}
 }

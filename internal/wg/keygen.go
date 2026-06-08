@@ -1,4 +1,4 @@
-// Package wg provides WireGuard key material helpers shared across the cyno
+// Package wg provides WireGuard key material helpers shared across the gateway
 // control plane.
 package wg
 

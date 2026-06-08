@@ -20,6 +20,26 @@ const (
 	providersRelease    = "crossplane-providers"
 	configRelease       = "crossplane-config"
 
+	// operatorNamespace and operatorRelease name the single, cluster-scoped
+	// operator install. The chart renders cluster-singletons (the Gateway CRD, the
+	// XGatewayGCP and XGatewayNetwork XRDs and Compositions, and a fixed-name
+	// ClusterRole/ClusterRoleBinding), so it must be installed exactly once per
+	// cluster; the one operator reconciles Gateways across every per-test namespace.
+	operatorNamespace = "gateway-operator"
+	operatorRelease   = "gateway-operator"
+	// operatorNameOverride pins the chart name so the operator Deployment has a
+	// deterministic name the suite waits on. With one install per cluster the
+	// release prefix is redundant, so the chart-rendered objects are named after
+	// this value directly.
+	operatorNameOverride = "gateway-operator"
+
+	// gatewayCRDName and xgatewayXRDName are the cluster-singleton custom-resource
+	// definitions the operator install brings: the user-facing Gateway CRD and the
+	// XGatewayGCP composite XRD. The suite waits on both before any Stack creates a
+	// Gateway.
+	gatewayCRDName  = "gateways.wgnet.dev"
+	xgatewayXRDName = "xgatewaygcps.infra.wgnet.dev"
+
 	// crossplaneChartVersion pins the Crossplane core chart.
 	crossplaneChartVersion = "2.3.1"
 	crossplaneChartRepo    = "https://charts.crossplane.io/stable"
@@ -39,17 +59,23 @@ const (
 	// faster than the provider install.
 	configInstallTimeout = "3m"
 
-	// operatorInstallTimeout bounds the helm --wait for the operator chart. The
-	// chart installs the operator Deployment, RBAC, CRDs, and the XRD/Composition;
-	// none of those depend on a provisioned Gateway, so they settle quickly. Kept
-	// under the go-test deadline so a stuck install fails fast.
+	// operatorInstallTimeout bounds the helm --wait for the once-per-cluster
+	// operator chart. The chart installs the operator Deployment, RBAC, CRDs, and
+	// the XRD/Composition; none of those depend on a provisioned Gateway, so they
+	// settle quickly. Kept under the go-test deadline so a stuck install fails fast.
 	operatorInstallTimeout = "3m"
 	// operatorReadyTimeout bounds the explicit wait for the operator Deployment to
-	// report Available after install, before the Gateway CR is created.
+	// report Available after the single install, before any Stack creates a Gateway.
 	operatorReadyTimeout = 2 * time.Minute
+	// crdEstablishedTimeout and xrdPresentTimeout bound the post-install waits for
+	// the Gateway CRD's Established condition and the XGatewayGCP XRD's presence.
+	// helm --wait does not gate on either, so the suite waits explicitly before a
+	// Stack applies a Gateway of that kind.
+	crdEstablishedTimeout = 2 * time.Minute
+	xrdPresentTimeout     = 2 * time.Minute
 
 	// gatewayReadyTimeout bounds the wait for the Gateway CR to report an address
-	// and Ready=True. The operator must reconcile the Gateway into the XGateway,
+	// and Ready=True. The operator must reconcile the Gateway into the XGatewayGCP,
 	// every composed GCP resource (network, subnet, firewall, SA, secret,
 	// instance) must reconcile, and the operator must mirror the IP back up.
 	gatewayReadyTimeout = 6 * time.Minute
@@ -77,11 +103,33 @@ type Suite struct {
 	log           *zap.Logger
 }
 
+// Client returns the suite's Kubernetes client, so validation-failure tests can
+// apply and inspect Gateways directly without going through Start (which would
+// provision a GCP VM). The returned client targets the same cluster Start uses.
+func (s *Suite) Client() *hk8s.Client { return s.client }
+
+// Env returns the suite's GCP configuration, so tests building a Gateway CR
+// outside Start can populate spec.gcp with the same region and zone.
+func (s *Suite) Env() Env { return s.env }
+
 // Setup provisions the kind cluster (or targets an existing one), builds and
 // loads the operator and link images, installs Crossplane core + the
-// GCP/Kubernetes providers + crossplane-config (credentials.source=Secret), and
-// loads the GCP service-account key as the creds Secret. When t is non-nil,
-// cluster teardown is registered via t.Cleanup.
+// GCP/Kubernetes providers + crossplane-config (credentials.source=Secret),
+// loads the GCP service-account key as the creds Secret, and installs the operator
+// chart exactly once. The operator is always cluster-scoped, so the single
+// operator reconciles Gateways across every per-test namespace. Cluster teardown
+// is not registered here: with
+// multiple parallel Stacks sharing one cluster, deleting it must wait until every
+// Stack's GCP drain completes. The caller drives that once-after-everything via
+// Teardown from TestMain.
+//
+// Setup returns a non-nil *Suite from the moment the kind cluster handle exists,
+// even alongside an error from a later step (image build, Crossplane install,
+// operator install). The cluster is created early but the failure-prone steps
+// come after; returning the partially-built suite on those error paths lets the
+// caller's TestMain still delete the cluster via Teardown instead of leaking it.
+// Only the pre-cluster failures (logger init, env validation) return a nil suite,
+// and those happen before anything is created.
 func Setup(ctx context.Context, t testing.TB) (*Suite, error) {
 	log, err := zap.NewDevelopment()
 	if err != nil {
@@ -96,42 +144,34 @@ func Setup(ctx context.Context, t testing.TB) (*Suite, error) {
 
 	cluster := hk8s.NewKindCluster(log)
 	kubeCtx := cluster.KubeContext()
+
+	// Capture the cluster handle into the suite before any failure-prone step.
+	// Every error path past this point returns this same suite so TestMain's
+	// Teardown can delete the cluster; Teardown deletes only what was created.
+	suite := &Suite{
+		env:     env,
+		cluster: cluster,
+		repoDir: repoDir,
+		kubeCtx: contextOrCurrent(kubeCtx),
+		log:     log,
+	}
+
 	if !useExisting() {
 		if err := cluster.Ensure(ctx); err != nil {
-			return nil, fmt.Errorf("kind ensure: %w", err)
-		}
-		if t != nil {
-			t.Cleanup(func() {
-				// Mirror the per-test GCP-resource PRESERVE idiom: on a failed run
-				// with CYNO_E2E_PRESERVE set, leave the kind cluster running so the
-				// in-cluster link/echo pods survive for live debugging.
-				if t.Failed() && os.Getenv("CYNO_E2E_PRESERVE") != "" {
-					kubeconfig := filepath.Join(os.TempDir(), "cyno-e2e-kubeconfig")
-					log.Warn("test failed; leaving kind cluster running for debugging",
-						zap.String("cluster", cluster.Name()),
-						zap.String("kubeconfig", kubeconfig),
-						zap.String("namespaces_hint", "per-test link/echo pods live in the cyno<id> namespaces; list with: kubectl get ns"),
-						zap.String("cleanup", "kind delete cluster --name "+cluster.Name()),
-					)
-					return
-				}
-				if err := cluster.Delete(context.Background()); err != nil {
-					log.Error("kind delete", zap.Error(err))
-				}
-			})
+			return suite, fmt.Errorf("kind ensure: %w", err)
 		}
 		// kind nodes share the host kernel; the link's kernel-mode WireGuard
 		// interface needs the wireguard module loaded on the node.
 		node := cluster.Name() + "-control-plane"
 		log.Info("loading wireguard kernel module on kind node", zap.String("node", node))
 		if out, err := shared.RunCmd(ctx, nil, "docker", "exec", node, "modprobe", "wireguard"); err != nil {
-			return nil, fmt.Errorf("load wireguard module on kind node: %w\n%s", err, out)
+			return suite, fmt.Errorf("load wireguard module on kind node: %w\n%s", err, out)
 		}
 	}
 
 	kubeconfig, err := resolveKubeconfig(cluster)
 	if err != nil {
-		return nil, err
+		return suite, err
 	}
 	contextOverride := ""
 	if !useExisting() {
@@ -140,8 +180,9 @@ func Setup(ctx context.Context, t testing.TB) (*Suite, error) {
 
 	client, err := hk8s.NewClientFromKubeconfig(kubeconfig, contextOverride, log)
 	if err != nil {
-		return nil, fmt.Errorf("k8s client: %w", err)
+		return suite, fmt.Errorf("k8s client: %w", err)
 	}
+	suite.client = client
 
 	// Both images share a run-unique tag so a rerun never reuses a stale layer
 	// cached under the same ref. The operator and link are distinct Dockerfile
@@ -150,46 +191,130 @@ func Setup(ctx context.Context, t testing.TB) (*Suite, error) {
 	imageTag := "e2e-" + shared.ShortID()
 	operatorImage, err := hk8s.BuildImage(ctx, repoDir, "gateway-operator", imageTag, "operator", log)
 	if err != nil {
-		return nil, fmt.Errorf("build operator image: %w", err)
+		return suite, fmt.Errorf("build operator image: %w", err)
 	}
+	suite.operatorImage = operatorImage
 	linkImage, err := hk8s.BuildImage(ctx, repoDir, "gateway-link", imageTag, "link", log)
 	if err != nil {
-		return nil, fmt.Errorf("build link image: %w", err)
+		return suite, fmt.Errorf("build link image: %w", err)
 	}
+	suite.linkImage = linkImage
 	if !useExisting() {
 		if err := cluster.LoadImage(ctx, operatorImage.Ref()); err != nil {
-			return nil, fmt.Errorf("kind load operator image: %w", err)
+			return suite, fmt.Errorf("kind load operator image: %w", err)
 		}
 		if err := cluster.LoadImage(ctx, linkImage.Ref()); err != nil {
-			return nil, fmt.Errorf("kind load link image: %w", err)
+			return suite, fmt.Errorf("kind load link image: %w", err)
 		}
 	}
 
 	helm := hk8s.NewHelm(contextOrCurrent(kubeCtx), repoDir, log)
+	suite.helm = helm
 
 	if err := installCrossplaneStack(ctx, helm, env); err != nil {
-		return nil, err
+		return suite, err
 	}
 
 	creds, err := env.readCredsJSON()
 	if err != nil {
-		return nil, err
+		return suite, err
 	}
 	if err := client.ApplyCredsSecret(ctx, env.CredsNamespace, env.CredsSecret, "credentials.json", creds); err != nil {
-		return nil, fmt.Errorf("apply creds secret: %w", err)
+		return suite, fmt.Errorf("apply creds secret: %w", err)
 	}
 
-	return &Suite{
-		env:           env,
-		cluster:       cluster,
-		helm:          helm,
-		client:        client,
-		operatorImage: operatorImage,
-		linkImage:     linkImage,
-		repoDir:       repoDir,
-		kubeCtx:       contextOrCurrent(kubeCtx),
-		log:           log,
-	}, nil
+	if err := suite.installOperator(ctx); err != nil {
+		return suite, fmt.Errorf("operator install: %w", err)
+	}
+
+	return suite, nil
+}
+
+// installOperator installs the operator chart exactly once per cluster into
+// operatorNamespace. The single release brings the Gateway CRD, the XGatewayGCP
+// and XGatewayNetwork XRDs and Compositions, the cluster-singleton
+// ClusterRole/ClusterRoleBinding, and the operator Deployment. The operator is always cluster-scoped, so its cache is
+// unrestricted and it reconciles Gateways in every per-test namespace. After
+// --wait it asserts the
+// Deployment is Available, the Gateway CRD is Established, and the XRD is present,
+// the readiness signals helm --wait does not cover, before any Stack creates a
+// Gateway.
+func (s *Suite) installOperator(ctx context.Context) error {
+	valuesPath, err := writeValues(os.TempDir(), valuesParams{
+		nameOverride:  operatorNameOverride,
+		operatorImage: s.operatorImage,
+		linkImage:     s.linkImage,
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.helm.Install(ctx, hk8s.ReleaseSpec{
+		Name:            operatorRelease,
+		Namespace:       operatorNamespace,
+		CreateNamespace: true,
+		ChartPath:       "k8s/charts/wireguard-gateway-operator",
+		ValuesFiles:     []string{valuesPath},
+		Wait:            true,
+		Timeout:         operatorInstallTimeout,
+	}); err != nil {
+		return err
+	}
+	if err := s.client.WaitDeploymentAvailable(ctx, operatorNamespace, operatorNameOverride, operatorReadyTimeout); err != nil {
+		return fmt.Errorf("operator deployment not available: %w", err)
+	}
+	if err := s.client.WaitCRDEstablished(ctx, gatewayCRDName, crdEstablishedTimeout); err != nil {
+		return fmt.Errorf("gateway crd not established: %w", err)
+	}
+	if err := s.client.WaitXRDPresent(ctx, xgatewayXRDName, xrdPresentTimeout); err != nil {
+		return fmt.Errorf("xgatewaygcp xrd not present: %w", err)
+	}
+	return nil
+}
+
+// Teardown deletes the kind cluster the suite provisioned. It is the
+// once-after-everything counterpart to Setup: the caller invokes it from
+// TestMain after m.Run returns, which blocks until every parallel test and its
+// per-Stack GCP drain (registered in Start's t.Cleanup) has completed, so the
+// cluster is never deleted out from under a Stack still draining GCP. code is
+// the binary's exit code, used as the run's pass/fail signal for the
+// preserve-on-failure gate. Teardown is a no-op when targeting an existing
+// cluster. It logs but does not fail on a delete error: the process is already
+// exiting with code.
+//
+// Teardown is safe on a partially-initialized suite returned by a failed Setup:
+// it deletes only the kind cluster, and that handle is captured before any
+// failure-prone step, so a nil handle means nothing was created.
+func (s *Suite) Teardown(ctx context.Context, code int) {
+	if useExisting() || s.cluster == nil {
+		return
+	}
+	kubeconfig := filepath.Join(os.TempDir(), "gateway-e2e-kubeconfig")
+	// GATEWAY_E2E_KEEP leaves the kind cluster up regardless of pass or fail;
+	// the per-test teardown leaves the GCP VM up to match.
+	if s.env.Keep {
+		s.log.Warn("GATEWAY_E2E_KEEP set; leaving kind cluster running for debugging",
+			zap.String("cluster", s.cluster.Name()),
+			zap.String("kubeconfig", kubeconfig),
+			zap.String("namespaces_hint", "per-test link/echo pods live in the gw<id> namespaces; list with: kubectl get ns"),
+			zap.String("cleanup", "kind delete cluster --name "+s.cluster.Name()),
+		)
+		return
+	}
+	// Mirror the per-test GCP-resource PRESERVE idiom: on a failed run with
+	// GATEWAY_E2E_PRESERVE set, leave the kind cluster running so the in-cluster
+	// link/echo pods survive for live debugging.
+	if code != 0 && os.Getenv("GATEWAY_E2E_PRESERVE") != "" {
+		s.log.Warn("run failed; leaving kind cluster running for debugging",
+			zap.String("cluster", s.cluster.Name()),
+			zap.String("kubeconfig", kubeconfig),
+			zap.String("namespaces_hint", "per-test link/echo pods live in the gw<id> namespaces; list with: kubectl get ns"),
+			zap.String("cleanup", "kind delete cluster --name "+s.cluster.Name()),
+		)
+		return
+	}
+	if err := s.cluster.Delete(ctx); err != nil {
+		s.log.Error("kind delete", zap.Error(err))
+	}
 }
 
 // installCrossplaneStack installs the Crossplane core, the providers chart, and
@@ -256,7 +381,7 @@ func resolveKubeconfig(cluster *hk8s.KindCluster) (string, error) {
 		return filepath.Join(home, ".kube", "config"), nil
 	}
 
-	path := filepath.Join(os.TempDir(), "cyno-e2e-kubeconfig")
+	path := filepath.Join(os.TempDir(), "gateway-e2e-kubeconfig")
 	if err := cluster.ExportKubeConfig(path); err != nil {
 		return "", fmt.Errorf("export kubeconfig: %w", err)
 	}

@@ -17,7 +17,9 @@ func TestRenderNftables(t *testing.T) {
 	}
 
 	wantContains := []string{
-		"table inet cyno {",
+		"add table inet gateway",
+		"flush table inet gateway",
+		"table inet gateway {",
 		"type nat hook prerouting priority dstnat; policy accept;",
 		`iif "wg0" tcp dport 8443 dnat ip to 10.96.1.1 : 443`,
 		`iif "wg0" udp dport 30000 dnat ip to 10.96.2.2 : 9000`,
@@ -65,9 +67,57 @@ func TestRenderNftablesDeterministicAndSorted(t *testing.T) {
 	if idxTCP80 < 0 || idxUDP80 < 0 || idx9000 < 0 {
 		t.Fatalf("missing expected DNAT lines:\n%s", first)
 	}
-	if !(idxTCP80 < idxUDP80 && idxUDP80 < idx9000) {
+	if idxTCP80 >= idxUDP80 || idxUDP80 >= idx9000 {
 		t.Errorf("DNAT lines not sorted by (port, proto): tcp80=%d udp80=%d t9000=%d\n%s",
 			idxTCP80, idxUDP80, idx9000, first)
+	}
+}
+
+// TestRenderNftablesRetargetReferencesOnlyNewClusterIP pins the retarget contract
+// at the render layer: when a forward on a fixed public port is repointed to a new
+// ClusterIP, the rendered document must DNAT the port to the new IP and accept the
+// new IP in the forward chain, and must contain no reference to the old IP. The
+// DNAT and the companion accept rule both derive from the same ResolvedForward, so
+// they move together; the whole table is flushed and rebuilt, so the old IP cannot
+// survive. Distinct, recognizable IPs make a stale reference obvious.
+func TestRenderNftablesRetargetReferencesOnlyNewClusterIP(t *testing.T) {
+	const (
+		port    = 8453
+		proto   = "tcp"
+		target  = 443
+		oldIP   = "10.96.0.10"
+		newIP   = "10.96.0.20"
+		svcName = "retarget"
+	)
+
+	before, err := RenderNftables([]ResolvedForward{
+		{Name: svcName, PublicPort: port, Protocol: proto, ClusterIP: oldIP, TargetPort: target},
+	})
+	if err != nil {
+		t.Fatalf("RenderNftables (before): %v", err)
+	}
+	if !strings.Contains(before, oldIP) {
+		t.Fatalf("before retarget: rendered ruleset should reference old ClusterIP %q\n%s", oldIP, before)
+	}
+
+	after, err := RenderNftables([]ResolvedForward{
+		{Name: svcName, PublicPort: port, Protocol: proto, ClusterIP: newIP, TargetPort: target},
+	})
+	if err != nil {
+		t.Fatalf("RenderNftables (after): %v", err)
+	}
+
+	wantContains := []string{
+		"iif \"wg0\" tcp dport 8453 dnat ip to 10.96.0.20 : 443",
+		"iif \"wg0\" ip daddr 10.96.0.20 tcp dport 443 accept",
+	}
+	for _, frag := range wantContains {
+		if !strings.Contains(after, frag) {
+			t.Errorf("after retarget: rendered ruleset missing %q\n%s", frag, after)
+		}
+	}
+	if strings.Contains(after, oldIP) {
+		t.Errorf("after retarget: rendered ruleset still references old ClusterIP %q; DNAT and accept must move to the new IP and leave nothing behind\n%s", oldIP, after)
 	}
 }
 
@@ -77,7 +127,9 @@ func TestRenderNftablesEmpty(t *testing.T) {
 		t.Fatalf("RenderNftables: %v", err)
 	}
 	for _, frag := range []string{
-		"table inet cyno {",
+		"add table inet gateway",
+		"flush table inet gateway",
+		"table inet gateway {",
 		`oifname != "wg0" masquerade`,
 		"policy drop;",
 		`iif "wg0" drop`,
@@ -150,10 +202,10 @@ func TestRenderWGConf(t *testing.T) {
 				"PrivateKey = PRIV=",
 				"PublicKey = PK=",
 				"AllowedIPs = 10.99.0.1/32",
+				"PersistentKeepalive = 0",
 			},
 			wantNotContains: []string{
 				"ListenPort",
-				"PersistentKeepalive",
 				"Address",
 				"MTU",
 			},

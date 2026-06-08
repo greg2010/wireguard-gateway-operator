@@ -1,23 +1,31 @@
 #!/usr/bin/env sh
-# Fetches the gateway WireGuard key bundle from GCP Secret Manager, writes the
-# wg0 netdev unit, and restarts systemd-networkd to bring the interface up. The
-# bundle is a two-line payload: line 1 is the gateway private key, line 2 is the
-# link peer public key. Loops until the secret version exists and decodes
-# cleanly, so the instance may boot before the operator has populated the secret.
-# Runs after network-online.target, since the metadata server and Secret Manager
-# are reachable only over the primary NIC.
+# Renders every per-Gateway boot artifact from the instance metadata server, then
+# fetches the WireGuard key bundle from GCP Secret Manager and brings wg0 up. All
+# per-Gateway values (the WireGuard listen port, the gateway and link addresses,
+# the tunnel subnet, the project ID, and the secret ID) are read from instance
+# metadata, not baked into this script: the operator sets them on the XGatewayGCP
+# spec, the composition writes them into the Instance metadata, and this script
+# resolves them at boot. The rendered Ignition is therefore byte-identical across
+# every Gateway.
 #
-# The per-Gateway secret ID is read from the instance metadata server, not baked
-# into this script: the operator sets XGateway.spec.secretId, the composition
-# writes it into the Instance metadata "secret-id" attribute, and this script
-# resolves it at boot. The WireGuard listen port and link address it templates
-# are operator-global, so the rendered Ignition is identical across every Gateway.
+# It writes the wg0 netdev (with the fetched listen port and peer), the wg0
+# .network address, and the nftables ruleset (substituting the listen port and
+# link address into the shipped template), then loops until the secret version
+# exists and decodes cleanly, so the instance may boot before the operator has
+# populated the secret. Runs after network-online.target, since the metadata
+# server and Secret Manager are reachable only over the primary NIC.
 set -eu
 
+# Restrict new files to the owner: the OAuth token and the secret bundle land in
+# /tmp before they are removed, and must not be world-readable in the interim.
+umask 077
+
 NETDEV_PATH=/etc/systemd/network/10-wg0.netdev
+NETWORK_PATH=/etc/systemd/network/20-wg0.network
+NFT_PATH=/etc/nftables/gateway.nft
 METADATA_BASE="http://metadata.google.internal/computeMetadata/v1/instance"
 METADATA_TOKEN_URL="$METADATA_BASE/service-accounts/default/token"
-SECRET_ID_URL="$METADATA_BASE/attributes/secret-id"
+METADATA_ATTR_BASE="$METADATA_BASE/attributes"
 
 modprobe wireguard 2>&1 || echo "gateway-keyfetch: modprobe wireguard returned nonzero (may be builtin)"
 
@@ -28,10 +36,35 @@ extract_json_string() {
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
+fetch_metadata_attr() {
+	# Loops until the named instance metadata attribute returns HTTP 200, so the
+	# boot tolerates the operator populating the Instance metadata after the VM
+	# starts. The metadata server returns a non-empty error body on 404, so the
+	# status code, not body emptiness, decides whether a value is present: gating
+	# on the body alone would accept a 404 error page as a real attribute value.
+	attr="$1"
+	body_file="/tmp/gateway-attr.json"
+	attempt=0
+	while true; do
+		attempt=$((attempt + 1))
+		http="$(curl -s --connect-timeout 5 --max-time 10 -o "$body_file" -w '%{http_code}' -H "Metadata-Flavor: Google" "$METADATA_ATTR_BASE/$attr" || echo 000)"
+		# Diagnostics go to stderr so the caller's "$(fetch_metadata_attr ...)"
+		# captures only the value printf emits, not these log lines.
+		echo "gateway-keyfetch: attr=$attr attempt=$attempt http=$http" >&2
+		if [ "$http" = "200" ]; then
+			value="$(cat "$body_file")"
+			rm -f "$body_file" 2>/dev/null || true
+			printf '%s' "$value"
+			return 0
+		fi
+		rm -f "$body_file" 2>/dev/null || true
+		sleep 5
+	done
+}
+
 write_netdev() {
 	priv="$1"
 	peer_pub="$2"
-	umask 077
 	cat > "$NETDEV_PATH.tmp" <<EOF
 [NetDev]
 Name=wg0
@@ -39,29 +72,63 @@ Kind=wireguard
 
 [WireGuard]
 PrivateKey=$priv
-ListenPort={{ .Values.wireguard.listenPort }}
+ListenPort=$wg_listen_port
 
 [WireGuardPeer]
 PublicKey=$peer_pub
-AllowedIPs={{ .Values.wireguard.linkAddress }}/32
+AllowedIPs=$wg_link_address/32
 EOF
 	chmod 0640 "$NETDEV_PATH.tmp"
 	chown root:systemd-network "$NETDEV_PATH.tmp"
 	mv "$NETDEV_PATH.tmp" "$NETDEV_PATH"
 }
 
-secret_id=""
-attempt=0
-while [ -z "$secret_id" ]; do
-	attempt=$((attempt + 1))
-	secret_id="$(curl -s --connect-timeout 5 --max-time 10 -H "Metadata-Flavor: Google" "$SECRET_ID_URL" || true)"
-	echo "gateway-keyfetch: attempt=$attempt secret_id_empty=$([ -z "$secret_id" ] && echo yes || echo no)"
-	if [ -z "$secret_id" ]; then
-		sleep 5
-	fi
-done
+write_network() {
+	# The wg0 address reuses the tunnel subnet's prefix length so the gateway and
+	# link share one routed CIDR. A subnet without a '/' would make "${var##*/}"
+	# yield the whole string and emit a malformed Address= line, so reject it.
+	case "$wg_subnet" in
+		*/*) ;;
+		*)
+			echo "gateway-keyfetch: ERROR wg-subnet '$wg_subnet' has no '/' prefix length" >&2
+			exit 1
+			;;
+	esac
+	suffix="${wg_subnet##*/}"
+	cat > "$NETWORK_PATH.tmp" <<EOF
+[Match]
+Name=wg0
 
-secret_url="https://secretmanager.googleapis.com/v1/projects/{{ .Values.gcp.projectID }}/secrets/$secret_id/versions/latest:access"
+[Network]
+Address=$wg_gateway_address/$suffix
+EOF
+	chmod 0644 "$NETWORK_PATH.tmp"
+	mv "$NETWORK_PATH.tmp" "$NETWORK_PATH"
+}
+
+render_nft() {
+	# Substitute the per-Gateway listen port and link address into the shipped
+	# value-free ruleset in place; gateway-nftables.service runs after this unit
+	# and loads the rendered file. The delimiter is '|' so a value containing '/'
+	# (a CIDR) does not terminate the s command and brick boot under set -eu.
+	sed -e "s|__WG_LISTEN_PORT__|$wg_listen_port|g" \
+		-e "s|__WG_LINK_ADDRESS__|$wg_link_address|g" \
+		"$NFT_PATH" > "$NFT_PATH.tmp"
+	chmod 0644 "$NFT_PATH.tmp"
+	mv "$NFT_PATH.tmp" "$NFT_PATH"
+}
+
+wg_listen_port="$(fetch_metadata_attr wg-listen-port)"
+wg_gateway_address="$(fetch_metadata_attr wg-gateway-address)"
+wg_link_address="$(fetch_metadata_attr wg-link-address)"
+wg_subnet="$(fetch_metadata_attr wg-subnet)"
+project_id="$(fetch_metadata_attr project-id)"
+secret_id="$(fetch_metadata_attr secret-id)"
+
+write_network
+render_nft
+
+secret_url="https://secretmanager.googleapis.com/v1/projects/$project_id/secrets/$secret_id/versions/latest:access"
 
 attempt=0
 while true; do

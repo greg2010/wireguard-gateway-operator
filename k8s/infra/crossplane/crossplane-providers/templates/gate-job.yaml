@@ -47,13 +47,15 @@ spec:
         - name: wait-crds
           image: {{ .Values.gate.image | quote }}
           command: ["kubectl"]
+          # This list must stay in sync with the GCP managed resources the
+          # composition emits (crossplane/gcp/composition.gotmpl is the
+          # authority); a kind added there needs its CRD gated here too.
           args:
             - wait
             - --for=condition=established
             - crd/instances.compute.gcp.m.upbound.io
             - crd/addresses.compute.gcp.m.upbound.io
             - crd/networks.compute.gcp.m.upbound.io
-            - crd/subnetworks.compute.gcp.m.upbound.io
             - crd/firewalls.compute.gcp.m.upbound.io
             - crd/serviceaccounts.cloudplatform.gcp.m.upbound.io
             - crd/secrets.secretmanager.gcp.m.upbound.io

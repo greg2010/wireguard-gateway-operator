@@ -30,38 +30,22 @@ spec:
           image: {{ include "wireguard-gateway-operator.operatorImage" . | quote }}
           imagePullPolicy: {{ .Values.operator.pullPolicy }}
           env:
-            - name: GATEWAY_OPERATOR_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
             - name: GATEWAY_OPERATOR_LEADER_ELECTION
               value: {{ .Values.operator.leaderElection | quote }}
             - name: GATEWAY_OPERATOR_METRICS_ADDR
               value: {{ .Values.operator.metricsAddr | quote }}
             - name: GATEWAY_OPERATOR_HEALTH_ADDR
               value: {{ .Values.operator.healthAddr | quote }}
+            - name: GATEWAY_SHARED_NETWORK_NAME
+              value: {{ include "wireguard-gateway-operator.sharedNetworkName" . | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: GATEWAY_LINK_IMAGE
               value: {{ include "wireguard-gateway-operator.linkImage" . | quote }}
             - name: GATEWAY_LINK_IMAGE_PULL_POLICY
               value: {{ .Values.link.pullPolicy | quote }}
-            - name: GATEWAY_WG_SUBNET
-              value: {{ .Values.wireguard.subnet | quote }}
-            - name: GATEWAY_WG_LINK_ADDRESS
-              value: {{ .Values.wireguard.linkAddress | quote }}
-            - name: GATEWAY_WG_LISTEN_PORT
-              value: {{ .Values.wireguard.listenPort | quote }}
-            - name: GATEWAY_WG_KEEPALIVE
-              value: {{ .Values.wireguard.keepalive | quote }}
-            - name: GATEWAY_WG_MTU
-              value: {{ .Values.wireguard.mtu | quote }}
-            - name: GATEWAY_WG_RECONCILE_INTERVAL
-              value: {{ .Values.wireguard.reconcileInterval | quote }}
-            - name: GATEWAY_GCP_SUBNET_CIDR
-              value: {{ .Values.gcp.subnetCIDR | quote }}
-            - name: GATEWAY_GCP_IMAGE
-              value: {{ .Values.gcp.image | quote }}
-            - name: GATEWAY_GCP_DISK_SIZE_GB
-              value: {{ .Values.gcp.diskSizeGB | quote }}
-            - name: GATEWAY_GCP_RESERVED_IP
-              value: {{ .Values.gcp.reservedIP | quote }}
             - name: GATEWAY_USER_DATA
               valueFrom:
                 configMapKeyRef:

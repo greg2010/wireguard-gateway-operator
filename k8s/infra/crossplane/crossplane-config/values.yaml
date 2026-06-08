@@ -5,7 +5,7 @@ projectID: ""
 
 # Credentials the GCP providers authenticate with.
 #   Secret mounts a GCP service-account JSON key from the referenced Secret. This
-#     is the credential path: cyno runs on-prem, where no GCP metadata server is
+#     is the credential path: the gateway runs on-prem, where no GCP metadata server is
 #     reachable. Create the Secret before installing (default: crossplane-system/
 #     gcp-creds, key credentials.json).
 #   InjectedIdentity uses the identity attached to the provider pod and only
