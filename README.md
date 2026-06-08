@@ -6,19 +6,17 @@ without exposing a cloud LoadBalancer of its own. You apply a namespaced
 gateway VM, dials it from inside the cluster, and forwards the public TCP/UDP
 ports you list to your in-cluster Services.
 
-Use it when a cluster cannot (or should not) accept inbound connections
-directly — an on-prem or NAT'd cluster, a homelab behind a residential ISP, or
-any environment where outbound-only egress is the only reliable path — but you
-still need stable public endpoints in front of cluster workloads.
+Use it when a cluster cannot accept inbound connections directly: on-prem or
+NAT'd clusters, a homelab behind a residential ISP, anything with outbound-only
+egress. You still get stable public endpoints in front of cluster workloads.
 
 ## How it works
 
-For each `Gateway`, the operator reconciles two halves: a GCP VM running
-WireGuard and nftables (provisioned through a Crossplane composition) that holds
-the public IP and opens the listed ports, and an in-cluster `gateway-link`
-Deployment that peers with the VM over WireGuard and DNATs the forwarded ports
-to the backend Services. The cluster always connects outbound to the VM, so no
-inbound firewall rule is ever needed on the cluster side. When `dnsHostnames` is
+Each `Gateway` reconciles two halves. A Crossplane composition provisions a GCP
+VM running WireGuard and nftables: it holds the public IP and opens the listed
+ports. An in-cluster `gateway-link` Deployment peers with that VM and DNATs the
+forwarded ports to the backend Services. Because the cluster only ever dials
+outbound, no inbound firewall rule is needed cluster-side. When `dnsHostnames` is
 set, the operator publishes a `DNSEndpoint` pointing those names at the VM's
 public IP for external-dns to serve.
 
@@ -57,14 +55,14 @@ public IP for external-dns to serve.
 
 ## Installation
 
-Install the dependencies from upstream in order — Crossplane core, the GCP
-providers and pipeline functions, then credentials and a `ClusterProviderConfig`
-— and finish with the operator. The charts under `k8s/infra/crossplane/`
+Install the upstream dependencies in order: Crossplane core, the GCP providers
+and pipeline functions, then credentials and a `ClusterProviderConfig`. Finish
+with the operator. The charts under `k8s/infra/crossplane/`
 (`crossplane-providers`, `crossplane-config`) are E2E test scaffolding: they pin
 package versions and add a CRD-readiness gate Job for `make test-e2e`, and are
 not a production install path.
 
-**1. Crossplane core**:
+**1. Crossplane core.**
 
 ```sh
 helm install crossplane crossplane \
@@ -72,7 +70,7 @@ helm install crossplane crossplane \
   -n crossplane-system --create-namespace --wait
 ```
 
-**2. GCP providers and pipeline functions**:
+**2. GCP providers and pipeline functions.**
 
 ```sh
 kubectl apply -f - <<'EOF'
@@ -134,28 +132,27 @@ spec:
   package: xpkg.crossplane.io/crossplane-contrib/function-auto-ready:v0.6.5
 EOF
 
-# Providers register their managed-resource CRDs asynchronously; wait before continuing.
 kubectl wait --for=condition=Healthy provider.pkg.crossplane.io --all --timeout=5m
 kubectl wait --for=condition=Healthy function.pkg.crossplane.io --all --timeout=5m
 ```
 
-The providers track the floating `:v2` major channel (Upbound publishes no
-`:latest`), while the functions pin an explicit version because crossplane-contrib
-publishes no floating tag; confirm current versions on the
+The providers track the floating `:v2` major channel, since Upbound publishes no
+`:latest`. The functions pin an explicit version because crossplane-contrib
+publishes no floating tag. Confirm current versions on the
 [Upbound Marketplace](https://marketplace.upbound.io/) (providers) and the
 [crossplane-contrib releases](https://github.com/crossplane-contrib) (functions).
 
-The `gcp-fast-poll` DeploymentRuntimeConfig lowers the provider poll interval
-(upstream default 10m makes the multi-resource gateway provisioning chain very
-slow); tune `PROVIDER_POLL` — lower is faster to provision at the cost of more
+The `gcp-fast-poll` DeploymentRuntimeConfig lowers the provider poll interval,
+since the upstream default of 10m makes the multi-resource gateway provisioning
+chain slow. Tune `PROVIDER_POLL`: lower is faster to provision at the cost of more
 API calls. Do not declare a `provider-family-gcp` Provider explicitly: the leaf
 providers pull the shared family in automatically, and declaring it duplicates
 the family and breaks its RBAC.
 
 **3. Credentials and ProviderConfig.** Load the service-account key as the
-`crossplane-system/gcp-creds` Secret (key `credentials.json`) — see
+`crossplane-system/gcp-creds` Secret (key `credentials.json`). See
 [Configuring GCP credentials](#configuring-gcp-credentials) for obtaining the key
-and for the declarative loading paths; the direct form is:
+and for the declarative loading paths. The direct form is:
 
 ```sh
 kubectl create secret generic gcp-creds -n crossplane-system \
@@ -181,7 +178,7 @@ The `ClusterProviderConfig` name must be `default`: the gateway composition's GC
 managed resources reference `providerConfigRef.name: default`. It and the provider
 CRDs must exist before any `Gateway` provisions.
 
-**4. The operator:**
+**4. The operator.**
 
 ```sh
 helm install wireguard-gateway-operator \
@@ -201,15 +198,14 @@ not on the chart. The two images are built from this repo's `Dockerfile`
 
 ## Configuring GCP credentials
 
-The provider authenticates to GCP with a service-account JSON key, delivered as
-the Secret the `ClusterProviderConfig` references (`crossplane-system/gcp-creds`,
-key `credentials.json`).
+The provider authenticates to GCP with a service-account JSON key. This section
+covers minting that key; loading it as the Secret is step 4 below.
 
-The exported key is long-lived and the scripts do not rotate it; periodically
+The exported key is long-lived and the scripts do not rotate it. Periodically
 mint a replacement (`gcloud iam service-accounts keys create`), update the Secret,
 and delete the old key.
 
-1. Create a GCP project and enable the required APIs — compute, secretmanager,
+1. Create a GCP project and enable the required APIs: compute, secretmanager,
    iam, cloudresourcemanager.
 2. Create a service account and grant it the roles the composition needs
    (`compute.instanceAdmin.v1`, `compute.networkAdmin`, `compute.securityAdmin`,
@@ -221,9 +217,9 @@ and delete the old key.
 
 `scripts/setup-gcp-project.sh` performs step 1 (project and APIs),
 `scripts/setup-gcp-sa.sh` performs step 2 (the service account and its roles),
-and `scripts/get-gcp-creds.sh` performs step 3 (the key); all read configuration
+and `scripts/get-gcp-creds.sh` performs step 3 (the key). All read configuration
 from a `.env` file (see [.env.example](.env.example)). They produce the GCP-side
-credential but intentionally do not load it into a cluster — that is step 4.
+credential but intentionally do not load it into a cluster. That is step 4.
 
 Reference: [create project](https://docs.cloud.google.com/resource-manager/docs/creating-managing-projects),
 [enable APIs](https://docs.cloud.google.com/service-usage/docs/enable-disable),
