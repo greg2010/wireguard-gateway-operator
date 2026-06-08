@@ -1,10 +1,6 @@
-// Package crossplane exercises the shipped GCP XGatewayGCP composition template
-// against the real function-go-templating function image over gRPC.
-//
-// The test does not stand up Crossplane or a Kubernetes API server: it drives
-// the function's FunctionRunnerService directly, the same contract Crossplane
-// invokes per reconcile. This isolates the template logic (the part this repo
-// owns) from the rest of the rendering pipeline.
+// Package crossplane exercises the shipped GCP XGatewayGCP composition template by
+// driving the real function-go-templating image's FunctionRunnerService over gRPC,
+// the same contract Crossplane invokes per reconcile.
 package crossplane
 
 import (
@@ -29,47 +25,40 @@ const (
 	// when started with --insecure.
 	functionPort = "9443/tcp"
 
-	// xrName is the composite resource name every case in this suite uses. The
-	// function keys observed composed resources by this value via the
-	// crossplane.io/composite label, so observed fixtures must carry it too.
+	// xrName is the composite resource name every case uses; the function keys
+	// observed resources by it via the crossplane.io/composite label, so observed
+	// fixtures must carry it too.
 	xrName = "xgateway-smoke"
 
 	// testRegion is the region every fixture XR requests.
 	testRegion = "us-central1"
 
-	// reservedAddr is the external IP the observed Address reports once
-	// allocated. The reservedIP case asserts it surfaces on the instance
-	// accessConfig natIp and on the XR status address.
+	// reservedAddr is the external IP the observed Address reports; the reservedIP
+	// case asserts it surfaces on the instance accessConfig natIp and the XR status.
 	reservedAddr = "203.0.113.7"
 
-	// ephemeralNatIP is the ephemeral external IP the provider writes back on
-	// the observed instance NIC when reservedIP is false. The no-reservation
-	// case asserts the XR status address reads back from this value.
+	// ephemeralNatIP is the external IP the provider writes back on the observed NIC
+	// when reservedIP is false; the no-reservation case reads the XR status from it.
 	ephemeralNatIP = "198.51.100.22"
 
-	// saEmail is the service account email the observed service-account reports
-	// at status.atProvider.email. Cases that supply it expect the instance and
-	// the secret IAM member to render and the XR status to surface it.
+	// saEmail is the service-account email the observed service-account reports at
+	// status.atProvider.email, gating the instance, secret IAM member, and XR status.
 	saEmail = "gateway@wgnet-test.iam.gserviceaccount.com"
 
 	// secretAccessorRole is the IAM role granted to the gateway service account
 	// on the WireGuard-key secret.
 	secretAccessorRole = "roles/secretmanager.secretAccessor"
 
-	// gatewaySecretID is spec.secretId for the fixtures. The template stamps it
-	// onto the instance metadata as secret-id, which the gateway VM's keyfetch
-	// reads to pull the WireGuard key from Secret Manager.
+	// gatewaySecretID is spec.secretId; the template stamps it onto the instance
+	// metadata as secret-id, which the VM's keyfetch reads to pull the WireGuard key.
 	gatewaySecretID = "gateway-wg"
 
-	// testProjectID is spec.projectID for the fixtures. The template stamps it onto
-	// the instance metadata as project-id, which the gateway VM's keyfetch reads to
-	// build the Secret Manager URL.
+	// testProjectID is spec.projectID; the template stamps it onto the instance
+	// metadata as project-id, which the VM's keyfetch reads to build the SM URL.
 	testProjectID = "wgnet-test-project"
 
-	// sharedNetworkName is spec.sharedNetworkName for the per-gateway fixtures: the
-	// name of the VPC the separate shared-network composition creates. The template
-	// stamps it verbatim onto the Firewall and the instance NIC, so the per-gateway
-	// composition no longer creates or observes its own Network or Subnetwork.
+	// sharedNetworkName is spec.sharedNetworkName, the VPC the shared-network
+	// composition creates; the template stamps it onto the Firewall and instance NIC.
 	sharedNetworkName = "wgnet-test"
 )
 
@@ -187,9 +176,8 @@ func TestXGatewayGCPComposition(t *testing.T) {
 					t.Errorf("instance metadata secret-id = %q, want %q", got, gatewaySecretID)
 				}
 				// The per-Gateway WireGuard and project values flow onto the instance
-				// metadata; the gateway VM's keyfetch reads them at boot to render the
-				// netdev, nftables, wg0 address, and Secret Manager URL. This is the
-				// split-brain fix at the composition boundary.
+				// metadata; the VM's keyfetch reads them to render the netdev, nftables,
+				// wg0 address, and Secret Manager URL.
 				wantMeta := map[string]string{
 					"wg-listen-port":     "51820",
 					"wg-mtu":             "1380",
@@ -372,10 +360,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			},
 		},
 		{
-			// The split-brain fix at the composition boundary: a non-default
-			// wgListenPort and a distinct projectID flow verbatim onto the rendered
-			// instance metadata, so the single per-Gateway value reaches the gateway
-			// VM's keyfetch rather than a stale chart-baked one.
+			// A non-default wgListenPort and distinct projectID flow verbatim onto the
+			// rendered instance metadata, so the per-Gateway value reaches the VM's
+			// keyfetch rather than a chart-baked one.
 			name: "non-default wgListenPort and projectID reach instance metadata",
 			spec: map[string]any{
 				"region":            testRegion,
@@ -456,10 +443,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 	}
 }
 
-// TestXGatewayNetworkComposition renders the shared-network composition and
-// asserts it emits exactly one Network MR named for the requested VPC with
-// autoCreateSubnetworks enabled. This is the VPC the per-gateway composition
-// attaches every gateway instance and firewall onto.
+// TestXGatewayNetworkComposition renders the shared-network composition and asserts
+// it emits exactly one Network MR named for the requested VPC with
+// autoCreateSubnetworks enabled.
 func TestXGatewayNetworkComposition(t *testing.T) {
 	if os.Getenv("GATEWAY_INTEGRATION") == "" {
 		t.Skip("set GATEWAY_INTEGRATION to run the composition integration test")
@@ -545,19 +531,16 @@ func newRunFunction(t *testing.T) *runFunction {
 }
 
 // buildRequest assembles a RunFunctionRequest for the per-gateway XGatewayGCP
-// composition, carrying the GoTemplate input, the XR built from spec, and any
-// observed composed resources. The XR always uses xrName so the function's
-// observed-resource keying lines up with the crossplane.io/composite label on
-// observed fixtures.
+// composition from spec and observed resources, with the XR named xrName so the
+// function's observed-resource keying lines up.
 func (rf *runFunction) buildRequest(t *testing.T, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
 	t.Helper()
 	return rf.buildRequestFor(t, rf.template, "XGatewayGCP", spec, observed)
 }
 
 // buildRequestFor assembles a RunFunctionRequest for an arbitrary composition
-// template and XR kind in the infra.wgnet.dev group, letting a single running
-// function container render either the per-gateway or the shared-network
-// composition.
+// template and XR kind in the infra.wgnet.dev group, so one running container can
+// render either composition.
 func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
 	t.Helper()
 
@@ -591,9 +574,8 @@ func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec
 }
 
 // observedResource wraps a composed-resource body in the metadata
-// function-go-templating uses to key .observed.resources: the
-// crossplane.io/composition-resource-name annotation names the slot and the
-// crossplane.io/composite label ties it to the XR.
+// function-go-templating keys .observed.resources by: the composition-resource-name
+// annotation names the slot and the composite label ties it to the XR.
 func observedResource(t *testing.T, name string, body map[string]any) *fnv1.Resource {
 	t.Helper()
 	meta, ok := body["metadata"].(map[string]any)
@@ -643,10 +625,9 @@ func readChartTemplate(t *testing.T, relPath string) string {
 	return string(b)
 }
 
-// goTemplatingImage returns the function-go-templating package the providers
-// chart pins, making that values file the single source of truth for the digest
-// the test boots. The path is resolved relative to this test file so it does not
-// depend on the process working directory.
+// goTemplatingImage returns the function-go-templating package the providers chart
+// pins, so that values file is the single source of truth for the digest the test
+// boots. The path resolves relative to this test file, not the working directory.
 func goTemplatingImage(t *testing.T) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -713,9 +694,7 @@ func assertWithheld(t *testing.T, resp *fnv1.RunFunctionResponse, name string) {
 }
 
 // assertSharedNetworkNIC asserts the instance's primary NIC attaches directly to
-// the shared VPC by name and carries no subnetwork wiring, the shape the
-// shared-VPC refactor requires now that the per-gateway composition no longer
-// creates a Subnetwork.
+// the shared VPC by name and carries no subnetwork wiring.
 func assertSharedNetworkNIC(t *testing.T, inst map[string]any) {
 	t.Helper()
 	nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")

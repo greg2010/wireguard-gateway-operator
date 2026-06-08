@@ -80,10 +80,8 @@ spec:
                       type: string
                     service:
                       description: |-
-                        Service is the bare in-cluster Service name (not an FQDN); see Namespace for
-                        cross-namespace targets. Constrained to a single DNS-1035 label so a
-                        dotted FQDN cannot be smuggled in to reach a Service the Namespace gate
-                        would otherwise govern.
+                        Service is the bare in-cluster Service name, constrained to a single
+                        DNS-1035 label so a dotted FQDN cannot bypass the Namespace gate.
                       minLength: 1
                       pattern: ^[a-z]([-a-z0-9]*[a-z0-9])?$
                       type: string
@@ -145,6 +143,21 @@ spec:
                 - projectID
                 - region
                 - zone
+                type: object
+              link:
+                default: {}
+                description: |-
+                  Link configures the in-cluster link Deployment. Every value defaults via the
+                  CRD, so the block may be omitted to get a single-replica link.
+                properties:
+                  replicas:
+                    default: 1
+                    description: |-
+                      Replicas is the number of link pods. Values >1 enable hot-standby
+                      failover and safe rolling updates via leader election.
+                    format: int32
+                    minimum: 1
+                    type: integer
                 type: object
               provider:
                 default: gcp

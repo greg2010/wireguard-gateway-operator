@@ -5,34 +5,41 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
-// defaultStaleness is the handshake age threshold used when the peer has no
-// PersistentKeepalive configured and so no fixed handshake cadence to derive a
-// tighter bound from.
+// defaultStaleness is the handshake age threshold when the peer has no
+// PersistentKeepalive cadence to derive a tighter bound from.
 const defaultStaleness = 180 * time.Second
 
-// minStaleness is a floor on the handshake age threshold. WireGuard refreshes
-// the latest-handshake timestamp only on rekey (REKEY_AFTER_TIME, ~120s) or
-// on-demand traffic, never on keepalive packets, so between rekeys a healthy
-// peer's handshake legitimately ages toward 120s. The floor must exceed that
-// rekey interval to avoid flapping unready on an otherwise live tunnel.
+// minStaleness floors the handshake age threshold above the ~120s rekey interval.
+// WireGuard refreshes the timestamp only on rekey, so a lower floor would flap an
+// otherwise live tunnel unready between rekeys.
 const minStaleness = 150 * time.Second
 
-// readiness reports tunnel health over HTTP. It is ready when wg show reports a
-// peer handshake newer than a staleness window derived from PersistentKeepalive.
+// readiness reports tunnel health over HTTP, gated on leadership. A non-leader always
+// reports ready without probing wg0; the leader reports ready only on a peer handshake
+// newer than the staleness window. The leader flag is concurrency-safe.
 type readiness struct {
 	keepalive int
 	now       func() time.Time
 	// wgShow returns the output of `wg show wg0 latest-handshakes`.
 	wgShow func(ctx context.Context) (string, error)
+	leader atomic.Bool
 }
 
 // newReadiness builds a readiness checker. now and wgShow are injected so the
-// readiness decision is testable without a real interface or clock.
+// readiness decision is testable without a real interface or clock. It starts as
+// a standby (not leader) until setLeader marks it active.
 func newReadiness(keepalive int, now func() time.Time, wgShow func(ctx context.Context) (string, error)) *readiness {
 	return &readiness{keepalive: keepalive, now: now, wgShow: wgShow}
+}
+
+// setLeader records whether this replica currently holds leadership. It is
+// called from the leader-election callbacks concurrently with handler reads.
+func (r *readiness) setLeader(leader bool) {
+	r.leader.Store(leader)
 }
 
 // staleness is three keepalive intervals floored at minStaleness, or
@@ -45,6 +52,9 @@ func (r *readiness) staleness() time.Duration {
 }
 
 func (r *readiness) ready(ctx context.Context) bool {
+	if !r.leader.Load() {
+		return true
+	}
 	out, err := r.wgShow(ctx)
 	if err != nil {
 		return false
@@ -66,10 +76,9 @@ func (r *readiness) handler(w http.ResponseWriter, req *http.Request) {
 	_, _ = w.Write([]byte("no recent handshake"))
 }
 
-// freshestHandshake parses the output of `wg show wg0 latest-handshakes`, whose
-// lines are "<pubkey>\t<unix-epoch>", and returns the most recent non-zero
-// handshake time. An epoch of 0 means the peer has never completed a handshake.
-// ok is false when no peer has a non-zero handshake.
+// freshestHandshake parses `wg show wg0 latest-handshakes` lines
+// ("<pubkey>\t<unix-epoch>") and returns the most recent non-zero handshake time. ok
+// is false when no peer has completed a handshake (every epoch 0).
 func freshestHandshake(wgShowOutput string) (time.Time, bool) {
 	var newest int64
 	for line := range strings.SplitSeq(wgShowOutput, "\n") {

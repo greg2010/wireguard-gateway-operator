@@ -62,52 +62,81 @@ func TestReadinessReady(t *testing.T) {
 
 	tcs := []struct {
 		name      string
+		leader    bool
 		keepalive int
 		showOut   string
 		showErr   error
 		want      bool
 	}{
 		{
-			name:      "fresh_within_keepalive_window",
+			name:      "leader_fresh_within_keepalive_window",
+			leader:    true,
 			keepalive: 25, // staleness = max(75s, 150s) = 150s
 			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-30),
 			want:      true,
 		},
 		{
-			name:      "handshake_aged_past_keepalive_but_within_rekey_floor",
+			name:      "leader_handshake_aged_past_keepalive_but_within_rekey_floor",
+			leader:    true,
 			keepalive: 25, // staleness floor = 150s covers the ~120s rekey interval
 			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-120),
 			want:      true,
 		},
 		{
-			name:      "stale_beyond_rekey_floor",
+			name:      "leader_stale_beyond_rekey_floor",
+			leader:    true,
 			keepalive: 25, // staleness = max(75s, 150s) = 150s
 			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-200),
 			want:      false,
 		},
 		{
-			name:      "no_handshake",
+			name:      "leader_no_handshake",
+			leader:    true,
 			keepalive: 25,
 			showOut:   "PK=\t0",
 			want:      false,
 		},
 		{
-			name:      "wg_show_error",
+			name:      "leader_wg_show_error",
+			leader:    true,
 			keepalive: 25,
 			showErr:   fmt.Errorf("wg0 does not exist"),
 			want:      false,
 		},
 		{
-			name:      "keepalive_zero_fresh_within_default_window",
+			name:      "leader_keepalive_zero_fresh_within_default_window",
+			leader:    true,
 			keepalive: 0, // staleness = 180s
 			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-120),
 			want:      true,
 		},
 		{
-			name:      "keepalive_zero_stale_beyond_default_window",
+			name:      "leader_keepalive_zero_stale_beyond_default_window",
+			leader:    true,
 			keepalive: 0, // staleness = 180s
 			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-200),
 			want:      false,
+		},
+		{
+			name:      "standby_ready_despite_stale_handshake",
+			leader:    false,
+			keepalive: 25,
+			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-3600),
+			want:      true,
+		},
+		{
+			name:      "standby_ready_despite_no_handshake",
+			leader:    false,
+			keepalive: 25,
+			showOut:   "PK=\t0",
+			want:      true,
+		},
+		{
+			name:      "standby_ready_despite_wg_show_error",
+			leader:    false,
+			keepalive: 25,
+			showErr:   fmt.Errorf("wg0 does not exist"),
+			want:      true,
 		},
 	}
 
@@ -117,9 +146,27 @@ func TestReadinessReady(t *testing.T) {
 				return tc.showOut, tc.showErr
 			}
 			rd := newReadiness(tc.keepalive, now, wgShow)
+			rd.setLeader(tc.leader)
 			if got := rd.ready(context.Background()); got != tc.want {
-				t.Errorf("ready = %v, want %v (staleness=%s)", got, tc.want, rd.staleness())
+				t.Errorf("ready = %v, want %v (leader=%v, staleness=%s)", got, tc.want, tc.leader, rd.staleness())
 			}
 		})
+	}
+}
+
+// TestReadinessStandbyIgnoresWGShow pins that a non-leader never shells out for
+// handshake state: ready() must short-circuit to true before calling wgShow.
+func TestReadinessStandbyIgnoresWGShow(t *testing.T) {
+	called := false
+	rd := newReadiness(25, time.Now, func(_ context.Context) (string, error) {
+		called = true
+		return "", fmt.Errorf("wgShow must not be called for a standby")
+	})
+
+	if !rd.ready(context.Background()) {
+		t.Fatal("standby ready = false, want true")
+	}
+	if called {
+		t.Error("wgShow was called for a non-leader; ready() must short-circuit first")
 	}
 }

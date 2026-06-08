@@ -11,24 +11,19 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// agnhostImage is the canonical Kubernetes e2e test image. Its `netexec`
-// subcommand serves HTTP on --http-port (the /hostname path returns the
-// serving pod's name, the marker the TCP data-path assertion checks) and echoes
-// UDP datagrams on --udp-port.
+// agnhostImage is the canonical Kubernetes e2e test image. Its netexec subcommand
+// serves HTTP on --http-port (the /hostname path returns the serving pod's name, the
+// data-path marker) and echoes UDP datagrams on --udp-port.
 const agnhostImage = "registry.k8s.io/e2e-test-images/agnhost:2.53"
 
 // EchoFixtures names a TCP (HTTP) echo Service and a UDP echo Service created in
 // ns. The link DNATs gateway ports to these Services' DNS names; the probes' retry
 // budget absorbs the backing Deployments' startup, so no readiness wait is done.
 type EchoFixtures struct {
-	// TCPService is the in-cluster DNS name of the HTTP echo Service.
 	TCPService string
-	// TCPPort is the Service port the HTTP echo listens on.
-	TCPPort int
-	// UDPService is the in-cluster DNS name of the UDP echo Service.
+	TCPPort    int
 	UDPService string
-	// UDPPort is the Service port the UDP echo listens on.
-	UDPPort int
+	UDPPort    int
 }
 
 // echo fixture constants. The container ports match the agnhost netexec flags.
@@ -45,20 +40,16 @@ const (
 // is the return shape for the standalone echo helpers (NodePort, cross-namespace)
 // that deploy one backend rather than the TCP+UDP pair EchoFixtures carries.
 type EchoBackend struct {
-	// Namespace is where the echo Deployment and Service live.
 	Namespace string
 	// Service is the bare Service name; the operator builds the FQDN from it and
 	// Namespace.
 	Service string
-	// Port is the Service port the HTTP echo listens on.
-	Port int
+	Port    int
 }
 
-// DeployEchoFixtures creates the TCP and UDP echo Deployments and Services in ns
-// and returns their addresses. It does not wait for the Deployments to become
-// Available; the data-path probes retry long enough to cover pod startup. The
-// returned Service names are short (in-namespace) DNS names; the link resolves
-// them within the same namespace.
+// DeployEchoFixtures creates the TCP and UDP echo Deployments and Services in ns and
+// returns their in-namespace addresses. It does not wait for Available; the data-path
+// probes retry long enough to cover pod startup.
 func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixtures, error) {
 	tcpArgs := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
 	udpArgs := []string{"netexec", fmt.Sprintf("--udp-port=%d", echoUDPPort), "--http-port=0"}
@@ -78,11 +69,9 @@ func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixture
 	}, nil
 }
 
-// DeployNodePortEcho creates an HTTP echo Deployment fronted by a NodePort
-// Service in ns and returns its address. A NodePort Service still carries a
-// ClusterIP, so the operator accepts it as a forward backend; this exercises the
-// service-type acceptance path for NodePort end to end. The name is distinct from
-// the ClusterIP fixtures so both can coexist in the same namespace.
+// DeployNodePortEcho creates an HTTP echo Deployment fronted by a NodePort Service
+// in ns and returns its address, exercising the NodePort service-type acceptance
+// path. Its name is distinct from the ClusterIP fixtures so both can coexist.
 func (c *Client) DeployNodePortEcho(ctx context.Context, ns string) (EchoBackend, error) {
 	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
 	if err := c.applyEcho(ctx, ns, echoNodePortName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeNodePort, args); err != nil {
@@ -91,13 +80,9 @@ func (c *Client) DeployNodePortEcho(ctx context.Context, ns string) (EchoBackend
 	return EchoBackend{Namespace: ns, Service: echoNodePortName, Port: echoTCPPort}, nil
 }
 
-// DeployEchoInNamespace creates ns (carrying nsLabels) and deploys an HTTP echo
-// Deployment fronted by a ClusterIP Service in it, returning the backend address.
-// It is the cross-namespace forward fixture: the caller passes the consent label
-// so the operator permits a Gateway in another namespace to forward to this
-// Service. The namespace is created with the supplied labels in one shot rather
-// than via EnsureNamespace so the consent label is present before the Gateway
-// reconciles.
+// DeployEchoInNamespace creates ns with nsLabels and deploys a ClusterIP echo into
+// it, the cross-namespace forward fixture. The namespace is created with the labels
+// in one shot so the consent label is present before the Gateway reconciles.
 func (c *Client) DeployEchoInNamespace(ctx context.Context, ns string, nsLabels map[string]string) (EchoBackend, error) {
 	nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns, Labels: nsLabels}}
 	if _, err := c.typed.CoreV1().Namespaces().Create(ctx, nsObj, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -110,12 +95,9 @@ func (c *Client) DeployEchoInNamespace(ctx context.Context, ns string, nsLabels 
 	return EchoBackend{Namespace: ns, Service: echoXNSName, Port: echoTCPPort}, nil
 }
 
-// DeployEchoBackend creates a ClusterIP HTTP echo Deployment+Service named name in
-// ns and returns its address. It is the dedicated-backend fixture the lifecycle
-// subtests attach a runtime forward to, kept distinct from the create-time echoes
-// (whose Services other subtests assert on) by its caller-chosen name. It does not
-// wait for the Deployment to become Available; the data-path probes retry long
-// enough to cover pod startup.
+// DeployEchoBackend creates a ClusterIP HTTP echo named name in ns and returns its
+// address, the caller-named dedicated backend the lifecycle subtests attach a runtime
+// forward to. It does not wait for Available; the data-path probes cover pod startup.
 func (c *Client) DeployEchoBackend(ctx context.Context, ns, name string) (EchoBackend, error) {
 	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
 	if err := c.applyEcho(ctx, ns, name, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {

@@ -82,13 +82,14 @@ func TestReadKeyFile(t *testing.T) {
 	}
 }
 
-// newHealthHandler builds the readiness handler serveHealth mounts, with an
-// injected wgShow and a fixed clock so the ready/not-ready decision is
-// deterministic.
+// newHealthHandler builds the readiness handler with an injected wgShow and a
+// fixed clock. It marks the readiness a leader so the handshake gate is exercised
+// rather than short-circuited.
 func newHealthHandler(now time.Time, showOut string, showErr error) http.HandlerFunc {
 	rd := newReadiness(25, func() time.Time { return now }, func(_ context.Context) (string, error) {
 		return showOut, showErr
 	})
+	rd.setLeader(true)
 	return rd.handler
 }
 
@@ -140,14 +141,15 @@ func TestServeHealthHandler(t *testing.T) {
 	}
 }
 
-// TestServeHealthServesAndDrains boots the real serveHealth on an ephemeral
-// loopback address, confirms /healthz answers over the wire, then cancels its
-// context and asserts a graceful nil return.
+// TestServeHealthServesAndDrains boots serveHealth on a loopback address,
+// confirms /healthz answers over the wire, then cancels and asserts a graceful
+// nil return.
 func TestServeHealthServesAndDrains(t *testing.T) {
 	now := time.Unix(1700001000, 0)
 	rd := newReadiness(25, func() time.Time { return now }, func(_ context.Context) (string, error) {
 		return fmt.Sprintf("PK=\t%d", now.Unix()-30), nil
 	})
+	rd.setLeader(true)
 
 	addr := freeLoopbackAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())

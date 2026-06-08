@@ -24,13 +24,8 @@ func NewHelm(kubeCtx, repoDir string, log *zap.Logger) *Helm {
 	return &Helm{kubeCtx: kubeCtx, repoDir: repoDir, log: log}
 }
 
-// Install runs `helm upgrade --install` for one release. When rel.Wait is set
-// it adds --wait, blocking until every release object reports ready; callers
-// whose own readiness is asymmetric (e.g. a Deployment that cannot become ready
-// until a later phase) leave Wait unset and poll explicitly instead.
-// valuesFiles are passed as -f in order (later files override earlier);
-// setValues become --set, setStrings become --set-string. chartRef is either a
-// chart path or a remote chart name (with repo set).
+// Install runs `helm upgrade --install` for one release. ValuesFiles are passed
+// as -f in order (later files override earlier).
 func (h *Helm) Install(ctx context.Context, rel ReleaseSpec) error {
 	h.log.Info("helm install", zap.String("release", rel.Name), zap.String("namespace", rel.Namespace))
 	rel.repoDir = h.repoDir
@@ -98,11 +93,8 @@ func (h *Helm) Uninstall(ctx context.Context, name, namespace string) error {
 
 // ReleaseSpec describes one helm release.
 type ReleaseSpec struct {
-	// Name is the release name.
-	Name string
-	// Namespace is the install namespace.
-	Namespace string
-	// CreateNamespace passes --create-namespace.
+	Name            string
+	Namespace       string
 	CreateNamespace bool
 	// Wait passes --wait, blocking until every release object is ready. Leave
 	// unset when the caller polls readiness itself.
@@ -115,15 +107,12 @@ type ReleaseSpec struct {
 	RemoteChart string
 	// Repo is the chart repository URL for RemoteChart.
 	Repo string
-	// Version pins the chart version (remote charts).
+	// Version pins the chart version for remote charts.
 	Version string
 	// Timeout overrides helm's default --timeout (e.g. "5m").
-	Timeout string
-	// ValuesFiles are -f value files in override order.
-	ValuesFiles []string
-	// SetValues are --set KEY=VALUE pairs.
-	SetValues []string
-	// SetStringValues are --set-string KEY=VALUE pairs.
+	Timeout         string
+	ValuesFiles     []string
+	SetValues       []string
 	SetStringValues []string
 
 	repoDir string

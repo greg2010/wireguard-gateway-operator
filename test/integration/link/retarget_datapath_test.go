@@ -13,28 +13,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// This test drives real TCP traffic through the link's rendered DNAT across a
-// forward retarget, to settle whether an in-place target swap (Service A -> B on
-// a fixed public port) blackholes existing or new flows. It builds a three-netns
-// topology so packets genuinely ingress an interface named wg0 and are forwarded
-// to a separate "cluster" netns, matching production routing where a ClusterIP is
-// reached via a route rather than locally; a local-delivery shortcut would route
-// DNAT'd packets through the input chain instead of forward and not exercise the
-// accept rules at all.
-//
-// It proves three things about a retarget that hold with the real template:
-//   - a fresh connection before the retarget reaches A;
-//   - a connection ESTABLISHED to A before the retarget keeps working after it,
-//     because the forward chain's leading `ct state established,related accept`
-//     matches the conntrack-pinned flow regardless of the per-destination accept
-//     rule that the retarget moves from A to B; the reused flow is therefore not
-//     dropped;
-//   - a fresh connection after the retarget reaches B, because a new 5-tuple
-//     re-evaluates the prerouting DNAT.
-//
-// The combination rules out a stale-conntrack blackhole on a retarget: existing
-// flows are accepted (they continue to the old target, not dropped) and new flows
-// follow the new target.
+// A three-netns topology forwards traffic through wg0 to a separate cluster netns
+// so the accept rules are exercised, not bypassed by local delivery.
 
 const (
 	// dpRetargetPort is the public port the forward exposes on wg0.
@@ -53,10 +33,9 @@ const (
 	dpProbeTimeout = 5 * time.Second
 )
 
-// TestNftablesRetargetDataPathFollowsClusterIP exercises the link's rendered
-// nftables over real traffic across a retarget and asserts the data path follows
-// the new ClusterIP without blackholing existing flows. See the file comment for
-// the topology and the invariants it pins.
+// TestNftablesRetargetDataPathFollowsClusterIP asserts the data path follows a
+// retargeted ClusterIP: a fresh pre-retarget flow reaches A, an established flow
+// stays pinned to A, and a fresh post-retarget flow reaches B.
 func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -94,11 +73,8 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	}
 }
 
-// startDataPathContainer brings up the pinned image with the tooling and the
-// three-netns topology this test drives traffic through, and returns the running
-// container. It does not reuse startNftContainer because that creates a dummy wg0
-// that cannot carry traffic; this builds a wg0 veth peer plus a separate cluster
-// netns so DNAT'd packets are forwarded rather than delivered locally.
+// startDataPathContainer brings up the three-netns topology with a wg0 veth peer,
+// unlike startNftContainer whose dummy wg0 cannot carry forwarded traffic.
 func startDataPathContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 
@@ -136,13 +112,9 @@ func installDataPathPackages(ctx context.Context, t testing.TB, ctr testcontaine
 	}
 }
 
-// topologyScript builds the client/gateway/cluster netns plumbing. The gateway is
-// the container's root netns: wg0 is the gateway end of the client veth, so a SYN
-// from the client to the public port ingresses wg0 and traverses the prerouting
-// nat hook with iif "wg0". The two stand-in ClusterIPs live in the cluster netns
-// behind a second veth, routed via /32s, so DNAT'd packets are forwarded out to
-// them and exercise the forward chain. The cluster end also carries a /24 base
-// address so backends have a return route to the gateway.
+// topologyScript builds the client/gateway/cluster netns plumbing: wg0 is the
+// gateway end of the client veth, and the stand-in ClusterIPs live behind a second
+// veth in the cluster netns so DNAT'd packets are forwarded, not delivered locally.
 const topologyScript = `set -e
 ip netns add client
 ip link add vc-gw type veth peer name wg0
@@ -232,10 +204,9 @@ func waitClusterListening(ctx context.Context, t testing.TB, ctr testcontainers.
 	t.Fatalf("cluster backends did not start listening on port %d within deadline", dpTargetPort)
 }
 
-// probeScript opens a fresh connection from the client netns to the public port,
-// sends one request, and prints the trimmed reply prefixed with GOT:, or ERR: on
-// failure. A fresh connection models the e2e probe's per-poll dial and forces a
-// prerouting DNAT re-evaluation.
+// probeScript dials a fresh connection from the client netns, sends one request,
+// and prints the reply prefixed GOT: (or ERR: on failure). The fresh connection
+// forces a prerouting DNAT re-evaluation, like the e2e probe's per-poll dial.
 const probeScript = `import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(float(sys.argv[3]))
@@ -265,24 +236,17 @@ func probeOnce(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 	return parseMarker(out)
 }
 
-// heldConnection is a long-lived client connection kept open inside the container
-// across a retarget, so the test can issue a second request on the same
-// established flow and observe whether conntrack pins it to the old target.
-//
-// The Go test drives it through the filesystem: it bumps a generation counter
-// file, and the in-container server, on seeing a new generation, sends one
-// request on the held socket and writes the backend's reply to a per-generation
-// file the test then reads. Regular files are used rather than fifos so a writer
-// closing after each request does not wedge the reader on EOF.
+// heldConnection is a client connection kept open across a retarget so the test can
+// observe whether conntrack pins the flow to the old target. It is driven through
+// the filesystem via a generation counter and per-generation reply files.
 type heldConnection struct {
 	ctr testcontainers.Container
 	gen int
 }
 
-// heldScript opens one connection to the public port, then polls the generation
-// file; each time it advances, it sends a request on the held socket and writes
-// the reply to /tmp/held_reply.<gen>. Keeping the socket open between requests is
-// what makes the flow ESTABLISHED across the retarget.
+// heldScript opens one connection, then on each generation bump sends a request on
+// the held socket and writes the reply to /tmp/held_reply.<gen>. Keeping the socket
+// open between requests is what makes the flow ESTABLISHED across the retarget.
 const heldScript = `import socket, os, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)

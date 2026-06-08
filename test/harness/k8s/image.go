@@ -20,11 +20,9 @@ type ImageRef struct {
 // Ref returns the full repository:tag reference.
 func (r ImageRef) Ref() string { return r.Repository + ":" + r.Tag }
 
-// BuildImage builds one Dockerfile target from build/package/Dockerfile into the
-// local docker store with a run-unique tag and returns its reference. push is
-// implied false (no registry), so LoadImage must side-load it into kind. target
-// selects the multi-stage build target (e.g. "operator" or "link"); repository
-// names the resulting image.
+// BuildImage builds the named multi-stage target from build/package/Dockerfile into
+// the local docker store with a run-unique tag and returns its reference. Nothing is
+// pushed, so LoadImage must side-load it into kind.
 func BuildImage(ctx context.Context, repoDir, repository, tag, target string, log *zap.Logger) (ImageRef, error) {
 	ref := ImageRef{Repository: repository, Tag: tag}
 	log.Info("docker build image", zap.String("ref", ref.Ref()), zap.String("target", target))

@@ -30,6 +30,12 @@ type GatewaySpec struct {
 	// +kubebuilder:default={}
 	Wireguard GatewayWireguardSpec `json:"wireguard,omitempty"`
 
+	// Link configures the in-cluster link Deployment. Every value defaults via the
+	// CRD, so the block may be omitted to get a single-replica link.
+	// +optional
+	// +kubebuilder:default={}
+	Link GatewayLinkSpec `json:"link,omitempty"`
+
 	// Provider selects the provider-specific Crossplane Composition that
 	// provisions the gateway VM, matched by the composite's compositionSelector.
 	// Only gcp is supported today.
@@ -119,6 +125,16 @@ type GatewayWireguardSpec struct {
 	ReconcileInterval string `json:"reconcileInterval,omitempty"`
 }
 
+// GatewayLinkSpec configures the in-cluster link Deployment.
+type GatewayLinkSpec struct {
+	// Replicas is the number of link pods. Values >1 enable hot-standby
+	// failover and safe rolling updates via leader election.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas,omitempty"`
+}
+
 type Forward struct {
 	// Port is the public port opened on the gateway VM and DNAT'd through the
 	// tunnel.
@@ -129,10 +145,8 @@ type Forward struct {
 	// +kubebuilder:validation:Enum=TCP;UDP
 	Protocol Protocol `json:"protocol"`
 
-	// Service is the bare in-cluster Service name (not an FQDN); see Namespace for
-	// cross-namespace targets. Constrained to a single DNS-1035 label so a
-	// dotted FQDN cannot be smuggled in to reach a Service the Namespace gate
-	// would otherwise govern.
+	// Service is the bare in-cluster Service name, constrained to a single
+	// DNS-1035 label so a dotted FQDN cannot bypass the Namespace gate.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:Pattern=^[a-z]([-a-z0-9]*[a-z0-9])?$
 	Service string `json:"service"`

@@ -73,13 +73,9 @@ func TestRenderNftablesDeterministicAndSorted(t *testing.T) {
 	}
 }
 
-// TestRenderNftablesRetargetReferencesOnlyNewClusterIP pins the retarget contract
-// at the render layer: when a forward on a fixed public port is repointed to a new
-// ClusterIP, the rendered document must DNAT the port to the new IP and accept the
-// new IP in the forward chain, and must contain no reference to the old IP. The
-// DNAT and the companion accept rule both derive from the same ResolvedForward, so
-// they move together; the whole table is flushed and rebuilt, so the old IP cannot
-// survive. Distinct, recognizable IPs make a stale reference obvious.
+// TestRenderNftablesRetargetReferencesOnlyNewClusterIP pins that repointing a forward
+// moves both the DNAT and its companion accept rule to the new ClusterIP and leaves no
+// reference to the old one.
 func TestRenderNftablesRetargetReferencesOnlyNewClusterIP(t *testing.T) {
 	const (
 		port    = 8453

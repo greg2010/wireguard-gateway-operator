@@ -1,22 +1,28 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
 )
 
@@ -38,9 +44,8 @@ var xgatewayGCPGVR = schema.GroupVersionResource{
 }
 
 // crdGVR and compositeResourceDefinitionGVR are the apiextensions resources the
-// suite polls for readiness after the once-per-cluster operator install: the
-// Gateway CRD must be Established before any Gateway applies, and the XGatewayGCP
-// XRD must be present so the operator's composites bind.
+// suite polls for readiness after the operator install: the Gateway CRD must be
+// Established before any Gateway applies, and the XGatewayGCP XRD must be present.
 var (
 	crdGVR = schema.GroupVersionResource{
 		Group:    "apiextensions.k8s.io",
@@ -58,7 +63,11 @@ var (
 type Client struct {
 	typed   kubernetes.Interface
 	dynamic dynamic.Interface
-	log     *zap.Logger
+	// rest is the resolved REST config the typed/dynamic clients were built from.
+	// It is retained so ExecInPod can open a SPDY remotecommand stream, which needs
+	// the transport config directly rather than a typed client.
+	rest *rest.Config
+	log  *zap.Logger
 }
 
 // NewClientFromKubeconfig builds a Client from a kubeconfig file. When context
@@ -83,7 +92,7 @@ func NewClientFromKubeconfig(path, context string, log *zap.Logger) (*Client, er
 	if err != nil {
 		return nil, fmt.Errorf("dynamic client: %w", err)
 	}
-	return &Client{typed: typed, dynamic: dyn, log: log}, nil
+	return &Client{typed: typed, dynamic: dyn, rest: cfg, log: log}, nil
 }
 
 // EnsureNamespace creates ns if it does not already exist.
@@ -107,14 +116,9 @@ func (c *Client) DeleteNamespace(ctx context.Context, ns string) error {
 	return nil
 }
 
-// SetNamespaceLabel sets label=value on ns via a read-modify-write, so the
-// operator's Namespace watch fires and re-classifies any cross-namespace forward
-// into ns. Used by the consent-label lifecycle subtest.
-//
-// The read-modify-write runs inside retry.RetryOnConflict against a freshly
-// fetched Namespace on each attempt, so a concurrent write that bumps the
-// Namespace's resourceVersion (the namespace controller stamps status) does not
-// fail the label update on an optimistic-concurrency conflict.
+// SetNamespaceLabel sets label=value on ns so the operator's Namespace watch
+// re-classifies any cross-namespace forward into ns. The read-modify-write retries
+// on conflict so a concurrent status write does not fail the update.
 func (c *Client) SetNamespaceLabel(ctx context.Context, ns, label, value string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj, err := c.typed.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
@@ -132,14 +136,9 @@ func (c *Client) SetNamespaceLabel(ctx context.Context, ns, label, value string)
 	})
 }
 
-// RemoveNamespaceLabel deletes label from ns via a read-modify-write, so the
-// operator's Namespace watch fires and re-denies any cross-namespace forward into
-// ns. Used by the consent-label lifecycle subtest.
-//
-// The read-modify-write runs inside retry.RetryOnConflict against a freshly
-// fetched Namespace on each attempt, so a concurrent write that bumps the
-// Namespace's resourceVersion (the namespace controller stamps status) does not
-// fail the label removal on an optimistic-concurrency conflict.
+// RemoveNamespaceLabel deletes label from ns so the operator's Namespace watch
+// re-denies any cross-namespace forward into ns. The read-modify-write retries on
+// conflict so a concurrent status write does not fail the update.
 func (c *Client) RemoveNamespaceLabel(ctx context.Context, ns, label string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj, err := c.typed.CoreV1().Namespaces().Get(ctx, ns, metav1.GetOptions{})
@@ -175,15 +174,9 @@ func (c *Client) DeleteDeployment(ctx context.Context, ns, name string) error {
 	return nil
 }
 
-// RestartDeployment forces a rollout of the named Deployment by stamping the
-// pod-template restartedAt annotation, mirroring `kubectl rollout restart`. The
-// changed pod template makes the Deployment controller replace every pod, so a
-// data-path probe after the rollout reaches a fresh pod. Used to prove a forward's
-// DNAT to a backend's stable ClusterIP survives backend pod churn.
-//
-// The read-modify-write runs inside retry.RetryOnConflict against a freshly
-// fetched Deployment on each attempt, so a concurrent status write does not lose
-// the annotation update to an optimistic-concurrency conflict.
+// RestartDeployment forces a rollout by stamping the pod-template restartedAt
+// annotation, like `kubectl rollout restart`. The read-modify-write retries on
+// conflict so a concurrent status write does not lose the annotation update.
 func (c *Client) RestartDeployment(ctx context.Context, ns, name string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		dep, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
@@ -201,13 +194,9 @@ func (c *Client) RestartDeployment(ctx context.Context, ns, name string) error {
 	})
 }
 
-// DeletePodsByLabel deletes every pod in ns matching the label selector and
-// returns the number successfully deleted. A not-found on an individual delete is
-// tolerated (and not counted) so a pod the controller already reaped between the
-// list and the delete does not fail the call. The count lets a caller assert the
-// selector actually matched pods, so a selector or namespace drift fails loudly
-// rather than silently deleting nothing. Used to evict a component's pods (e.g.
-// the link) and prove its replacement re-establishes the data path.
+// DeletePodsByLabel deletes every pod in ns matching the label selector and returns
+// the number deleted, so a caller can assert the selector matched. A not-found on an
+// individual delete is tolerated and not counted.
 func (c *Client) DeletePodsByLabel(ctx context.Context, ns, selector string) (int, error) {
 	pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
@@ -228,9 +217,19 @@ func (c *Client) DeletePodsByLabel(ctx context.Context, ns, selector string) (in
 	return deleted, nil
 }
 
+// DeletePod deletes the single named pod in ns, targeting one pod by name (unlike
+// DeletePodsByLabel) so the failover test can delete only the lease holder and
+// leave the standby running. Not-found is treated as success.
+func (c *Client) DeletePod(ctx context.Context, ns, name string) error {
+	err := c.typed.CoreV1().Pods(ns).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete pod %s/%s: %w", ns, name, err)
+	}
+	return nil
+}
+
 // PodNamesByLabel returns the names of every pod in ns matching the label
-// selector. Used to snapshot a component's pods before evicting them so a caller
-// can wait for a replacement whose name is not in the pre-delete set.
+// selector.
 func (c *Client) PodNamesByLabel(ctx context.Context, ns, selector string) ([]string, error) {
 	pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
@@ -243,36 +242,61 @@ func (c *Client) PodNamesByLabel(ctx context.Context, ns, selector string) ([]st
 	return names, nil
 }
 
-// WaitForReplacementPod polls the label selector until a Ready pod whose name is
-// not in oldNames is observed, or the timeout elapses. Pairs with PodNamesByLabel
-// and DeletePodsByLabel to prove a component's pods were genuinely replaced (not
-// merely that a delete was issued): the old pod can stay Ready while its delete is
-// async, so gating on a new Ready name is the signal the replacement took over.
-// Assumes the controller assigns the replacement a new name (e.g. a Deployment
-// with the Recreate strategy, which tears the old pod down before creating one).
-func (c *Client) WaitForReplacementPod(ctx context.Context, ns, selector string, oldNames []string, timeout time.Duration) error {
-	c.log.Info("waiting for replacement pod",
-		zap.String("namespace", ns), zap.String("selector", selector))
-	old := make(map[string]struct{}, len(oldNames))
-	for _, name := range oldNames {
-		old[name] = struct{}{}
+// ExecInPod runs command (argv, no shell) in the pod's default container over a
+// SPDY remotecommand stream and returns the captured streams. A non-zero exit
+// surfaces as a non-nil error, so a caller keys on err rather than a parsed code.
+func (c *Client) ExecInPod(ctx context.Context, namespace, podName string, command []string) (stdout, stderr string, err error) {
+	req := c.typed.CoreV1().RESTClient().
+		Post().
+		Resource("pods").
+		Namespace(namespace).
+		Name(podName).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Command: command,
+			Stdout:  true,
+			Stderr:  true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(c.rest, "POST", req.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("build exec executor for %s/%s: %w", namespace, podName, err)
 	}
-	return c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
-		pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
-		if err != nil {
-			return false, fmt.Errorf("list pods (ns=%s selector=%s): %w", ns, selector, err)
-		}
-		for i := range pods.Items {
-			pod := &pods.Items[i]
-			if _, isOld := old[pod.Name]; isOld {
-				continue
-			}
-			if podReady(pod) {
-				return true, nil
-			}
-		}
-		return false, nil
+
+	var outBuf, errBuf bytes.Buffer
+	streamErr := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &outBuf,
+		Stderr: &errBuf,
 	})
+	stdout, stderr = outBuf.String(), errBuf.String()
+	if streamErr != nil {
+		return stdout, stderr, fmt.Errorf("exec %v in %s/%s: %w", command, namespace, podName, streamErr)
+	}
+	return stdout, stderr, nil
+}
+
+// EvictPod requests a voluntary eviction via the policy/v1 Eviction subresource,
+// the same path a node drain uses, so the pod's PodDisruptionBudget is enforced.
+// A PDB violation rejects the eviction with TooManyRequests (HTTP 429).
+func (c *Client) EvictPod(ctx context.Context, namespace, podName string) error {
+	err := c.typed.PolicyV1().Evictions(namespace).Evict(ctx, &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+	})
+	if err != nil {
+		return fmt.Errorf("evict pod %s/%s: %w", namespace, podName, err)
+	}
+	return nil
+}
+
+// GetPodDisruptionBudgetStatus reads the named PodDisruptionBudget's status, which
+// the disruption controller recomputes from the matching pods. A caller asserts on
+// its computed fields to confirm the selector matches and the budget protects.
+func (c *Client) GetPodDisruptionBudgetStatus(ctx context.Context, namespace, name string) (policyv1.PodDisruptionBudgetStatus, error) {
+	pdb, err := c.typed.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return policyv1.PodDisruptionBudgetStatus{}, fmt.Errorf("get pdb %s/%s: %w", namespace, name, err)
+	}
+	return pdb.Status, nil
 }
 
 // ApplyCredsSecret creates or updates the crossplane creds Secret holding the
@@ -307,10 +331,9 @@ type GatewayForward struct {
 	// Service is the bare in-cluster Service name the link DNATs the port to; the
 	// operator builds the FQDN from it and Namespace.
 	Service string
-	// Namespace is the target Service's namespace. Empty defaults to the
-	// Gateway's namespace and omits the field from the CR; a non-empty value
-	// targets a Service in another namespace, which the operator permits only when
-	// that namespace carries the cross-namespace ingress consent label.
+	// Namespace is the target Service's namespace. Empty defaults to the Gateway's
+	// namespace and omits the field; a non-empty value targets another namespace,
+	// permitted only when it carries the cross-namespace ingress consent label.
 	Namespace string
 	// TargetPort is the port on Service.
 	TargetPort int
@@ -329,17 +352,18 @@ type GatewaySpec struct {
 	Forwards []GatewayForward
 	// DNSHostnames populate spec.dnsHostnames (empty omits the field).
 	DNSHostnames []string
-	// WireguardListenPort sets spec.wireguard.listenPort, the gateway VM's
-	// WireGuard UDP listen port. Zero omits the field so the CRD default (51820)
-	// applies; a non-zero value lets a test give coexisting gateways distinct WG
-	// ports to assert per-gateway firewall isolation.
+	// WireguardListenPort sets spec.wireguard.listenPort. Zero omits the field so
+	// the CRD default (51820) applies; a non-zero value gives coexisting gateways
+	// distinct WG ports.
 	WireguardListenPort int
+	// Replicas sets spec.link.replicas. Zero omits the field so the CRD default (1)
+	// applies; a value >1 runs a hot standby behind leader election.
+	Replicas int32
 }
 
-// CreateGateway applies a Gateway CR (wgnet.dev/v1alpha1) in ns with the given
-// spec. The operator reconciles it into the XGatewayGCP composite and the link
-// Deployment. Idempotent on the already-exists path so re-running Start in a
-// reused namespace is safe.
+// CreateGateway applies a Gateway CR (wgnet.dev/v1alpha1) in ns, which the operator
+// reconciles into the XGatewayGCP composite and the link Deployment. Idempotent on
+// the already-exists path so re-running Start in a reused namespace is safe.
 func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec GatewaySpec) error {
 	forwards := make([]any, 0, len(spec.Forwards))
 	for _, f := range spec.Forwards {
@@ -348,10 +372,8 @@ func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec Gatewa
 			"protocol": f.Protocol,
 			"service":  f.Service,
 		}
-		// Omit the optional fields when unset so the CR mirrors the operator's
-		// optional-field contract: an empty namespace defaults to the Gateway's own
-		// namespace, and a zero targetPort defaults to port. Emitting an explicit
-		// zero targetPort would also fail the CRD's minimum=1 validation.
+		// An explicit zero targetPort would fail the CRD's minimum=1 validation, so
+		// omit the optional fields when unset.
 		if f.Namespace != "" {
 			forward["namespace"] = f.Namespace
 		}
@@ -372,11 +394,14 @@ func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec Gatewa
 		"gcp":      gcp,
 		"forwards": forwards,
 	}
-	// Omit spec.wireguard.listenPort when unset so the CRD default (51820)
-	// applies; a non-zero value pins a distinct WG port for the gateway.
 	if spec.WireguardListenPort != 0 {
 		gatewaySpec["wireguard"] = map[string]any{
 			"listenPort": int64(spec.WireguardListenPort),
+		}
+	}
+	if spec.Replicas > 0 {
+		gatewaySpec["link"] = map[string]any{
+			"replicas": int64(spec.Replicas),
 		}
 	}
 	if len(spec.DNSHostnames) > 0 {
@@ -451,11 +476,9 @@ func (c *Client) WaitGatewayReady(ctx context.Context, ns, name string, timeout 
 	return status, nil
 }
 
-// WaitGatewayCondition polls the named Gateway until it carries a status
-// condition matching condType, status, and reason, or timeout elapses. An empty
-// reason matches any reason. Unlike WaitGatewayReady it does not gate on the
-// address, so it serves the validation-failure paths (e.g. Ready=False reason
-// CrossNamespaceForwardDenied) that never reach a provisioned address.
+// WaitGatewayCondition polls the named Gateway until it carries a status condition
+// matching condType, status, and reason (an empty reason matches any), or timeout
+// elapses. Unlike WaitGatewayReady it does not gate on the address.
 func (c *Client) WaitGatewayCondition(ctx context.Context, ns, name, condType, status, reason string, timeout time.Duration) error {
 	c.log.Info("waiting for gateway condition",
 		zap.String("namespace", ns), zap.String("name", name),
@@ -472,17 +495,9 @@ func (c *Client) WaitGatewayCondition(ctx context.Context, ns, name, condType, s
 	})
 }
 
-// UpdateGateway applies a read-modify-write to the named Gateway's spec: it
-// fetches the current object, hands mutate the spec map to edit in place, then
-// writes the object back. mutate operates on .spec only; a non-nil error from it
-// aborts the update. Used to edit spec.forwards live and exercise the operator's
-// checksum-driven config rollout.
-//
-// The fetch-mutate-write runs inside retry.RetryOnConflict against a freshly
-// fetched object on each attempt, so a concurrent operator write to the same
-// Gateway (status, conditions, finalizers) does not lose the update to an
-// optimistic-concurrency conflict. mutate must therefore be safe to run more
-// than once.
+// UpdateGateway applies a read-modify-write to the named Gateway's spec via mutate,
+// retrying on conflict against a freshly fetched object. A non-nil error from mutate
+// aborts the update; mutate must be safe to run more than once.
 func (c *Client) UpdateGateway(ctx context.Context, ns, name string, mutate func(spec map[string]any) error) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		obj, err := c.dynamic.Resource(gatewayGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
@@ -509,10 +524,64 @@ func (c *Client) UpdateGateway(ctx context.Context, ns, name string, mutate func
 	})
 }
 
-// DeleteGateway deletes the named Gateway, triggering the operator's finalizer
-// (which drains the XGatewayGCP before the object is removed). Not-found is
-// treated as success so teardown is idempotent. It does not wait; pair it with
-// WaitGatewayGone.
+// SetLinkReplicas sets spec.link.replicas on the named Gateway to n so the
+// operator scales the link Deployment in place. n must be >=1 (the CRD's minimum).
+func (c *Client) SetLinkReplicas(ctx context.Context, ns, name string, n int32) error {
+	return c.UpdateGateway(ctx, ns, name, func(spec map[string]any) error {
+		link, _ := spec["link"].(map[string]any)
+		if link == nil {
+			link = map[string]any{}
+		}
+		link["replicas"] = int64(n)
+		spec["link"] = link
+		return nil
+	})
+}
+
+// GetLeaseHolder returns the holder of the coordination.k8s.io Lease in ns: the link
+// replica programming the data plane. An absent Lease or unset holder returns "" and
+// a nil error, since before the first acquire and during failover there is no holder.
+func (c *Client) GetLeaseHolder(ctx context.Context, ns, name string) (string, error) {
+	lease, err := c.typed.CoordinationV1().Leases(ns).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get lease %s/%s: %w", ns, name, err)
+	}
+	if lease.Spec.HolderIdentity == nil {
+		return "", nil
+	}
+	return *lease.Spec.HolderIdentity, nil
+}
+
+// WaitLeaseHolderChanges polls until the Lease holder is non-empty and differs from
+// oldHolder, returning the new holder. It is the failover signal: leadership moving
+// to a new pod. A still-empty holder keeps it polling.
+func (c *Client) WaitLeaseHolderChanges(ctx context.Context, ns, name, oldHolder string, timeout time.Duration) (string, error) {
+	c.log.Info("waiting for lease holder to change",
+		zap.String("namespace", ns), zap.String("name", name), zap.String("oldHolder", oldHolder))
+	var newHolder string
+	err := c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
+		holder, err := c.GetLeaseHolder(ctx, ns, name)
+		if err != nil {
+			return false, err
+		}
+		if holder != "" && holder != oldHolder {
+			newHolder = holder
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("wait lease %s/%s holder change from %q: %w", ns, name, oldHolder, err)
+	}
+	return newHolder, nil
+}
+
+// DeleteGateway deletes the named Gateway, triggering the operator's finalizer that
+// drains the XGatewayGCP. Not-found is success so teardown is idempotent. It does
+// not wait; pair it with WaitGatewayGone.
 func (c *Client) DeleteGateway(ctx context.Context, ns, name string) error {
 	err := c.dynamic.Resource(gatewayGVR).Namespace(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil && !apierrors.IsNotFound(err) {
@@ -547,11 +616,9 @@ func (c *Client) DumpGateway(ctx context.Context, ns, name string) (string, erro
 	return fmt.Sprintf("%#v", obj.Object), nil
 }
 
-// WaitXGatewayGCPGone polls until the named XGatewayGCP composite is absent, or
-// timeout elapses. The operator names the composite after the Gateway, so the
-// composite shares the Gateway's name. Teardown uses it as the in-cluster signal
-// that Crossplane drained the GCP resources the composite owned, before the
-// namespace is deleted.
+// WaitXGatewayGCPGone polls until the named XGatewayGCP composite (named after the
+// Gateway) is absent, or timeout elapses. Teardown uses it as the in-cluster signal
+// that Crossplane drained the composite's GCP resources before the namespace delete.
 func (c *Client) WaitXGatewayGCPGone(ctx context.Context, ns, name string, timeout time.Duration) error {
 	c.log.Info("waiting for xgatewaygcp deletion", zap.String("namespace", ns), zap.String("name", name))
 	return c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
@@ -566,12 +633,90 @@ func (c *Client) WaitXGatewayGCPGone(ctx context.Context, ns, name string, timeo
 	})
 }
 
+// ownedChild is one in-cluster object the Gateway owns by controller reference,
+// named for the failure message and probed via getErr.
+type ownedChild struct {
+	kind string
+	name string
+	// getErr fetches the object and returns the Get error; a NotFound means the
+	// child has been reaped.
+	getErr func(ctx context.Context, ns, name string) error
+}
+
+// AssertOwnedChildrenGone polls until every object the Gateway owns is NotFound,
+// failing if any remain. It must run after the Gateway CR is gone but before the
+// namespace delete (which would mask an unreaped child); expectPDB gates the link PDB.
+func (c *Client) AssertOwnedChildrenGone(ctx context.Context, t *testing.T, ns, gateway string, expectPDB bool, timeout time.Duration) {
+	t.Helper()
+
+	linkName := gateway + "-link"
+	bundleName := gateway + "-bundle"
+
+	children := []ownedChild{
+		{"Deployment", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"ConfigMap", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"NetworkPolicy", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.NetworkingV1().NetworkPolicies(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"ServiceAccount", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.CoreV1().ServiceAccounts(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"Role", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.RbacV1().Roles(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"RoleBinding", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.RbacV1().RoleBindings(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"Secret", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+		{"Secret", bundleName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+	}
+	if expectPDB {
+		children = append(children, ownedChild{"PodDisruptionBudget", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.PolicyV1().PodDisruptionBudgets(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}})
+	}
+
+	c.log.Info("asserting owner-ref GC reaped gateway children",
+		zap.String("namespace", ns), zap.String("gateway", gateway), zap.Bool("expectPDB", expectPDB))
+
+	var remaining []string
+	err := c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
+		remaining = remaining[:0]
+		for _, child := range children {
+			// A non-NotFound error is treated as still-present, not terminal, so a
+			// transient API blip during in-flight GC does not abort the wait.
+			if err := child.getErr(ctx, ns, child.name); !apierrors.IsNotFound(err) {
+				remaining = append(remaining, fmt.Sprintf("%s/%s", child.kind, child.name))
+			}
+		}
+		return len(remaining) == 0, nil
+	})
+	if err != nil {
+		t.Errorf("wait for owner-ref GC of gateway %s/%s children: %v; still present: %v",
+			ns, gateway, err, remaining)
+	}
+}
+
 // GetXGatewayGCPServiceAccountEmail reads status.serviceAccountEmail from the
-// named XGatewayGCP composite, the GCP service-account the operator scopes the
-// gateway's firewall rule to via targetServiceAccounts. The operator names the
-// composite after the Gateway, so name is the Gateway's name. An empty string
-// (with no error) means the composite has not yet observed the SA; the caller
-// should retry. A missing composite is returned as an error.
+// named XGatewayGCP composite (named after the Gateway). An empty string with a
+// nil error means the composite has not yet observed the SA; the caller retries.
 func (c *Client) GetXGatewayGCPServiceAccountEmail(ctx context.Context, ns, name string) (string, error) {
 	obj, err := c.dynamic.Resource(xgatewayGCPGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -590,16 +735,9 @@ func readyCondition(obj *unstructured.Unstructured) bool {
 	return hasCondition(obj, "Ready", "True", "")
 }
 
-// hasCondition reports whether obj carries a status condition matching condType
-// and status, and (when reason is non-empty) reason. An empty reason matches any
-// reason, so callers can assert just type+status.
-//
-// When the condition carries observedGeneration, it must be at least the
-// object's metadata.generation. Without this a poll right after a spec edit could
-// match the stale pre-edit condition (which the operator has not yet re-stamped)
-// and return prematurely. At steady state observedGeneration equals generation,
-// so create-time waits are unaffected. Conditions that omit observedGeneration
-// (CRD Established, Crossplane XRD, Deployment) are not gated.
+// hasCondition reports whether obj carries a status condition matching condType,
+// status, and (when non-empty) reason. A condition carrying observedGeneration must
+// have it at least obj's generation, so a poll after a spec edit ignores a stale one.
 func hasCondition(obj *unstructured.Unstructured, condType, status, reason string) bool {
 	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil || !found {
@@ -708,14 +846,8 @@ func (c *Client) WaitDeploymentAvailable(ctx context.Context, ns, name string, t
 }
 
 // WaitEndpointsReady polls the named Service's EndpointSlices until at least one
-// endpoint address is Ready, or the timeout elapses. EndpointSlices are matched
-// to their owning Service by the kubernetes.io/service-name label the endpoint
-// controller stamps; an endpoint counts as ready when Conditions.Ready is nil or
-// true, per the EndpointSlice contract. WaitDeploymentAvailable alone leaves an
-// endpoint-population lag (the echo Deployment carries no readinessProbe, so it
-// reports Available before its pod is registered as a ready endpoint), so a
-// caller that points a forward at a fresh backend gates on this to ensure the
-// backend is actually serving before the DNAT goes live.
+// address is Ready. The readinessProbe-less echo reports Available before it is a
+// ready endpoint, so a retarget gates on this before the DNAT goes live.
 func (c *Client) WaitEndpointsReady(ctx context.Context, namespace, serviceName string, timeout time.Duration) error {
 	c.log.Info("waiting for service endpoints ready",
 		zap.String("namespace", namespace), zap.String("service", serviceName))
@@ -743,8 +875,7 @@ func (c *Client) WaitEndpointsReady(ctx context.Context, namespace, serviceName 
 
 // WaitCRDEstablished polls the named CustomResourceDefinition until it reports an
 // Established condition of True, or the timeout elapses. helm --wait does not gate
-// on a CRD's Established condition, so the suite waits explicitly before applying
-// any custom resource of that kind.
+// on this, so the suite waits explicitly before applying a CR of that kind.
 func (c *Client) WaitCRDEstablished(ctx context.Context, name string, timeout time.Duration) error {
 	c.log.Info("waiting for crd established", zap.String("name", name))
 	return c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
@@ -760,10 +891,8 @@ func (c *Client) WaitCRDEstablished(ctx context.Context, name string, timeout ti
 }
 
 // WaitXRDPresent polls until the named Crossplane CompositeResourceDefinition
-// exists, or the timeout elapses. Presence is sufficient for the suite: the
-// operator hard-requires the XGatewayGCP CRD the XRD installs, and the Composition
-// is created in the same release, so the XRD existing confirms the composite path
-// is wired.
+// exists, or the timeout elapses. Presence is sufficient: the XRD and its
+// Composition ship in one release, so the XRD existing confirms the composite path.
 func (c *Client) WaitXRDPresent(ctx context.Context, name string, timeout time.Duration) error {
 	c.log.Info("waiting for xrd present", zap.String("name", name))
 	return c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
@@ -807,14 +936,9 @@ func (c *Client) PodLogsByLabel(ctx context.Context, ns, selector string, tailLi
 	return string(buf), nil
 }
 
-// ServiceEndpointSummary returns a per-Service summary of every Service in ns
-// joined to its EndpointSlices: the Service name, its ClusterIP, and the count
-// and list of Ready endpoint addresses backing it. EndpointSlices are matched to
-// their owning Service by the kubernetes.io/service-name label the endpoint
-// controller stamps. It serves the failure dump's "did the retargeted backend
-// have ready endpoints" question, so a retarget that converged in the operator
-// but raced an empty backend is visible. Addresses are deduplicated and sorted so
-// the output is stable across the multiple slices a single Service can own.
+// ServiceEndpointSummary returns a per-Service line for every Service in ns: name,
+// ClusterIP, and the Ready endpoint addresses backing it. Addresses are deduplicated
+// and sorted for a stable line across the slices one Service can own.
 func (c *Client) ServiceEndpointSummary(ctx context.Context, ns string) (string, error) {
 	services, err := c.typed.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -839,9 +963,8 @@ func (c *Client) ServiceEndpointSummary(ctx context.Context, ns string) (string,
 		}
 		for j := range slice.Endpoints {
 			ep := &slice.Endpoints[j]
-			// A nil Ready is treated as ready per the EndpointSlice contract; only
-			// an explicit false excludes the address, so a backend mid-rollout with
-			// an unready endpoint is counted as unready in the dump.
+			// A nil Ready is ready per the EndpointSlice contract; only an explicit
+			// false excludes the address.
 			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
 				continue
 			}
@@ -866,10 +989,8 @@ func (c *Client) ServiceEndpointSummary(ctx context.Context, ns string) (string,
 	return b.String(), nil
 }
 
-// PodStatusSummary returns one line per pod in ns matching selector: the pod
-// name, phase, whether its Ready condition is True, and the node it landed on. An
-// empty selector summarizes every pod in the namespace. It serves the failure
-// dump's backend-pod-health question without dumping raw pod YAML.
+// PodStatusSummary returns one line per pod in ns matching selector: name, phase,
+// Ready, and node. An empty selector summarizes every pod in the namespace.
 func (c *Client) PodStatusSummary(ctx context.Context, ns, selector string) (string, error) {
 	pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
 	if err != nil {
@@ -884,10 +1005,8 @@ func (c *Client) PodStatusSummary(ctx context.Context, ns, selector string) (str
 	return b.String(), nil
 }
 
-// ConfigMapData returns the value stored under key in the named ConfigMap in ns.
-// It serves the failure dump's "what did the link actually consume" question by
-// reading the link ConfigMap's rendered config.json. A missing key is returned as
-// an error so the dump records the key drift rather than logging an empty string.
+// ConfigMapData returns the value under key in the named ConfigMap in ns. A
+// missing key is an error so the dump records the drift rather than an empty string.
 func (c *Client) ConfigMapData(ctx context.Context, ns, name, key string) (string, error) {
 	cm, err := c.typed.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {

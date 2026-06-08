@@ -8,8 +8,10 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,16 +33,14 @@ import (
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
 
-// gatewayFinalizer blocks Gateway deletion until the operator has deleted the
-// XGatewayGCP and Crossplane has drained the cloud resources. The link, Secrets,
-// and DNSEndpoint are reaped by owner-ref GC, but the XGatewayGCP is deleted
-// explicitly here so the drain completes before the namespace and CRD go away.
+// gatewayFinalizer blocks Gateway deletion until the XGatewayGCP is deleted and
+// Crossplane has drained the cloud resources, so the drain completes before the
+// namespace and CRD go away. The other children are reaped by owner-ref GC.
 const gatewayFinalizer = "wgnet.dev/gateway-teardown"
 
-// fieldOwner is the server-side-apply field manager for every object the
-// reconciler applies. A stable manager name lets the API server track exactly
-// which fields the operator owns, so it never fights Crossplane's composite
-// controller or the built-in Deployment controller over server-defaulted fields.
+// fieldOwner is the server-side-apply field manager for every object the reconciler
+// applies. A stable name lets the API server track which fields the operator owns, so
+// it never fights Crossplane or the Deployment controller over defaulted fields.
 const fieldOwner = client.FieldOwner("gateway-operator")
 
 const (
@@ -55,12 +55,9 @@ const (
 	// requires an UpperCamelCase action describing what the controller was doing.
 	actionReconcile = "Reconcile"
 
-	// Forward-validation Ready=False reasons. Every one reflects mutable external
-	// state a backend change can clear without a Gateway spec edit: a Service
-	// appearing, disappearing, changing type, or publishing the target port; a
-	// target namespace being created; a consent label being added or removed. So
-	// all are transient (see anyTransientReason) and pair with the requeue floor,
-	// which bounds convergence even when the corresponding watch event is missed.
+	// Forward-validation Ready=False reasons. Each reflects mutable external state a
+	// backend change can clear without a spec edit, so all are transient (see
+	// anyTransientReason).
 	reasonCrossNamespaceForwardDenied = "CrossNamespaceForwardDenied"
 	reasonTargetNamespaceNotFound     = "TargetNamespaceNotFound"
 	reasonUnsupportedServiceType      = "UnsupportedServiceType"
@@ -68,20 +65,17 @@ const (
 	reasonTargetPortNotListening      = "TargetPortNotListening"
 )
 
-// crossNamespaceIngressLabel is the opt-in label a namespace must carry, set to
-// crossNamespaceIngressValue, before a Gateway in another namespace may forward
-// public traffic to a Service in it. It is the consent gate that closes the
-// cross-tenancy exposure hole: without it a Gateway owner could expose any
-// namespace's Service to the public internet.
+// crossNamespaceIngressLabel is the opt-in consent label a target namespace must carry
+// before a Gateway elsewhere may forward public traffic into it, so a Gateway owner
+// cannot expose an arbitrary namespace's Service to the internet.
 const (
 	crossNamespaceIngressLabel = "wgnet.dev/allow-gateway-ingress"
 	crossNamespaceIngressValue = "true"
 )
 
-// validationRequeueAfter is how long to wait before re-checking a forward whose
-// backend Service is not yet present. It is a fixed transient backoff, decoupled
-// from the steady-state RequeueInterval (which may be zero in tests) so a missing
-// Service never spins a hot requeue loop.
+// validationRequeueAfter is the fixed transient backoff before re-checking a forward
+// whose backend is not yet present, decoupled from the steady-state RequeueInterval
+// (which may be zero in tests) so a missing Service never spins a hot requeue loop.
 const validationRequeueAfter = 10 * time.Second
 
 // KeyGenerator produces a WireGuard keypair. It is injected so tests can supply
@@ -97,11 +91,9 @@ type GatewayReconciler struct {
 	Config   Config
 	Recorder events.EventRecorder
 
-	// APIReader reads directly from the API server, bypassing the manager cache.
-	// The shared-network refcount in releaseAfterSharedNetwork uses it to read the
-	// shared XGatewayNetwork composite, which carries no owner ref and is not
-	// watched, so the cache never tracks it. SetupWithManager binds it to the
-	// manager's APIReader.
+	// APIReader reads directly from the API server, bypassing the manager cache, for
+	// the unwatched, owner-ref-less objects the cache never tracks (the shared
+	// XGatewayNetwork, link Leases, and holder pods). SetupWithManager binds it.
 	APIReader client.Reader
 
 	// GenerateKey supplies WireGuard keypairs. Nil defaults to wg.GenerateKeypair.
@@ -117,28 +109,22 @@ type GatewayReconciler struct {
 // +kubebuilder:rbac:groups=infra.wgnet.dev,resources=xgatewaynetworks/status,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create;get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=create;get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=externaldns.k8s.io,resources=dnsendpoints,verbs=create;get;update
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
-// Reconcile drives a Gateway toward its desired state. On deletion it deletes the
-// XGatewayGCP and requeues until the composite is gone before releasing the
-// finalizer; otherwise it ensures the finalizer, classifies the forwards, and
-// ensures the key Secrets, the XGatewayGCP, and the link children rendered with
-// the valid forward subset, then mirrors the composite status and requeues.
-//
-// Forward classification gates provisioning per forward rather than all-or-
-// nothing. A Gateway with at least one valid forward provisions, exposing exactly
-// the valid subset. A Gateway whose forwards are all invalid does not provision
-// while unprovisioned; once provisioned it keeps its VM and re-applies the
-// children with an empty forward set, which closes the firewall to the WireGuard
-// underlay only and stops the link serving any forward, rather than tearing the VM
-// down on a transient backend outage. Invalid forwards always surface on the Ready
-// condition.
+// Reconcile drives a Gateway toward its desired state: it exposes exactly the valid
+// forward subset and never provisions while all forwards are invalid, but once
+// provisioned keeps its VM rather than tearing down on a transient backend outage.
 func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -169,10 +155,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.fail(ctx, &gw, "check xgatewaygcp existence", err)
 	}
 
-	// No valid forward and nothing provisioned yet: do not provision. Report the
-	// invalid forwards and requeue on the transient floor when any can clear on its
-	// own (a Service or its port appearing), so the Gateway converges without a spec
-	// edit once a backend catches up.
+	// No valid forward and never provisioned: hold off, but requeue on the transient
+	// floor when an invalid forward can clear on its own, so the Gateway converges
+	// without a spec edit once a backend catches up.
 	if len(valid) == 0 && !provisioned {
 		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", false, invalid); serr != nil {
 			return ctrl.Result{}, fmt.Errorf("mirror status: %w", serr)
@@ -208,12 +193,12 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.fail(ctx, &gw, "ensure dns endpoint", err)
 	}
 
-	linkAvailable, err := r.linkAvailable(ctx, &gw)
+	linkActive, err := r.linkActive(ctx, &gw)
 	if err != nil {
-		return r.fail(ctx, &gw, "read link availability", err)
+		return r.fail(ctx, &gw, "read link activity", err)
 	}
 
-	ready := address != "" && linkAvailable && len(invalid) == 0
+	ready := address != "" && linkActive && len(invalid) == 0
 	if err := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ready, invalid); err != nil {
 		return ctrl.Result{}, fmt.Errorf("mirror status: %w", err)
 	}
@@ -227,7 +212,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	logger.V(1).Info("reconciled gateway",
-		"address", address, "linkAvailable", linkAvailable, "ready", ready,
+		"address", address, "linkActive", linkActive, "ready", ready,
 		"valid", len(valid), "invalid", len(invalid))
 	return result, nil
 }
@@ -239,30 +224,9 @@ type invalidForward struct {
 	message string
 }
 
-// classifyForwards partitions a Gateway's forwards into those resolving to a
-// real, DNAT-able backend the Gateway is permitted to expose (valid) and those
-// failing a check (invalid), preserving spec order in both. Unlike an
-// all-or-nothing gate it evaluates every forward, so a Gateway with a mix
-// provisions its valid forwards while reporting the invalid ones.
-//
-// Per forward the first failing check, in order, classifies it: the
-// cross-namespace consent gate, then Service existence, then Service type, then
-// whether the Service publishes the forward's target port. The cross-namespace
-// gate is the security boundary: forwarding into another namespace requires that
-// namespace to carry the opt-in consent label, so a Gateway owner cannot expose an
-// unconsenting tenant's Service to the public internet. The Service-type check
-// rejects backends with no stable ClusterIP to DNAT to (ExternalName, headless),
-// which would otherwise produce an invalid or SSRF-prone rule. The target-port
-// check rejects a forward whose backend Service does not actually publish the port
-// the link would DNAT to, which would otherwise install a black-hole rule.
-//
-// A non-NotFound API error reading a namespace or Service is returned as err: it
-// is an infrastructure failure, not a user error, so it fails the whole reconcile
-// and the manager retries with backoff rather than misclassifying the forward.
-//
-// All reads go through the uncached APIReader. Validation is infrequent, so the
-// direct API reads are negligible, and a single read path keeps same- and
-// cross-namespace targets uniform.
+// classifyForwards partitions a Gateway's forwards into the valid subset it may DNAT
+// to and the invalid ones, preserving spec order. A non-NotFound API error fails the
+// whole reconcile rather than misclassifying; reads use the uncached APIReader.
 func (r *GatewayReconciler) classifyForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway) (valid []wgnetv1alpha1.Forward, invalid []invalidForward, err error) {
 	for _, f := range gw.Spec.Forwards {
 		ns := effectiveForwardNamespace(f, gw)
@@ -316,10 +280,8 @@ func (r *GatewayReconciler) classifyForwards(ctx context.Context, gw *wgnetv1alp
 }
 
 // serviceListensOn reports whether svc publishes a service port matching port and
-// proto. A Service port with an empty protocol defaults to TCP per the Kubernetes
-// API, so an empty value is treated as TCP for the comparison. The check is
-// against the Service's published port (spec.ports[].port), the value
-// effectiveTargetPort yields, not the pods' containerPort (spec.ports[].targetPort).
+// proto, comparing against the published spec.ports[].port (not the pods'
+// containerPort). An empty Service-port protocol defaults to TCP per the API.
 func serviceListensOn(svc *corev1.Service, port int32, proto corev1.Protocol) bool {
 	for _, p := range svc.Spec.Ports {
 		svcProto := p.Protocol
@@ -333,19 +295,9 @@ func serviceListensOn(svc *corev1.Service, port int32, proto corev1.Protocol) bo
 	return false
 }
 
-// anyTransientReason reports whether any invalid forward carries a reason a
-// backend change can clear without a Gateway spec edit. It is the transient-floor
-// backstop: a Gateway with such an invalid forward is requeued on the fixed floor
-// so it re-converges even if the watch event that would normally re-trigger
-// classification is missed (a coalesced update, a dropped informer event, a label
-// edit on a namespace the cache was not yet tracking).
-//
-// Every forward-validation reason qualifies because each reflects mutable external
-// state: a Service appearing, disappearing, changing type, or publishing the
-// target port; a target namespace being created; a consent label toggling. The
-// reasons are enumerated rather than collapsed to len(invalid) > 0 so a future
-// reason that is genuinely permanent (a spec-only error) is excluded by default
-// until deliberately added here.
+// anyTransientReason reports whether any invalid forward carries a reason a backend
+// change can clear without a spec edit, the signal to requeue on the fixed floor.
+// Reasons are enumerated so a permanent (spec-only) reason is excluded by default.
 func anyTransientReason(invalid []invalidForward) bool {
 	for _, inv := range invalid {
 		switch inv.reason {
@@ -357,10 +309,9 @@ func anyTransientReason(invalid []invalidForward) bool {
 	return false
 }
 
-// namespaceAllowsIngress reports whether the named namespace carries the
-// cross-namespace ingress consent label. A NotFound error is returned to the
-// caller so it can distinguish a missing namespace from a present one lacking the
-// label.
+// namespaceAllowsIngress reports whether the named namespace carries the consent
+// label. A NotFound error is returned so the caller can distinguish a missing
+// namespace from a present one lacking the label.
 func (r *GatewayReconciler) namespaceAllowsIngress(ctx context.Context, name string) (bool, error) {
 	var ns corev1.Namespace
 	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: name}, &ns); err != nil {
@@ -369,11 +320,9 @@ func (r *GatewayReconciler) namespaceAllowsIngress(ctx context.Context, name str
 	return ns.Labels[crossNamespaceIngressLabel] == crossNamespaceIngressValue, nil
 }
 
-// serviceHasClusterIP reports whether svc exposes a routable ClusterIP the link
-// can DNAT to. ExternalName Services have no ClusterIP (DNAT to an external CNAME
-// is invalid and SSRF-prone), and headless Services (clusterIP None or empty) have
-// no stable VIP (a DNAT would pin to a single pod). ClusterIP and NodePort both
-// carry a real ClusterIP and are accepted.
+// serviceHasClusterIP reports whether svc exposes a routable ClusterIP to DNAT to.
+// ExternalName (SSRF-prone CNAME) and headless (no stable VIP) Services are rejected;
+// ClusterIP and NodePort both carry a real ClusterIP and are accepted.
 func serviceHasClusterIP(svc *corev1.Service) bool {
 	if svc.Spec.Type == corev1.ServiceTypeExternalName {
 		return false
@@ -385,18 +334,8 @@ func serviceHasClusterIP(svc *corev1.Service) bool {
 }
 
 // reconcileDelete deletes the XGatewayGCP and waits for it to disappear before
-// releasing the finalizer, so Crossplane finishes draining GCP while the
-// namespace is still alive. Owner-ref GC reaps the remaining children. While the
-// drain is in flight it marks the Gateway Ready=False/Terminating so a stuck GCP
-// teardown is visible in kubectl, and requeues on the fixed transient floor rather
-// than RequeueInterval (zero in tests) so it never hot-loops.
-//
-// Once the per-gateway composite is gone it refcounts the shared XGatewayNetwork:
-// if this is the last Gateway, it deletes the shared network and holds the
-// finalizer until the network is confirmed NotFound. Removing the last finalizer
-// only after that confirmation is the anti-orphan guarantee. Concurrent
-// last-deletes are safe because Delete is NotFound-tolerant, and a Gateway created
-// while the last delete is in flight re-ensures the network on its own reconcile.
+// releasing the finalizer, so Crossplane drains GCP while the namespace is still
+// alive, then hands off to releaseAfterSharedNetwork for the shared-VPC refcount.
 func (r *GatewayReconciler) reconcileDelete(ctx context.Context, gw *wgnetv1alpha1.Gateway) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(gw, gatewayFinalizer) {
 		return ctrl.Result{}, nil
@@ -432,20 +371,9 @@ func (r *GatewayReconciler) reconcileDelete(ctx context.Context, gw *wgnetv1alph
 	return ctrl.Result{RequeueAfter: validationRequeueAfter}, nil
 }
 
-// releaseAfterSharedNetwork runs once a deleting Gateway's per-gateway composite
-// is gone. The shared VPC is one per cluster, so the refcount counts Gateways
-// cluster-wide: it removes the finalizer immediately when any other Gateway
-// remains anywhere in the cluster, and only when this is the last Gateway does it
-// tear the shared XGatewayNetwork down and hold the finalizer until the network is
-// confirmed NotFound, so the last Gateway never disappears while a shared VPC it
-// provisioned is still draining.
-//
-// The network read goes through the uncached APIReader because the shared network
-// carries no owner ref and is not watched, so the cache never tracks it and a
-// cached read could miss its deletion timestamp. The Gateway count uses the same
-// reader so the cluster-wide refcount is read consistently with the network. The
-// deleting Gateway carries a non-zero DeletionTimestamp, so the zero-timestamp
-// filter excludes it from the count without special-casing its name.
+// releaseAfterSharedNetwork refcounts the one-per-cluster shared VPC, releasing the
+// finalizer at once while any Gateway remains and only on the last delete tearing the
+// XGatewayNetwork down and holding until it is NotFound. Reads use the uncached APIReader.
 func (r *GatewayReconciler) releaseAfterSharedNetwork(ctx context.Context, gw *wgnetv1alpha1.Gateway) (ctrl.Result, error) {
 	var gateways wgnetv1alpha1.GatewayList
 	if err := r.APIReader.List(ctx, &gateways); err != nil {
@@ -503,9 +431,8 @@ func (r *GatewayReconciler) releaseFinalizer(ctx context.Context, gw *wgnetv1alp
 }
 
 // ensureSecrets generates the WireGuard key material once and persists it as the
-// owner-ref'd bundle and link Secrets. Existing Secrets are left untouched: the
-// keys are never rotated, and the owner-ref ensures GC reaps them on delete since
-// the operator's secrets RBAC withholds the delete verb.
+// owner-ref'd bundle and link Secrets. Existing Secrets are left untouched (keys are
+// never rotated); owner-ref GC reaps them since the secrets RBAC withholds delete.
 func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
 	bundleExists, err := r.objectExists(ctx, gw.Namespace, bundleSecretName(gw), &corev1.Secret{})
 	if err != nil {
@@ -541,14 +468,9 @@ func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1
 	return nil
 }
 
-// ensureXGatewayGCP server-side-applies the composite. Apply touches only the
-// operator-owned fields (spec, labels, owner ref), so Crossplane's status and
-// any field it defaults are left intact and the two controllers stop fighting.
-// ForceOwnership lets the apply manager take sole ownership of those spec fields
-// without erroring on a pre-existing field manager.
-//
-// forwards is the validated subset whose ports the composite opens on the GCP
-// firewall.
+// ensureXGatewayGCP server-side-applies the composite, touching only operator-owned
+// fields so Crossplane's status and defaulted fields stay intact. forwards is the
+// validated subset whose ports the composite opens on the GCP firewall.
 func (r *GatewayReconciler) ensureXGatewayGCP(ctx context.Context, gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.Forward) error {
 	desired, err := buildXGatewayGCP(gw, r.Config, forwards)
 	if err != nil {
@@ -567,13 +489,9 @@ func (r *GatewayReconciler) ensureXGatewayGCP(ctx context.Context, gw *wgnetv1al
 	return nil
 }
 
-// ensureXGatewayNetwork server-side-applies the singleton shared-VPC composite so
-// the network exists before any per-gateway firewall or instance references it by
-// name. It is idempotent: re-applying the unchanged object is a no-op. The
-// composite carries no controller/owner reference because it is shared across
-// every Gateway and refcount-managed by reconcileDelete, not garbage-collected
-// with any single Gateway. Every provisioning reconcile calls it, so a network
-// torn down by a racing last-delete is re-created on the next reconcile.
+// ensureXGatewayNetwork server-side-applies the singleton shared-VPC composite so the
+// network exists before any firewall or instance references it. It is unowned
+// (refcount-managed) and re-created here if a racing last-delete tore it down.
 func (r *GatewayReconciler) ensureXGatewayNetwork(ctx context.Context) error {
 	desired := buildXGatewayNetwork(r.Config)
 	data, err := json.Marshal(desired)
@@ -586,20 +504,20 @@ func (r *GatewayReconciler) ensureXGatewayNetwork(ctx context.Context) error {
 	return nil
 }
 
-// ensureLink server-side-applies the link ConfigMap, NetworkPolicy, and
-// Deployment, all owner-ref'd to the Gateway. These resources have a stable,
-// fully operator-specified shape, so applying the built object is idempotent and
-// never fights the built-in Deployment controller over server-defaulted fields.
-//
-// address is the gateway IP observed from the XGatewayGCP status; it is rendered as
-// the WireGuard peer endpoint into the ConfigMap so the link reloads in place
-// when it first appears or changes. An empty address leaves the endpoint unset
-// and the link waits.
-//
-// forwards is the validated subset rendered into the link ConfigMap (the runtime
-// forwards the link serves) and the NetworkPolicy (the backend egress rules). The
-// link Deployment is forward-independent, so it carries no forward argument.
+// ensureLink server-side-applies the link's ServiceAccount, Role, RoleBinding,
+// ConfigMap, NetworkPolicy, and Deployment, all owner-ref'd. The PDB is applied only
+// at replicas>1 and deleted below that so a stale PDB cannot block drains.
 func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, forwards []wgnetv1alpha1.Forward) error {
+	if err := r.apply(ctx, gw, buildLinkServiceAccount(gw)); err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, buildLinkRole(gw)); err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, buildLinkRoleBinding(gw)); err != nil {
+		return err
+	}
+
 	cm, err := buildLinkConfigMap(gw, address, forwards)
 	if err != nil {
 		return err
@@ -610,7 +528,30 @@ func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Ga
 	if err := r.apply(ctx, gw, buildLinkNetworkPolicy(gw, forwards)); err != nil {
 		return err
 	}
-	return r.apply(ctx, gw, buildLinkDeployment(gw, r.Config))
+	if err := r.apply(ctx, gw, buildLinkDeployment(gw, r.Config)); err != nil {
+		return err
+	}
+
+	if effectiveLinkReplicas(gw) > 1 {
+		return r.apply(ctx, gw, buildLinkPodDisruptionBudget(gw))
+	}
+	return r.deleteLinkPodDisruptionBudget(ctx, gw)
+}
+
+// deleteLinkPodDisruptionBudget removes the link PDB if present, tolerating a
+// NotFound. It runs at a single replica so scaling a Gateway from many replicas
+// down to one does not leave the prior PDB behind to block node drains.
+func (r *GatewayReconciler) deleteLinkPodDisruptionBudget(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      linkComponentName(gw),
+			Namespace: gw.Namespace,
+		},
+	}
+	if err := r.Delete(ctx, pdb); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete link poddisruptionbudget: %w", err)
+	}
+	return nil
 }
 
 // ensureDNSEndpoint server-side-applies the DNSEndpoint when hostnames are set
@@ -634,13 +575,9 @@ func (r *GatewayReconciler) ensureDNSEndpoint(ctx context.Context, gw *wgnetv1al
 	return nil
 }
 
-// xgatewayGCPExists reports whether the Gateway's composite is already present,
-// which is the signal that the Gateway has provisioned at least once. The gate
-// uses it to decide whether an all-invalid forward set should hold provisioning
-// (never provisioned) or re-apply the children with an empty forward set (already
-// provisioned, keep the VM). A NotFound is reported as false; any other error is
-// surfaced so the reconcile fails rather than misreading a transient API error as
-// not-provisioned and tearing nothing down.
+// xgatewayGCPExists reports whether the composite is present, the signal that the
+// Gateway provisioned at least once and so keeps its VM under an all-invalid forward
+// set. A NotFound is false; any other error is surfaced rather than read as absent.
 func (r *GatewayReconciler) xgatewayGCPExists(ctx context.Context, gw *wgnetv1alpha1.Gateway) (bool, error) {
 	xg := newXGatewayGCP()
 	err := r.Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}, xg)
@@ -675,22 +612,32 @@ func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnet
 	return address, saEmail, nil
 }
 
-// linkAvailable reports whether the link Deployment this Gateway owns has reached
-// its DeploymentAvailable condition. The link's readiness probe only passes once
-// a fresh WireGuard handshake exists, so an Available link means the tunnel is up
-// and the data path is usable. A missing or not-yet-Available Deployment yields
-// false with no error: it means the link has not converged yet.
-func (r *GatewayReconciler) linkAvailable(ctx context.Context, gw *wgnetv1alpha1.Gateway) (bool, error) {
-	var dep appsv1.Deployment
-	key := client.ObjectKey{Namespace: gw.Namespace, Name: linkComponentName(gw)}
-	if err := r.Get(ctx, key, &dep); err != nil {
+// linkActive reports whether the link tunnel is up, gating on the lease-holder pod's
+// readiness rather than the Deployment's Available condition because idle standbys also
+// report Ready. A NotFound or empty holder is "not active yet", not an error.
+func (r *GatewayReconciler) linkActive(ctx context.Context, gw *wgnetv1alpha1.Gateway) (bool, error) {
+	var lease coordinationv1.Lease
+	leaseKey := client.ObjectKey{Namespace: gw.Namespace, Name: linkComponentName(gw)}
+	if err := r.APIReader.Get(ctx, leaseKey, &lease); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
-		return false, fmt.Errorf("get link deployment %s: %w", key, err)
+		return false, fmt.Errorf("get link lease %s: %w", leaseKey, err)
 	}
-	for _, cond := range dep.Status.Conditions {
-		if cond.Type == appsv1.DeploymentAvailable {
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return false, nil
+	}
+
+	var holder corev1.Pod
+	holderKey := client.ObjectKey{Namespace: gw.Namespace, Name: *lease.Spec.HolderIdentity}
+	if err := r.APIReader.Get(ctx, holderKey, &holder); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get link lease holder pod %s: %w", holderKey, err)
+	}
+	for _, cond := range holder.Status.Conditions {
+		if cond.Type == corev1.PodReady {
 			return cond.Status == corev1.ConditionTrue, nil
 		}
 	}
@@ -698,15 +645,8 @@ func (r *GatewayReconciler) linkAvailable(ctx context.Context, gw *wgnetv1alpha1
 }
 
 // mirrorStatusWithForwards copies the composite's observed fields onto the Gateway
-// status and sets the Ready condition. When any forward is invalid the condition
-// is Ready=False with the first invalid forward's reason (spec order is preserved,
-// so a single-forward Gateway reports exactly that forward's reason) and a message
-// enumerating every invalid forward, so the condition reflects the user-actionable
-// failure rather than the generic provisioning state. Otherwise it sets Ready from
-// ready, which the caller computes from the composite address and the link
-// Deployment's availability. It skips the status write when nothing changed, so a
-// status-only requeue does not self-trigger the For(&Gateway{}) watch into a write
-// loop.
+// status and sets the Ready condition, any invalid forward taking priority. It skips
+// the write when nothing changed so a status-only requeue cannot self-trigger a loop.
 func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway, address, saEmail string, ready bool, invalid []invalidForward) error {
 	cond := metav1.Condition{Type: conditionReady}
 	switch {
@@ -717,29 +657,24 @@ func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wg
 	case ready:
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = reasonReady
-		cond.Message = "gateway address provisioned and link tunnel up"
+		cond.Message = "gateway address provisioned and active link tunnel up"
 	default:
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = reasonProvisioning
-		cond.Message = "waiting for gateway address and link tunnel"
+		cond.Message = "waiting for gateway address and active link tunnel"
 	}
 
-	// Earlier SSA applies in the reconcile (the XGatewayGCP owner-ref/labels
-	// round-trip) bump the in-memory Gateway's resourceVersion against the API
-	// server's, so a direct Status().Update here would lose the optimistic-
-	// concurrency race and log a spurious conflict every reconcile. Re-Get a fresh
-	// Gateway inside RetryOnConflict and apply the computed status to that copy so
-	// the write carries an up-to-date resourceVersion. The computed values are
-	// identical regardless of which copy they land on.
+	// Earlier SSA applies stale the in-memory resourceVersion, so a direct
+	// Status().Update would lose the optimistic-concurrency race. Re-Get a fresh copy
+	// inside RetryOnConflict so the write carries an up-to-date resourceVersion.
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh wgnetv1alpha1.Gateway
 		if err := r.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
 			return fmt.Errorf("get gateway for status update: %w", err)
 		}
 
-		// Stamp observedGeneration from the freshly-Got object: the passed-in gw may
-		// be stale relative to a spec edit that landed mid-reconcile, and the
-		// condition must report the generation the status actually reflects.
+		// Stamp observedGeneration from the fresh object: the passed-in gw may be stale
+		// relative to a spec edit that landed mid-reconcile.
 		cond.ObservedGeneration = fresh.Generation
 
 		prevAddress := fresh.Status.Address
@@ -759,10 +694,9 @@ func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wg
 	})
 }
 
-// invalidForwardsMessage renders a concise one-line enumeration of the invalid
-// forwards for the Ready condition message, joining each forward's per-check
-// message so an operator sees which forwards are rejected and why straight from
-// kubectl, without reading the controller logs.
+// invalidForwardsMessage joins the per-forward messages into a one-line Ready
+// condition message so an operator sees which forwards are rejected and why from
+// kubectl alone, without reading the controller logs.
 func invalidForwardsMessage(invalid []invalidForward) string {
 	parts := make([]string, 0, len(invalid))
 	for _, inv := range invalid {
@@ -772,11 +706,8 @@ func invalidForwardsMessage(invalid []invalidForward) string {
 }
 
 // fail records the error on the Gateway's Ready condition and surfaces it so the
-// manager requeues with backoff. The status write is conflict-safe for the same
-// reason as mirrorStatusWithForwards: fail runs after SSA applies that bump the
-// in-memory Gateway's resourceVersion, so a direct Status().Update on the passed-in
-// copy would lose the optimistic-concurrency race. It re-Gets a fresh copy inside
-// RetryOnConflict and stamps observedGeneration from it.
+// manager requeues with backoff. The status write re-Gets a fresh copy inside
+// RetryOnConflict for the same reason as mirrorStatusWithForwards.
 func (r *GatewayReconciler) fail(ctx context.Context, gw *wgnetv1alpha1.Gateway, op string, cause error) (ctrl.Result, error) {
 	wrapped := fmt.Errorf("%s: %w", op, cause)
 	if r.Recorder != nil {
@@ -829,10 +760,8 @@ func (r *GatewayReconciler) createOwned(ctx context.Context, gw *wgnetv1alpha1.G
 }
 
 // apply server-side-applies desired with the operator field manager, stamping the
-// Gateway owner reference first. Typed builders omit TypeMeta, so the GVK is
-// populated from the scheme: SSA needs apiVersion+kind on the wire to target the
-// right resource. ForceOwnership lets the apply manager take sole ownership of the
-// fields it sets without erroring on a pre-existing field manager.
+// owner reference first. The GVK is populated from the scheme because typed builders
+// omit TypeMeta and SSA needs apiVersion+kind on the wire.
 func (r *GatewayReconciler) apply(ctx context.Context, gw *wgnetv1alpha1.Gateway, desired client.Object) error {
 	gvks, _, err := r.Scheme.ObjectKinds(desired)
 	if err != nil {
@@ -852,32 +781,9 @@ func (r *GatewayReconciler) apply(ctx context.Context, gw *wgnetv1alpha1.Gateway
 	return nil
 }
 
-// SetupWithManager registers the reconciler, watching the Gateway and owning the
-// children GC reaps by owner-ref plus the unstructured XGatewayGCP. The DNSEndpoint
-// is intentionally not owned: an Owns watch would make manager start require the
-// external-dns CRD.
-//
-// The XGatewayGCP and link Deployment watches deliberately omit
-// GenerationChangedPredicate so their status-only updates trigger a reconcile:
-// readiness gates on the XGatewayGCP's status.address and the Deployment's
-// DeploymentAvailable condition, and the predicate would filter exactly those
-// status writes, leaving readiness to flip only on the RequeueAfter fallback.
-// This does not reintroduce a write loop: child applies are server-side and
-// idempotent (re-applying an unchanged object is a no-op that bumps no
-// resourceVersion) and mirrorStatusWithForwards writes only on change. The
-// remaining child watches keep the predicate because nothing reads their status.
-//
-// The Service and Namespace watches drive forward classification: a forward's
-// backend Service appearing, disappearing, or changing its published ports, and a
-// target namespace's consent label being added or removed, all change which
-// forwards are valid. Mapping each such event back to the affected Gateways makes
-// the operator converge promptly. These are external objects the operator does not
-// own, so they are watched with explicit map functions rather than Owns. The
-// operator watches all namespaces, so these watches observe a forward's backend
-// Service or target namespace wherever it lives. Convergence does not depend on the
-// watch alone: a Gateway with an invalid forward is also requeued on the fixed
-// transient floor (anyTransientReason), so it reconverges even if a watch event is
-// coalesced or missed.
+// SetupWithManager registers the reconciler. The XGatewayGCP watch omits
+// GenerationChangedPredicate so its status-only address writes trigger a reconcile;
+// Service and Namespace watches drive forward classification.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.APIReader = mgr.GetAPIReader()
 
@@ -898,13 +804,9 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// gatewaysForService maps a changed Service to the Gateways that forward to it, so
-// a backend Service appearing, disappearing, or changing its published ports
-// re-runs classification for exactly those Gateways. It matches a forward by its
-// effective (namespace, name): a same-namespace forward resolves to the Gateway's
-// namespace, a cross-namespace forward to its explicit namespace. The list is the
-// cluster-wide cached read, so a Service in any namespace maps to its Gateways
-// wherever they live.
+// gatewaysForService maps a changed Service to the Gateways that forward to it,
+// matching by effective (namespace, name) so same- and cross-namespace forwards both
+// resolve. The list is cluster-wide.
 func (r *GatewayReconciler) gatewaysForService(ctx context.Context, obj client.Object) []reconcile.Request {
 	var gateways wgnetv1alpha1.GatewayList
 	if err := r.List(ctx, &gateways); err != nil {
@@ -925,12 +827,9 @@ func (r *GatewayReconciler) gatewaysForService(ctx context.Context, obj client.O
 	return requests
 }
 
-// gatewaysForNamespace maps a changed Namespace to the Gateways that have a
-// cross-namespace forward into it, so adding or removing the consent label re-runs
-// classification for exactly those Gateways. Only cross-namespace forwards are
-// considered: a forward whose effective namespace is the Gateway's own namespace is
-// governed by no consent label, so the Gateway's own namespace changing is
-// irrelevant to classification.
+// gatewaysForNamespace maps a changed Namespace to the Gateways with a cross-namespace
+// forward into it, so a consent-label edit re-classifies them. A forward into the
+// Gateway's own namespace is governed by no consent label and is skipped.
 func (r *GatewayReconciler) gatewaysForNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
 	var gateways wgnetv1alpha1.GatewayList
 	if err := r.List(ctx, &gateways); err != nil {

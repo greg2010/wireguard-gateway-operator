@@ -1,19 +1,7 @@
 {{/*
-wireguard-gateway-operator.ignition renders the gateway VM's Ignition v3.4.0
-config as a JSON string.
-
-The config is assembled directly as nested dict/list values and serialised with
-toJson, which keeps the chart self-contained (no Butane toolchain). Each file in
-files/ is run through tpl, then embedded as a base64 data URL.
-
-The rendered output is fully value-free and byte-identical across every Gateway:
-no per-Gateway value is baked in. The keyfetch unit reads every per-Gateway value
-(WireGuard listen port, gateway/link addresses, tunnel subnet, project ID, secret
-ID) from the instance metadata server at boot and renders the wg0 netdev, the wg0
-.network address, and the nftables ruleset from it. The netdev and .network are
-therefore not shipped as static files, and gateway.nft ships as a value-free
-template the keyfetch unit fills before gateway-nftables.service loads it. The
-operator stamps this one static userData ConfigMap onto every XGatewayGCP.
+Renders the gateway VM's Ignition v3.4.0 config as a JSON string (toJson, no Butane).
+The output is byte-identical across Gateways: the keyfetch unit reads per-Gateway values
+from instance metadata at boot, and gateway.nft ships as a template the unit fills.
 */}}
 {{- define "wireguard-gateway-operator.ignition" -}}
 {{- $keyfetchUnit := `[Unit]

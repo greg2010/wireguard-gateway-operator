@@ -99,10 +99,9 @@ func TestBuildApplyCommandsNoMTU(t *testing.T) {
 	assertCommandPlan(t, cmds, want)
 }
 
-// TestBuildReloadCommands pins the non-disruptive reload contract: the reload
-// plan reconciles the running interface with wg syncconf and atomically swaps the
-// ruleset with nft -f, and crucially issues no ip link del or ip link add, so an
-// established tunnel and its handshake survive a config change.
+// TestBuildReloadCommands pins the non-disruptive reload contract: the plan uses
+// wg syncconf and nft -f and issues no ip link del or add, so an established
+// tunnel survives a config change.
 func TestBuildReloadCommands(t *testing.T) {
 	const (
 		wgConfPath = "/tmp/gateway-wg.conf"
@@ -124,10 +123,9 @@ func TestBuildReloadCommands(t *testing.T) {
 	}
 }
 
-// TestFirstIPv4 pins the IPv4-selection rule the resolver depends on: the first
-// IPv4 in the slice wins regardless of position, and a slice with no IPv4 reports
-// not-ok so the resolver surfaces an error rather than handing an IPv6 address to
-// the IPv4-only nftables DNAT.
+// TestFirstIPv4 pins the resolver's IPv4-selection rule: the first IPv4 wins
+// regardless of position, and a slice with no IPv4 reports not-ok rather than
+// handing an IPv6 address to the IPv4-only DNAT.
 func TestFirstIPv4(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -192,9 +190,9 @@ func assertCommandPlan(t *testing.T, got, want []command) {
 	}
 }
 
-// runRecorder is an injectable runner. It records every command in order and
-// fails the call whose name matches failOn, so a test can drive a mid-plan
-// failure without shelling out.
+// runRecorder is an injectable runner that records every command and fails the
+// call whose name matches failOn, to drive a mid-plan failure without shelling
+// out.
 type runRecorder struct {
 	mu     sync.Mutex
 	cmds   []command
@@ -217,11 +215,9 @@ func (r *runRecorder) snapshot() []command {
 	return append([]command(nil), r.cmds...)
 }
 
-// TestApplyTearsDownInterfaceOnMidPlanFailure pins the self-heal contract: when
-// a plan step after wg0 is created fails, Apply issues an ip link del wg0 so the
-// next reload rebuilds the interface rather than reconciling against a
-// half-configured one. The leading idempotency delete (before any add) does not
-// count; the teardown delete must follow the successful add.
+// TestApplyTearsDownInterfaceOnMidPlanFailure pins the self-heal contract: a step
+// failing after wg0 is created makes Apply issue a teardown ip link del wg0 (following
+// the add, not the leading idempotency delete) so the next reload rebuilds.
 func TestApplyTearsDownInterfaceOnMidPlanFailure(t *testing.T) {
 	rec := &runRecorder{failOn: "wg"}
 
@@ -265,9 +261,8 @@ func indexOfCommand(cmds []command, name string, args ...string) int {
 	return -1
 }
 
-// lookupCall records one invocation of the injected lookup function, capturing
-// the address family and host the resolver passes so a test can assert the query
-// is A-only and absolute.
+// lookupCall records the address family and host of one injected lookup call, so
+// a test can assert the query is A-only and absolute.
 type lookupCall struct {
 	network string
 	host    string
@@ -279,10 +274,9 @@ type lookupResult struct {
 	err   error
 }
 
-// scriptedLookup returns a lookup stub that records every call and, on the i-th
-// call (0-based), returns results[i]. Indices past the script reuse the last
-// entry so a fully-failing script keeps failing. The recorder pointer lets the
-// test inspect the calls afterwards.
+// scriptedLookup returns a lookup stub that records every call into rec and
+// returns results[i] on the i-th call, reusing the last entry past the script so
+// a fully-failing script keeps failing.
 func scriptedLookup(rec *[]lookupCall, results []lookupResult) func(context.Context, string, string) ([]net.IP, error) {
 	return func(_ context.Context, network, host string) ([]net.IP, error) {
 		*rec = append(*rec, lookupCall{network: network, host: host})
@@ -295,9 +289,8 @@ func scriptedLookup(rec *[]lookupCall, results []lookupResult) func(context.Cont
 }
 
 // TestDefaultResolve pins the resolver contract that keeps a retarget from
-// blackholing the DNAT: queries are A-only and absolute so they skip the ndots
-// search-list walk, a transient failure or empty result is retried, exhausting
-// the retries fails loud, and ctx cancellation aborts the retry wait promptly.
+// blackholing the DNAT: queries are A-only and absolute, a transient failure or
+// empty result is retried, and exhausting the retries fails loud.
 func TestDefaultResolve(t *testing.T) {
 	ok := lookupResult{addrs: []net.IP{net.ParseIP("10.96.1.10")}}
 	ipv6Only := lookupResult{addrs: []net.IP{net.ParseIP("fd00::1")}}
@@ -398,11 +391,9 @@ func TestDefaultResolve(t *testing.T) {
 	}
 }
 
-// TestDefaultResolveContextCancellationAborts pins that a cancelled context
-// breaks the retry wait promptly instead of sleeping out resolveRetryDelay. The
-// first lookup fails to push the resolver into the inter-attempt wait, the
-// context is already cancelled, so the call must return well inside one retry
-// delay with the context error.
+// TestDefaultResolveContextCancellationAborts pins that a cancelled context breaks the
+// retry wait promptly: one lookup fails to enter the wait, then the call returns the
+// context error well inside one retry delay.
 func TestDefaultResolveContextCancellationAborts(t *testing.T) {
 	var calls int
 	resolve := newResolver(func(_ context.Context, _, _ string) ([]net.IP, error) {

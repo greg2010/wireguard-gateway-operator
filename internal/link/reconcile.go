@@ -13,38 +13,16 @@ import (
 )
 
 // defaultReconcileInterval backs the safety-net ticker when the configured
-// interval is non-positive, so it can never panic time.NewTicker or busy-loop.
-// The fsnotify watch is the primary trigger; the ticker only backstops a missed
-// event.
+// interval is non-positive, so time.NewTicker can never panic.
 const defaultReconcileInterval = 10 * time.Second
 
-// applyFunc programs the tunnel and nftables from rc, given the WireGuard
-// private and peer public keys. It is injected so the reload loop can be tested
-// without shelling out; production binds it to a closure that picks Apply or
-// Reconcile from wg0Exists.
+// applyFunc programs the tunnel and nftables from rc. It is injected so the
+// reload loop can be tested without shelling out.
 type applyFunc func(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string) error
 
-// watchAndReload applies the link's RuntimeConfig and keeps it in sync with the
-// on-disk ConfigMap in place: it re-applies whenever the file changes and the
-// peer endpoint is set, without ever tearing the tunnel down.
-//
-// It loads and applies the initial config synchronously before entering the
-// watch loop (tolerating an empty Peer.Endpoint: the operator may not have
-// observed the gateway address yet, in which case it logs and waits rather than
-// applying a peerless tunnel). That initial apply is what picks up the endpoint
-// once it is present. It then watches the directory holding the config so the
-// ConfigMap's atomic ..data symlink swap is observed: a Kubernetes ConfigMap
-// update replaces that symlink rather than rewriting the mounted file, so a file
-// watch would miss it; any directory event triggers a re-read. A
-// cfg.ReconcileInterval ticker backs the watch purely as a safety-net for a
-// missed event.
-//
-// On each wake it reloads the config and compares its canonical digest against
-// the last successfully-applied one; an unchanged config is a no-op, and a
-// changed config is applied only when the endpoint is set. last-applied is
-// advanced only on a successful apply, so a transient apply failure is retried on
-// the next wake. reconcile is injected for testing. It returns nil when ctx is
-// cancelled.
+// watchAndReload applies the RuntimeConfig and re-applies it on change, returning nil
+// on ctx cancellation. It watches the config's parent dir because a ConfigMap update
+// swaps the atomic ..data symlink a plain file watch would miss.
 func watchAndReload(ctx context.Context, cfg Config, privKey, peerPubKey string, reconcile applyFunc, log *zap.SugaredLogger) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -118,11 +96,9 @@ func watchAndReload(ctx context.Context, cfg Config, privKey, peerPubKey string,
 	}
 }
 
-// configDigest is the sha256 hex of rc's canonical JSON, used to detect a config
-// change across reloads. json.Marshal of RuntimeConfig is deterministic: struct
-// fields serialize in declaration order and the only slices (AllowedIPs,
-// Forwards) carry caller-defined order, so an unchanged config always hashes the
-// same.
+// configDigest is the sha256 hex of rc's JSON, used to detect a config change across
+// reloads. json.Marshal of RuntimeConfig is deterministic, so an unchanged config
+// always hashes the same.
 func configDigest(rc RuntimeConfig) (string, error) {
 	data, err := json.Marshal(rc)
 	if err != nil {

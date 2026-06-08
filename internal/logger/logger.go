@@ -9,10 +9,9 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// Config controls logger construction. LogLevel is a zap level name
-// (debug, info, warn, error); an unparseable value falls back to debug.
-// ProdLogFormat selects zap's production JSON encoder when true and the
-// development console encoder when false.
+// Config controls logger construction. LogLevel is a zap level name; an unparseable
+// value falls back to debug. ProdLogFormat selects the production JSON encoder over
+// the development console encoder.
 type Config struct {
 	LogLevel      string `default:"debug" split_words:"false"`
 	ProdLogFormat bool   `default:"false" split_words:"false"`

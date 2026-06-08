@@ -13,8 +13,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// testLogger returns a no-op sugared logger; the reload loop's logging is
-// incidental to its behaviour, so tests do not assert on log output.
+// testLogger returns a no-op sugared logger for tests that do not assert on logs.
 func testLogger(t *testing.T) *zap.SugaredLogger {
 	t.Helper()
 	return zap.NewNop().Sugar()
@@ -28,9 +27,8 @@ func observedLogger(t testing.TB) (*zap.SugaredLogger, *observer.ObservedLogs) {
 	return zap.New(core).Sugar(), logs
 }
 
-// applyRecorder is an injectable applyFunc that records the peer endpoint of each
-// apply and signals each call on a channel so tests can wait deterministically
-// rather than sleeping. It never shells out.
+// applyRecorder is an injectable applyFunc that records each apply's peer
+// endpoint and signals every call on a channel so tests wait without sleeping.
 type applyRecorder struct {
 	mu        sync.Mutex
 	endpoints []string
@@ -78,8 +76,8 @@ func assertNoApply(t *testing.T, r *applyRecorder, d time.Duration) {
 }
 
 // configJSON renders a RuntimeConfig JSON body with the given endpoint and a
-// single forward, the on-disk shape watchAndReload reads. An empty endpoint
-// models the operator not having observed the gateway address yet.
+// single forward. An empty endpoint models the operator not yet having observed
+// the gateway address.
 func configJSON(endpoint, service string) string {
 	ep := ""
 	if endpoint != "" {
@@ -99,10 +97,9 @@ func writeConfig(t *testing.T, path, body string) {
 	}
 }
 
-// startWatchAndReload writes an initial config file, starts watchAndReload in a
-// goroutine against the file's directory, and returns the config path, a cancel
-// func, and a done channel carrying the loop's return value so tests can assert
-// it does not exit early and observe its final error.
+// startWatchAndReload writes an initial config and runs watchAndReload in a
+// goroutine, returning the config path, a cancel func, and a done channel
+// carrying the loop's return value.
 func startWatchAndReload(t *testing.T, body string, r *applyRecorder) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -261,9 +258,8 @@ func TestConfigDigestStableAndSensitive(t *testing.T) {
 	}
 }
 
-// eventually polls cond until it is true or the deadline passes, failing the
-// test on timeout with msg. It keeps the fsnotify assertions deterministic
-// without sleeping on a fixed duration.
+// eventually polls cond until true or the deadline passes, failing with msg on
+// timeout.
 func eventually(t testing.TB, cond func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -276,19 +272,9 @@ func eventually(t testing.TB, cond func() bool, msg string) {
 	t.Fatalf("condition not met within deadline: %s", msg)
 }
 
-// TestWatchAndReloadReAddsWatchOnDirRemoval covers the watch-lost branch: when
-// the watched config directory is removed, the loop logs the loss, re-adds the
-// watch, and keeps functioning so a recreated config still drives an apply.
-//
-// inotify auto-drops the watch on IN_DELETE_SELF and the loop re-adds the
-// directory the instant it processes that event, when the directory may not yet
-// exist again; the re-add is therefore best-effort. The safety-net ticker is the
-// guaranteed recovery path in that case, so the interval is kept short enough to
-// backstop the recovery apply rather than at its production default. The
-// watch-lost warning is still attributed to the fsnotify path: the initial apply
-// is synchronous (it precedes the ticker loop) and directory removal delivers
-// IN_DELETE_SELF well inside one tick, so the warning is observed before any tick
-// could fire.
+// TestWatchAndReloadReAddsWatchOnDirRemoval covers the watch-lost branch: removing the
+// watched config dir makes the loop re-add the watch and keep functioning, with the
+// safety-net ticker as the guaranteed recovery path.
 func TestWatchAndReloadReAddsWatchOnDirRemoval(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "configdir")
 	if err := os.Mkdir(dir, 0o700); err != nil {
@@ -335,9 +321,8 @@ func TestWatchAndReloadReAddsWatchOnDirRemoval(t *testing.T) {
 }
 
 // waitRecoveryApply drains apply notifications until it sees want or the deadline
-// passes. After a directory-removal recovery a stale-config apply may precede the
-// recreated config's apply, so a single waitApply could observe the wrong
-// endpoint; this skips intermediate endpoints and waits for the expected one.
+// passes. After a dir-removal recovery a stale-config apply may precede the
+// recreated one, so it skips intermediate endpoints rather than failing on them.
 func waitRecoveryApply(t testing.TB, r *applyRecorder, want string) string {
 	t.Helper()
 	deadline := time.After(4 * time.Second)

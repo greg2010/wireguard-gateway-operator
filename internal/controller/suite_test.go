@@ -34,11 +34,9 @@ func gatewayCRDPath() string {
 	return filepath.Join("..", "..", "k8s", "charts", "wireguard-gateway-operator", "templates", "crds")
 }
 
-// setupEnvtest starts a control plane with the Gateway CRD plus minimal XGatewayGCP
-// and DNSEndpoint CRDs (the operator's unstructured children), and returns a
-// client on the operator scheme. It skips when KUBEBUILDER_ASSETS is unset, so a
-// machine without envtest assets falls through to the fake-client test instead of
-// failing.
+// setupEnvtest starts a control plane with the Gateway CRD plus minimal XGatewayGCP and
+// DNSEndpoint CRDs and returns a client on the operator scheme. It skips when
+// KUBEBUILDER_ASSETS is unset.
 func setupEnvtest(t *testing.T) *testEnv {
 	t.Helper()
 
@@ -117,10 +115,9 @@ func minimalXGatewayGCPCRD() *apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
-// minimalXGatewayNetworkCRD is a namespaced CRD matching the shared-network
-// composite's GVK with an open schema and a status subresource, enough for the
-// reconciler to apply the singleton network and for the refcount teardown to read
-// and delete it.
+// minimalXGatewayNetworkCRD is a namespaced CRD matching the shared-network composite's
+// GVK with an open schema and a status subresource, enough for the reconciler to apply
+// the singleton network and for the refcount teardown to read and delete it.
 func minimalXGatewayNetworkCRD() *apiextensionsv1.CustomResourceDefinition {
 	return &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "xgatewaynetworks.infra.wgnet.dev"},

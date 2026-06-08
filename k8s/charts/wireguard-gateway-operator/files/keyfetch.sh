@@ -1,23 +1,10 @@
 #!/usr/bin/env sh
-# Renders every per-Gateway boot artifact from the instance metadata server, then
-# fetches the WireGuard key bundle from GCP Secret Manager and brings wg0 up. All
-# per-Gateway values (the WireGuard listen port, the MTU, the gateway and link
-# addresses, the tunnel subnet, the project ID, and the secret ID) are read from
-# instance metadata, not baked into this script: the operator sets them on the
-# XGatewayGCP spec, the composition writes them into the Instance metadata, and
-# this script resolves them at boot. The rendered Ignition is therefore
-# byte-identical across every Gateway.
-#
-# It writes the wg0 netdev (with the fetched listen port and peer), the wg0
-# .network address, and the nftables ruleset (substituting the listen port and
-# link address into the shipped template), then loops until the secret version
-# exists and decodes cleanly, so the instance may boot before the operator has
-# populated the secret. Runs after network-online.target, since the metadata
-# server and Secret Manager are reachable only over the primary NIC.
+# Per-Gateway values are read from instance metadata, not baked in. The secret fetch
+# loops because the instance may boot before the operator has populated the secret.
 set -eu
 
-# Restrict new files to the owner: the OAuth token and the secret bundle land in
-# /tmp before they are removed, and must not be world-readable in the interim.
+# The OAuth token and secret bundle land in /tmp before removal and must not be
+# world-readable in the interim.
 umask 077
 
 NETDEV_PATH=/etc/systemd/network/10-wg0.netdev
@@ -30,26 +17,23 @@ METADATA_ATTR_BASE="$METADATA_BASE/attributes"
 modprobe wireguard 2>&1 || echo "gateway-keyfetch: modprobe wireguard returned nonzero (may be builtin)"
 
 extract_json_string() {
-	# Pulls the value of a flat JSON string field ("<field>":"<value>") from
-	# stdin. Sufficient for the metadata token and Secret Manager access
-	# responses, which are flat objects with no nested quotes in these fields.
+	# Sufficient for the flat metadata token and Secret Manager responses, which
+	# carry no nested quotes in these fields.
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
 fetch_metadata_attr() {
-	# Loops until the named instance metadata attribute returns HTTP 200, so the
-	# boot tolerates the operator populating the Instance metadata after the VM
-	# starts. The metadata server returns a non-empty error body on 404, so the
-	# status code, not body emptiness, decides whether a value is present: gating
-	# on the body alone would accept a 404 error page as a real attribute value.
+	# Loops because the operator may populate the metadata after the VM starts.
+	# Presence is decided by the status code, not the body: the server returns a
+	# non-empty error body on 404 that body-only gating would accept as a value.
 	attr="$1"
 	body_file="/tmp/gateway-attr.json"
 	attempt=0
 	while true; do
 		attempt=$((attempt + 1))
 		http="$(curl -s --connect-timeout 5 --max-time 10 -o "$body_file" -w '%{http_code}' -H "Metadata-Flavor: Google" "$METADATA_ATTR_BASE/$attr" || echo 000)"
-		# Diagnostics go to stderr so the caller's "$(fetch_metadata_attr ...)"
-		# captures only the value printf emits, not these log lines.
+		# Diagnostics go to stderr so the caller's command substitution captures
+		# only the value printf emits.
 		echo "gateway-keyfetch: attr=$attr attempt=$attempt http=$http" >&2
 		if [ "$http" = "200" ]; then
 			value="$(cat "$body_file")"
@@ -85,9 +69,9 @@ EOF
 }
 
 write_network() {
-	# The wg0 address reuses the tunnel subnet's prefix length so the gateway and
-	# link share one routed CIDR. A subnet without a '/' would make "${var##*/}"
-	# yield the whole string and emit a malformed Address= line, so reject it.
+	# The wg0 address reuses the tunnel subnet's prefix length. A subnet without a
+	# '/' would make "${var##*/}" yield the whole string and emit a malformed
+	# Address= line, so reject it.
 	case "$wg_subnet" in
 		*/*) ;;
 		*)
@@ -108,10 +92,8 @@ EOF
 }
 
 render_nft() {
-	# Substitute the per-Gateway listen port and link address into the shipped
-	# value-free ruleset in place; gateway-nftables.service runs after this unit
-	# and loads the rendered file. The delimiter is '|' so a value containing '/'
-	# (a CIDR) does not terminate the s command and brick boot under set -eu.
+	# The sed delimiter is '|' so a value containing '/' (a CIDR) does not
+	# terminate the s command and brick boot under set -eu.
 	sed -e "s|__WG_LISTEN_PORT__|$wg_listen_port|g" \
 		-e "s|__WG_LINK_ADDRESS__|$wg_link_address|g" \
 		"$NFT_PATH" > "$NFT_PATH.tmp"

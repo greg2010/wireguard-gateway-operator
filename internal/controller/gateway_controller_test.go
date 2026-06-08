@@ -11,8 +11,10 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -30,10 +32,8 @@ import (
 )
 
 // reconcileConfig is the operator config the controller tests reconcile with.
-// PodNamespace is "default" because every envtest control plane provisions that
-// namespace, so the singleton shared network applies cleanly in every test that
-// runs a real reconcile, including the manager-backed transition tests that create
-// only per-subtest gateway namespaces.
+// PodNamespace is "default" because every envtest control plane provisions it, so the
+// singleton shared network applies cleanly in every test.
 func reconcileConfig() Config {
 	return Config{
 		LinkImage:           "registry.example.com/gateway-link:test",
@@ -82,11 +82,8 @@ func sampleGateway(name, namespace string) *wgnetv1alpha1.Gateway {
 }
 
 // reconcileFixture starts envtest, creates the wg-system namespace and a sample
-// Gateway, and returns a reconciler wired to the real API server. The reconciler
-// applies its children with server-side apply, which the controller-runtime fake
-// client cannot model (its structured-merge-diff converter rejects typed objects
-// carrying a status subresource), so the reconcile tests run against a real
-// control plane and skip when envtest assets are unavailable.
+// Gateway, and returns a reconciler wired to the real API server. SSA, which the fake
+// client cannot model, is why these tests need a real control plane.
 func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReconciler, *wgnetv1alpha1.Gateway, client.ObjectKey, *int) {
 	t.Helper()
 	te := setupEnvtest(t)
@@ -96,10 +93,9 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 		t.Fatalf("create namespace: %v", err)
 	}
 
-	// sampleGateway's forwards target these Services; forward classification now
-	// requires each backend Service to exist with a real ClusterIP that publishes
-	// the forward's target port and protocol before the reconciler provisions
-	// children, so the lifecycle path must create them with matching ports.
+	// sampleGateway's forwards target these Services; classification requires each
+	// backend to exist with a ClusterIP publishing the forward's port before
+	// provisioning, so the lifecycle path must create them with matching ports.
 	for _, svc := range []*corev1.Service{
 		portedClusterIPService("wg-system", "web", 443, corev1.ProtocolTCP),
 		portedClusterIPService("wg-system", "vpn", 1194, corev1.ProtocolUDP),
@@ -126,9 +122,8 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 }
 
 // TestReconcileLifecycle exercises the full Gateway lifecycle subtest by subtest
-// against a real API server. The reconciler applies its children with server-side
-// apply, which only a real control plane models, so this test skips when envtest
-// assets are unavailable.
+// against a real API server, required because the reconciler applies its children with
+// server-side apply.
 func TestReconcileLifecycle(t *testing.T) {
 	ctx := context.Background()
 	te, r, gw, key, calls := reconcileFixture(ctx, t)
@@ -190,21 +185,24 @@ func TestReconcileLifecycle(t *testing.T) {
 		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &np)
 		assertOwnedByGateway(t, &np, gw)
 
-		// The link no longer runs under a dedicated ServiceAccount/Role/RoleBinding;
-		// the operator must not create them.
-		for _, probe := range []client.Object{
-			&corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{},
-		} {
-			err := cl.Get(ctx, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, probe)
-			if !apierrors.IsNotFound(err) {
-				t.Errorf("link %T get = %v, want NotFound (no link RBAC)", probe, err)
-			}
-		}
+		// The link runs leader election, so the operator creates its dedicated
+		// ServiceAccount, Role, and RoleBinding, each owner-ref'd to the Gateway.
+		var sa corev1.ServiceAccount
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &sa)
+		assertOwnedByGateway(t, &sa, gw)
+
+		var role rbacv1.Role
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &role)
+		assertOwnedByGateway(t, &role, gw)
+
+		var rb rbacv1.RoleBinding
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &rb)
+		assertOwnedByGateway(t, &rb, gw)
 	})
 
 	t.Run("status mirrored and endpoint rendered after composite reports address", func(t *testing.T) {
 		setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.9", "sa@example.iam.gserviceaccount.com")
-		setLinkDeploymentAvailable(ctx, t, cl, key)
+		setLinkLeaseActive(ctx, t, cl, key, "edge-link-0", true)
 		drainReconcile(ctx, t, r, key)
 
 		var got wgnetv1alpha1.Gateway
@@ -269,10 +267,54 @@ func TestReconcileLifecycle(t *testing.T) {
 	})
 }
 
+// TestReconcileLinkPodDisruptionBudget asserts the PDB tracks the link replica count:
+// absent at one replica, present at replicas>1, and removed again when scaling back to
+// one so a stale PDB cannot strand a node drain.
+func TestReconcileLinkPodDisruptionBudget(t *testing.T) {
+	ctx := context.Background()
+	te, r, gw, key, _ := reconcileFixture(ctx, t)
+	cl := te.client
+	pdbKey := client.ObjectKey{Namespace: key.Namespace, Name: linkComponentName(gw)}
+
+	// Default single replica: the link provisions but carries no PDB.
+	drainReconcile(ctx, t, r, key)
+	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pdb get at one replica = %v, want NotFound", err)
+	}
+
+	// Scaling to >1 must create the PDB, owner-ref'd for GC.
+	setLinkReplicas(ctx, t, cl, key, 3)
+	drainReconcile(ctx, t, r, key)
+	var pdb policyv1.PodDisruptionBudget
+	mustGet(ctx, t, cl, pdbKey, &pdb)
+	assertOwnedByGateway(t, &pdb, gw)
+	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
+		t.Errorf("pdb minAvailable = %+v, want 1", pdb.Spec.MinAvailable)
+	}
+
+	// Scaling back to one must delete the PDB so it cannot block a drain.
+	setLinkReplicas(ctx, t, cl, key, 1)
+	drainReconcile(ctx, t, r, key)
+	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Errorf("pdb get after scaling 3->1 = %v, want NotFound (deleted)", err)
+	}
+}
+
+// setLinkReplicas sets spec.link.replicas on the live Gateway at key via a
+// read-modify-write, so the reconciler reads the updated count.
+func setLinkReplicas(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, replicas int32) {
+	t.Helper()
+	var gw wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &gw)
+	gw.Spec.Link.Replicas = replicas
+	if err := cl.Update(ctx, &gw); err != nil {
+		t.Fatalf("set link replicas to %d: %v", replicas, err)
+	}
+}
+
 // TestReconcileIdempotent asserts that once a Gateway has converged, a further
-// reconcile of the unchanged Gateway neither errors nor rewrites the Gateway
-// (its resourceVersion is stable). This guards the SSA + idempotent-status fix
-// against the prior hot-write loop, in both the provisioning and ready states.
+// reconcile neither errors nor rewrites it (resourceVersion stays stable), guarding
+// against a status-write loop in both the provisioning and ready states.
 func TestReconcileIdempotent(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -298,7 +340,7 @@ func TestReconcileIdempotent(t *testing.T) {
 			drainReconcile(ctx, t, r, key)
 			if tc.address != "" {
 				setXGatewayGCPStatus(ctx, t, cl, key, tc.address, tc.saEmail)
-				setLinkDeploymentAvailable(ctx, t, cl, key)
+				setLinkLeaseActive(ctx, t, cl, key, key.Name+"-link-0", true)
 				drainReconcile(ctx, t, r, key)
 			}
 
@@ -340,12 +382,9 @@ func sharedNetworkKey(r *GatewayReconciler) client.ObjectKey {
 	return client.ObjectKey{Name: r.Config.SharedNetworkName, Namespace: r.Config.PodNamespace}
 }
 
-// reconcileUntilGone drives Reconcile until the Gateway at key is purged from the
-// API server, the same way the lifecycle delete subtest does. The refcount
-// teardown spans several reconciles (delete the per-gateway composite, observe it
-// gone, then for the last Gateway delete the shared network and wait for it to
-// vanish), so a fixed iteration count would be brittle; polling Reconcile until
-// the finalizer is released is deterministic against that multi-pass drain.
+// reconcileUntilGone drives Reconcile until the Gateway at key is purged. The refcount
+// teardown spans several reconciles, so polling until the finalizer releases is
+// deterministic where a fixed iteration count would be brittle.
 func reconcileUntilGone(ctx context.Context, t *testing.T, r *GatewayReconciler, cl client.Client, key client.ObjectKey) {
 	t.Helper()
 	eventually(ctx, t, "gateway "+key.String()+" purged after delete", func() bool {
@@ -356,13 +395,9 @@ func reconcileUntilGone(ctx context.Context, t *testing.T, r *GatewayReconciler,
 	})
 }
 
-// TestReconcileSharedNetworkRefcount asserts the shared network's lifecycle is
-// refcounted across Gateways: it survives a non-last Gateway's teardown and is
-// removed only when the last Gateway is deleted. Two Gateways share one network,
-// so deleting the first must leave the network in place while deleting the second
-// (the last) must tear it down. It runs against a real API server because the
-// reconciler applies the network with server-side apply, which only a real control
-// plane models, so it skips when envtest assets are unavailable.
+// TestReconcileSharedNetworkRefcount asserts the shared network is refcounted across
+// Gateways: with two sharing one network, deleting the first leaves it in place while
+// deleting the second (the last) tears it down.
 func TestReconcileSharedNetworkRefcount(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -419,21 +454,18 @@ func mustDeleteGateway(ctx context.Context, t *testing.T, cl client.Client, key 
 	}
 }
 
-// newGatewayCELFixture builds a Gateway carrying the given forwards and an
-// explicit spec.wireguard.listenPort, for the admission-time CEL validation test.
-// A zero wgPort is left unset so the CRD default applies, exercising the rules
-// against the defaulted port.
+// newGatewayCELFixture builds a Gateway with the given forwards and an explicit
+// spec.wireguard.listenPort for the CEL validation test. A zero wgPort is left unset so
+// the CRD default applies.
 func newGatewayCELFixture(name, namespace string, wgPort int32, forwards []wgnetv1alpha1.Forward) *wgnetv1alpha1.Gateway {
 	gw := newGateway(name, namespace, forwards, nil)
 	gw.Spec.Wireguard.ListenPort = wgPort
 	return gw
 }
 
-// newGatewayNoWireguard builds a Gateway as an unstructured object with the
-// spec.wireguard key entirely absent, so the CRD's spec.wireguard default and the
-// CEL rules run against a fully defaulted block. A typed fixture cannot express
-// this: encoding/json's omitempty does not drop a non-pointer struct, so a typed
-// Gateway always marshals spec.wireguard as a present (if empty) object.
+// newGatewayNoWireguard builds a Gateway as unstructured with spec.wireguard entirely
+// absent, so the CRD default and CEL rules run against a fully defaulted block. A typed
+// fixture cannot express this: omitempty does not drop a non-pointer struct.
 func newGatewayNoWireguard(name, namespace string, forwards []wgnetv1alpha1.Forward) *unstructured.Unstructured {
 	rawForwards := make([]any, 0, len(forwards))
 	for _, f := range forwards {
@@ -464,11 +496,7 @@ func newGatewayNoWireguard(name, namespace string, forwards []wgnetv1alpha1.Forw
 
 // TestGatewayCELValidation exercises the spec-level CEL rules at admission: the
 // per-(port,protocol) uniqueness rule and the rule barring a UDP forward on the
-// WireGuard listen port. Each case creates its own namespace and Gateway; the
-// rules fire at admission, so no Services or reconcile are needed. Accepted
-// Gateways must create cleanly; rejected ones must fail with an Invalid error
-// carrying the CEL message. The on-disk generated CRD must already carry the
-// rules for this to pass, which is what makes the manifests regen the green step.
+// WireGuard listen port. Accepted Gateways create cleanly; rejected ones fail Invalid.
 func TestGatewayCELValidation(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -577,11 +605,9 @@ func TestGatewayCELValidation(t *testing.T) {
 	}
 }
 
-// TestGatewayWireguardDefaulting verifies spec.wireguard is optional: a Gateway
-// that omits the block entirely must be admitted (no `Required value`) and read
-// back with every sub-field carrying its CRD default. This is the admission-time
-// guard against the regression where spec.wireguard was a required object and a
-// Gateway relying on the defaults was rejected.
+// TestGatewayWireguardDefaulting verifies spec.wireguard is optional: a Gateway that
+// omits the block is admitted and read back with every sub-field carrying its CRD
+// default.
 func TestGatewayWireguardDefaulting(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -612,10 +638,9 @@ func TestGatewayWireguardDefaulting(t *testing.T) {
 	}
 }
 
-// portedClusterIPService builds a ClusterIP Service in ns publishing port/proto;
-// the envtest API server assigns spec.clusterIP on create, so classification sees
-// a routable VIP. The published port must match a forward's effective target port
-// for the target-port-listens check to pass.
+// portedClusterIPService builds a ClusterIP Service in ns publishing port/proto; the
+// envtest API server assigns spec.clusterIP on create, so classification sees a
+// routable VIP.
 func portedClusterIPService(ns, name string, port int32, proto corev1.Protocol) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -664,19 +689,9 @@ func headlessService(ns, name string) *corev1.Service {
 	}
 }
 
-// TestClassifyForwards exercises the single-forward classification path end to end
-// against a real API server: the cross-namespace consent gate, the Service-type
-// checks, and the target-port-listens check that decide whether a forward is
-// valid. With one forward, a valid forward provisions and an invalid one (the only
-// forward, so zero valid) provisions nothing, so the outcomes mirror the prior
-// all-or-nothing gate. Each row uses its own gateway and target namespaces so the
-// cases stay isolated under one envtest control plane.
-//
-// Accepted forwards must let provisioning proceed (the bundle Secret appears and
-// the Ready reason is the provisioning state, not a denial). Denied forwards must
-// leave Ready=False with the specific reason and provision nothing. Transient
-// reasons (a not-yet-created Service, a not-yet-published target port) requeue
-// after validationRequeueAfter rather than failing permanently.
+// TestClassifyForwards exercises the single-forward classification path: an accepted
+// forward provisions, a denied one leaves Ready=False with the specific reason and
+// provisions nothing, and transient reasons requeue rather than fail.
 func TestClassifyForwards(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -855,9 +870,8 @@ func isValidationDenialReason(reason string) bool {
 }
 
 // reconcileToClassification reconciles past the finalizer-add pass (which requeues
-// before classification runs) and returns the result of the pass that actually
-// classifies the forwards. The first reconcile adds the finalizer and requeues;
-// the second classifies, so its result carries any classification requeue.
+// before classification runs) and returns the result of the second pass, which
+// classifies the forwards.
 func reconcileToClassification(ctx context.Context, t *testing.T, r *GatewayReconciler, key client.ObjectKey) ctrl.Result {
 	t.Helper()
 	req := ctrl.Request{NamespacedName: key}
@@ -910,26 +924,74 @@ func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, k
 	}
 }
 
-// setLinkDeploymentAvailable patches the link Deployment owned by the Gateway at
-// gwKey with a DeploymentAvailable=True condition, simulating the built-in
-// Deployment controller marking the link healthy once its readiness probe passes.
-// Readiness gating requires this, since envtest runs no kubelet to make the
-// Deployment Available on its own. The Deployment name is derived from the real
-// builder so it cannot drift from what the reconciler creates.
-func setLinkDeploymentAvailable(ctx context.Context, t *testing.T, cl client.Client, gwKey client.ObjectKey) {
+// setLinkLeaseActive makes linkActive observe podName as the active link tunnel for the
+// Gateway at gwKey: it points the lease holder at podName and sets that pod's PodReady
+// condition, which envtest's missing scheduler and kubelet leave unset.
+func setLinkLeaseActive(ctx context.Context, t *testing.T, cl client.Client, gwKey client.ObjectKey, podName string, ready bool) {
 	t.Helper()
-	name := linkComponentName(&wgnetv1alpha1.Gateway{
+	leaseName := linkComponentName(&wgnetv1alpha1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: gwKey.Name, Namespace: gwKey.Namespace},
 	})
-	var dep appsv1.Deployment
-	mustGet(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: name}, &dep)
-	dep.Status.Conditions = []appsv1.DeploymentCondition{{
-		Type:   appsv1.DeploymentAvailable,
-		Status: corev1.ConditionTrue,
-		Reason: "MinimumReplicasAvailable",
-	}}
-	if err := cl.Status().Update(ctx, &dep); err != nil {
-		t.Fatalf("update link deployment status: %v", err)
+
+	upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: leaseName}, podName)
+	upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: podName}, ready)
+}
+
+// upsertLeaseHolder ensures a coordination Lease at key exists with its
+// HolderIdentity set to holder, creating it on first call and patching the holder
+// thereafter.
+func upsertLeaseHolder(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, holder string) {
+	t.Helper()
+	var lease coordinationv1.Lease
+	err := cl.Get(ctx, key, &lease)
+	switch {
+	case apierrors.IsNotFound(err):
+		lease = coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+			Spec:       coordinationv1.LeaseSpec{HolderIdentity: &holder},
+		}
+		if err := cl.Create(ctx, &lease); err != nil {
+			t.Fatalf("create link lease %s: %v", key, err)
+		}
+	case err != nil:
+		t.Fatalf("get link lease %s: %v", key, err)
+	default:
+		lease.Spec.HolderIdentity = &holder
+		if err := cl.Update(ctx, &lease); err != nil {
+			t.Fatalf("update link lease %s holder: %v", key, err)
+		}
+	}
+}
+
+// upsertPodReady ensures a minimal pod at key exists with its PodReady condition set to
+// ready, writing the status subresource directly since envtest has no kubelet. It is
+// idempotent across readiness flips.
+func upsertPodReady(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, ready bool) {
+	t.Helper()
+	status := corev1.ConditionFalse
+	if ready {
+		status = corev1.ConditionTrue
+	}
+
+	var pod corev1.Pod
+	if err := cl.Get(ctx, key, &pod); err != nil {
+		if !apierrors.IsNotFound(err) {
+			t.Fatalf("get link holder pod %s: %v", key, err)
+		}
+		pod = corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Name},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "link", Image: "registry.example.com/gateway-link:test"}},
+			},
+		}
+		if err := cl.Create(ctx, &pod); err != nil {
+			t.Fatalf("create link holder pod %s: %v", key, err)
+		}
+	}
+
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}
+	if err := cl.Status().Update(ctx, &pod); err != nil {
+		t.Fatalf("update link holder pod %s status: %v", key, err)
 	}
 }
 
@@ -980,10 +1042,9 @@ func (f *fakeEventRecorder) Eventf(regarding runtime.Object, _ runtime.Object, e
 	})
 }
 
-// TestReconcilerFailEmitsEvent covers the reconcile-failure path: fail must emit a
-// Warning event describing the failure when a recorder is wired, and must not
-// panic when the recorder is nil. The status write fail performs needs a real API
-// server, so the test runs against envtest.
+// TestReconcilerFailEmitsEvent covers the reconcile-failure path: fail emits a Warning
+// event describing the failure when a recorder is wired, and does not panic when the
+// recorder is nil.
 func TestReconcilerFailEmitsEvent(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -1056,11 +1117,9 @@ func TestReconcilerFailEmitsEvent(t *testing.T) {
 	}
 }
 
-// linkConfigForwards reads the link ConfigMap the reconciler rendered for the
-// Gateway at key and returns its runtime forwards, failing the test if the
-// ConfigMap or its config key is absent. It is the assertion surface for "which
-// forwards did the operator actually expose", since the link config carries
-// exactly the valid subset.
+// linkConfigForwards reads the link ConfigMap the reconciler rendered for the Gateway
+// at key and returns its runtime forwards, the assertion surface for which forwards the
+// operator exposed.
 func linkConfigForwards(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) []link.Forward {
 	t.Helper()
 	var cm corev1.ConfigMap
@@ -1087,11 +1146,9 @@ func forwardServiceNames(forwards []link.Forward) []string {
 	return names
 }
 
-// TestMixedForwards covers the per-forward classification contract that
-// distinguishes the new gate from the prior all-or-nothing one: a Gateway with one
-// valid and one invalid forward provisions, exposes only the valid forward in the
-// link config, and reports Ready=False carrying the invalid forward's reason. The
-// invalid forward here is a missing backend Service (ServiceNotFound).
+// TestMixedForwards covers the per-forward classification contract: a Gateway with one
+// valid and one invalid forward provisions, exposes only the valid forward, and reports
+// Ready=False with the invalid forward's reason (a missing backend, ServiceNotFound).
 func TestMixedForwards(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -1141,14 +1198,109 @@ func TestMixedForwards(t *testing.T) {
 	}
 }
 
+// TestLinkActiveReadyGate covers the active-tunnel gate: a provisioned Gateway with a
+// valid forward and a known address is Ready only when the link lease holder is a Ready
+// pod, so a Ready idle standby must not mask a holder that is not Ready.
+func TestLinkActiveReadyGate(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	tests := []struct {
+		name string
+		// arrange sets up the lease/holder-pod state for the Gateway in ns after it has
+		// provisioned and been given an address. holderName is the deterministic name
+		// the row may use for the lease holder pod.
+		arrange   func(t *testing.T, ns, holderName string)
+		wantReady metav1.ConditionStatus
+	}{
+		{
+			name: "holder pod ready, tunnel up",
+			arrange: func(t *testing.T, ns, holderName string) {
+				setLinkLeaseActive(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw"}, holderName, true)
+			},
+			wantReady: metav1.ConditionTrue,
+		},
+		{
+			name: "holder pod not ready masks a ready standby",
+			arrange: func(t *testing.T, ns, holderName string) {
+				// A standby pod is Ready, but it is not the lease holder. The holder is
+				// the one whose readiness gates the tunnel, and it is not Ready, so the
+				// Gateway must be Ready=False despite the Ready standby.
+				upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link-standby"}, true)
+				setLinkLeaseActive(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw"}, holderName, false)
+			},
+			wantReady: metav1.ConditionFalse,
+		},
+		{
+			name: "lease absent, no active tunnel",
+			arrange: func(_ *testing.T, _, _ string) {
+				// No lease and no holder pod: linkActive must read NotFound and report
+				// the tunnel as not active without erroring.
+			},
+			wantReady: metav1.ConditionFalse,
+		},
+		{
+			name: "lease present but holder pod absent",
+			arrange: func(t *testing.T, ns, holderName string) {
+				// The lease names a holder pod that does not exist, simulating the
+				// failover window between the prior holder releasing the lease and the
+				// new holder publishing itself. linkActive must tolerate the missing pod.
+				upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, holderName)
+			},
+			wantReady: metav1.ConditionFalse,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("la-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+			mustCreate(ctx, t, cl, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+
+			gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+				{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			}, nil)
+			mustCreate(ctx, t, cl, gw)
+			key := client.ObjectKeyFromObject(gw)
+
+			gen, _ := countingKeyGen()
+			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+
+			// Provision the Gateway, then give the composite an address so the address
+			// gate is satisfied and the Ready outcome turns solely on the active tunnel.
+			drainReconcile(ctx, t, r, key)
+			setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.30", "sa@example.iam.gserviceaccount.com")
+
+			tt.arrange(t, ns, "gw-link-0")
+
+			// Reconcile must succeed: every tunnel-gate case (including the NotFound
+			// ones) is a non-error outcome, so a failure here means linkActive surfaced
+			// a NotFound as an error.
+			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+				t.Fatalf("reconcile after arranging tunnel state: %v", err)
+			}
+
+			var got wgnetv1alpha1.Gateway
+			mustGet(ctx, t, cl, key, &got)
+			cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if cond == nil {
+				t.Fatalf("Ready condition absent")
+			}
+			if cond.Status != tt.wantReady {
+				t.Errorf("Ready status = %s, want %s (reason %q, message %q)",
+					cond.Status, tt.wantReady, cond.Reason, cond.Message)
+			}
+			if tt.wantReady == metav1.ConditionTrue && cond.Reason != reasonReady {
+				t.Errorf("Ready reason = %q, want %q", cond.Reason, reasonReady)
+			}
+		})
+	}
+}
+
 // startManager builds a controller manager on the envtest config, registers the
-// GatewayReconciler through SetupWithManager so the Service and Namespace watches
-// are live, and starts it in a goroutine. It returns the manager's client. The
-// reconciler watches all namespaces so one manager can
-// serve gateways the transition subtests create in distinct namespaces, and uses a
-// deterministic key generator and zero steady-state requeue so the test's signal
-// is the watch-driven reconvergence, not a timed poll. The manager is stopped via
-// t.Cleanup.
+// GatewayReconciler so the Service and Namespace watches are live, starts it in a
+// goroutine (stopped via t.Cleanup), and returns its client.
 func startManager(ctx context.Context, t *testing.T, te *testEnv) client.Client {
 	t.Helper()
 
@@ -1195,10 +1347,9 @@ func startManager(ctx context.Context, t *testing.T, te *testEnv) client.Client 
 	return mgr.GetClient()
 }
 
-// pollUntil polls cond until it returns true or timeout elapses, failing with msg
-// on timeout. It is the manager-backed transition test's await primitive: a longer
-// deadline than the package eventually helper, since a watch-driven reconcile plus
-// the status patches it triggers take longer to converge than a direct reconcile.
+// pollUntil polls cond until it returns true or timeout elapses, failing with msg on
+// timeout. It is the manager-backed transition test's await primitive, with a longer
+// deadline than the package eventually helper.
 func pollUntil(ctx context.Context, t *testing.T, timeout time.Duration, msg string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -1215,10 +1366,8 @@ func pollUntil(ctx context.Context, t *testing.T, timeout time.Duration, msg str
 	t.Fatalf("timed out waiting for %s", msg)
 }
 
-// transitionTimeout bounds each manager-backed transition wait. It covers a watch
-// event firing, a reconcile running, and (for the ready waits) the composite and
-// link Deployment statuses being patched, so it is generous relative to the direct
-// reconcile waits elsewhere.
+// transitionTimeout bounds each manager-backed transition wait, generous because it
+// covers a watch event firing, a reconcile running, and the dependent status patches.
 const transitionTimeout = 30 * time.Second
 
 // gatewayReadyReason fetches the Gateway at key with cl and returns its Ready
@@ -1236,35 +1385,31 @@ func gatewayReadyReason(ctx context.Context, t *testing.T, cl client.Client, key
 	return cond.Status, cond.Reason
 }
 
-// driveProvisionedReady makes a provisioned Gateway reach the readiness
-// preconditions envtest cannot supply on its own: it waits for the operator to
-// create the composite and link Deployment, patches the composite's observed
-// address, and marks the link Deployment Available. The operator's status-driven
-// watches then flip the Gateway Ready=True (when no forward is invalid). It is
-// idempotent and may be called repeatedly as a subtest re-provisions. Writes go
-// through the direct client so the patches are not delayed by cache propagation.
+// driveProvisionedReady supplies the readiness preconditions envtest cannot: it waits
+// for the operator to create the composite and link Deployment, then patches the
+// composite address and makes the link lease hold a Ready pod so the watches flip Ready.
 func driveProvisionedReady(ctx context.Context, t *testing.T, direct client.Client, key client.ObjectKey) {
 	t.Helper()
 
 	pollUntil(ctx, t, transitionTimeout, "composite created for "+key.String(), func() bool {
 		return !apierrors.IsNotFound(direct.Get(ctx, key, newXGatewayGCP()))
 	})
-	setXGatewayGCPStatus(ctx, t, direct, key, "203.0.113.20", "sa@example.iam.gserviceaccount.com")
 
 	depKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
 	pollUntil(ctx, t, transitionTimeout, "link deployment created for "+key.String(), func() bool {
 		return !apierrors.IsNotFound(direct.Get(ctx, depKey, &appsv1.Deployment{}))
 	})
-	setLinkDeploymentAvailable(ctx, t, direct, key)
+
+	// Seed the active-tunnel precondition before the composite status: the lease and pod
+	// are not watched, so writing the watched composite status last lets its reconcile
+	// observe both the address and the active tunnel together and flip Ready=True.
+	setLinkLeaseActive(ctx, t, direct, key, key.Name+"-link-0", true)
+	setXGatewayGCPStatus(ctx, t, direct, key, "203.0.113.20", "sa@example.iam.gserviceaccount.com")
 }
 
-// TestForwardValidationTransitions runs a real manager so the Service and
-// Namespace watches enqueue, then drives backend changes and asserts the link
-// config and the Gateway Ready condition reconverge without a manual reconcile.
-// Each subtest uses its own namespace so the cases stay isolated under one manager.
-// Writes and reads use the direct envtest client so assertions see etcd state
-// without cache lag; the operator under test reconciles through its own cached
-// client.
+// TestForwardValidationTransitions runs a real manager so the Service and Namespace
+// watches enqueue, then drives backend changes and asserts the link config and Gateway
+// Ready condition reconverge without a manual reconcile. Reads use the direct client.
 func TestForwardValidationTransitions(t *testing.T) {
 	ctx := context.Background()
 	te := setupEnvtest(t)
@@ -1565,11 +1710,9 @@ func removeNamespaceLabel(ctx context.Context, t *testing.T, cl client.Client, n
 	}
 }
 
-// addServicePort appends a published port/proto to the named Service via a
-// read-modify-write with the direct client, so the operator's Service watch fires
-// and re-classification sees the newly published port. A multi-port Service
-// requires every port to be named, so it assigns a deterministic name to each
-// port (the pre-existing one included) before writing.
+// addServicePort appends a published port/proto to the named Service via the direct
+// client, so the operator's Service watch fires. It assigns every port a deterministic
+// name first, since a multi-port Service requires named ports.
 func addServicePort(ctx context.Context, t *testing.T, cl client.Client, ns, name string, port int32, proto corev1.Protocol) {
 	t.Helper()
 	var svc corev1.Service
@@ -1583,12 +1726,9 @@ func addServicePort(ctx context.Context, t *testing.T, cl client.Client, ns, nam
 	}
 }
 
-// removeServicePort drops the port matching port/proto from the named Service via a
-// read-modify-write with the direct client, so the operator's Service watch fires
-// and re-classification sees the port disappear. It rebuilds the port list minus
-// the removed entry, then renames the survivors deterministically to keep a
-// multi-port Service's name-uniqueness invariant satisfied. It fails the test if no
-// matching port was present.
+// removeServicePort drops the port matching port/proto from the named Service via the
+// direct client, so the operator's Service watch fires. It renames the survivors
+// deterministically to keep the named-port invariant, and fails if no port matched.
 func removeServicePort(ctx context.Context, t *testing.T, cl client.Client, ns, name string, port int32, proto corev1.Protocol) {
 	t.Helper()
 	var svc corev1.Service

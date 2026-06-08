@@ -10,99 +10,65 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	policyv1 "k8s.io/api/policy/v1"
 
 	e2eharness "github.com/greg2010/wireguard-gateway-operator/test/harness/e2e"
 	hk8s "github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
 
-// Ready=False reasons the operator sets on a forward-classification failure. The
-// lifecycle subtests assert on them. They mirror the operator's unexported reason
-// constants (internal/controller), duplicated here like the harness's consent
-// label because the operator's are unexported.
+// Ready=False reasons the lifecycle subtests assert on, mirroring the operator's
+// unexported reason constants.
 const (
 	crossNamespaceForwardDeniedReason = "CrossNamespaceForwardDenied"
 	serviceNotFoundReason             = "ServiceNotFound"
 	targetPortNotListeningReason      = "TargetPortNotListening"
 )
 
-// consentLabel and consentValue are the cross-namespace ingress consent label the
-// consent-label-toggle subtest sets on a target namespace. They mirror the
-// operator's gate (internal/controller), duplicated here because the operator's
-// constants are unexported.
+// consentLabel and consentValue are the cross-namespace ingress consent label,
+// mirroring the operator's unexported gate.
 const (
 	consentLabel = "wgnet.dev/allow-gateway-ingress"
 	consentValue = "true"
 )
 
 // lifecycleConditionTimeout bounds a lifecycle subtest's wait for the operator to
-// re-stamp the Gateway Ready condition after a forward, backend, or consent-label
-// change. The change is observed on the next reconcile the relevant watch
-// enqueues, so this need only cover the operator re-running classification and
-// writing status, not a GCP round trip.
+// re-stamp Ready after a forward/backend/consent change: a re-classification and
+// status write, not a GCP round trip.
 const lifecycleConditionTimeout = 90 * time.Second
 
-// lifecycleReadyTimeout bounds a lifecycle subtest's wait for the Gateway to
-// return Ready after a forward becomes valid. Like editRollTimeout it covers the
-// operator re-rendering the firewall and link config plus the link re-applying
-// nftables in place and the readiness gate trailing the live tunnel, so it shares
-// that budget.
+// lifecycleReadyTimeout bounds a lifecycle subtest's wait for the Gateway to return
+// Ready after a forward becomes valid, sharing editRollTimeout's budget.
 const lifecycleReadyTimeout = editRollTimeout
 
-// deniedConditionTimeout bounds the wait for a validation-failure Gateway to
-// report its Ready=False condition. The denial is decided on the first reconcile
-// after the target namespace exists, so this is short; it never provisions.
+// deniedConditionTimeout bounds the wait for a validation-failure Gateway to report
+// Ready=False, decided on the first reconcile and so short.
 const deniedConditionTimeout = 90 * time.Second
 
-// editRollTimeout bounds the forward-edit subtest's wait for the Gateway to
-// return Ready after a live forward edit. The link reloads its ConfigMap in
-// place, so this covers the operator re-rendering the config plus the link
-// re-applying nftables and the readiness gate trailing a fresh handshake, not a
+// editRollTimeout bounds the wait for the Gateway to return Ready after a live
+// forward edit (re-render, in-place nftables re-apply, fresh handshake), with no
 // pod replacement.
 const editRollTimeout = 3 * time.Minute
 
 // coexistWGListenPortA and coexistWGListenPortB are the distinct WireGuard listen
-// ports TestGatewayCoexistence gives its two gateways, so the firewall isolation
-// assertion can prove each gateway's rule admits only its own WG port in the
-// shared VPC. A keeps the chart default (51820); B uses a disjoint port. Both must
-// be disjoint from the negative and forwarded ports (StartE's precondition
-// re-checks the effective WG port).
+// ports TestGatewayCoexistence gives its two gateways, so the isolation assertion
+// can prove each rule admits only its own WG port.
 const (
 	coexistWGListenPortA = 51820
 	coexistWGListenPortB = 51821
 )
 
-// TestGatewayCoexistence validates that two independently provisioned gateways
-// sharing one GCP VPC serve only their own forwards and are isolated by
-// per-gateway service-account scoping. Each gateway's firewall, WireGuard tunnel,
-// and DNAT carry traffic to its own backend; a port one gateway forwards is
-// dropped at the other's firewall; and at the GCP firewall-rule level each
-// gateway's rules target only its own service account and admit only its own
-// WireGuard port. It provisions both gateways concurrently (each its own GCP VM,
-// namespace, and link) with distinct exposed ports and distinct WireGuard listen
-// ports, then asserts the positive data path on each, the negative cross-isolation
-// in both directions, the per-gateway firewall-rule scoping, and that exactly one
-// shared VPC backs both (create-once, no per-gateway duplicate).
-//
-// It is the 5th sharded top-level test. Unlike the single-VM shards it brings up
-// two stacks, so it provisions them under an errgroup to overlap the two GCP
-// round trips rather than serialize them; each stack registers its own teardown
-// (Gateway delete + GCP drain + namespace delete) via StartE, which is safe to run
-// off the test goroutine because it returns errors instead of calling t.Fatal.
+// TestGatewayCoexistence validates that two gateways sharing one GCP VPC are isolated
+// by per-gateway service-account scoping: each serves only its own forwards, the
+// other's port is dropped at its firewall, and one VPC backs both.
 func TestGatewayCoexistence(t *testing.T) {
 	t.Parallel()
 
 	suite := getSuite(t)
 	ctx := context.Background()
 
-	// Provision both stacks concurrently. StartE never calls t.Fatal (it returns
-	// errors and uses only the goroutine-safe t.Cleanup/t.Errorf/t.Logf), so it is
-	// safe under errgroup; the bring-up errors are collected here and re-raised on
-	// the test goroutine, where t.Fatal is legal.
-	// Give the two gateways distinct WireGuard listen ports: A keeps the chart
-	// default, B overrides to coexistWGListenPortB. With both gateways in one
-	// shared VPC, distinct WG ports plus distinct exposed ports make the firewall
-	// isolation assertion below a real test of per-gateway targetServiceAccounts
-	// scoping, not just of port-set bookkeeping.
+	// Distinct WG and exposed ports make the firewall isolation assertion below a
+	// real test of per-gateway targetServiceAccounts scoping, not port bookkeeping.
+	// Bring-up errors are re-raised on the test goroutine, where t.Fatal is legal.
 	var stackA, stackB *e2eharness.Stack
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -132,10 +98,7 @@ func TestGatewayCoexistence(t *testing.T) {
 
 	client := suite.Client()
 
-	// Each gateway forwards its own distinctly named backend on a distinct public
-	// port: A on its ServiceCreatedPort, B on its ServiceDeletedPort. Both ports are
-	// in forwardedPorts() and proven disjoint, and the backends carry the gateway's
-	// suffix so a marker identifies which gateway's data path answered.
+	// Distinctly named backends so a marker identifies which gateway answered.
 	const (
 		backendA = "gateway-echo-coexist-a"
 		backendB = "gateway-echo-coexist-b"
@@ -169,10 +132,8 @@ func TestGatewayCoexistence(t *testing.T) {
 		t.Fatalf("gateway B not ready after coexistence forward: %v", err)
 	}
 
-	// Positive: each gateway carries traffic to its own backend. The forward was
-	// just added, so the link must apply its new nftables rule before the data path
-	// answers; the readiness gate above trails the live handshake, not that apply, so
-	// these probes use the edit/lifecycle budget rather than the shorter data-path one.
+	// The just-added forward uses the edit budget: the link's new nftables rule is
+	// not trailed by the readiness gate.
 	markerA, err := probeTCPThroughGatewayPortUntil(ctx, stackA, stackA.ServiceCreatedPort, editRollTimeout)
 	if err != nil {
 		t.Fatalf("gateway A data path: %v", err)
@@ -184,9 +145,8 @@ func TestGatewayCoexistence(t *testing.T) {
 	}
 	assertBackendMarker(t, markerB, backendB)
 
-	// Cross-isolation: a gateway never forwards the other's port, so a SYN to the
-	// other's port is dropped at this gateway's firewall. The port was never opened
-	// here, so probeTCPDenied needs no propagation wait.
+	// Neither gateway forwards the other's port, so the SYN is dropped immediately;
+	// the port was never opened here, so no propagation wait is needed.
 	if err := probeTCPDenied(ctx, stackA, stackB.ServiceDeletedPort); err != nil {
 		t.Fatalf("gateway A leaked gateway B's port %d: %v", stackB.ServiceDeletedPort, err)
 	}
@@ -194,11 +154,8 @@ func TestGatewayCoexistence(t *testing.T) {
 		t.Fatalf("gateway B leaked gateway A's port %d: %v", stackA.ServiceCreatedPort, err)
 	}
 
-	// Firewall-rule isolation: assert at the GCP firewall-rule level (not just the
-	// data path) that each gateway's rules target only its own service account and
-	// admit only its own WireGuard port. In a shared VPC this is the invariant that
-	// keeps one gateway's rules off the other's VM; it is more reliable than a UDP
-	// data-path probe, which the firewall drops silently.
+	// Assert at the firewall-rule level that each gateway's rules target only its own
+	// SA and WG port, more reliable than a silently-dropped UDP data-path probe.
 	saA, err := suite.GatewayServiceAccountEmail(ctx, stackA.Namespace, stackA.GatewayName)
 	if err != nil {
 		t.Fatalf("read gateway A service account email: %v", err)
@@ -216,8 +173,7 @@ func TestGatewayCoexistence(t *testing.T) {
 	assertFirewallIsolation(ctx, t, suite, stackA, saA, saB, stackB.WireguardListenPort)
 	assertFirewallIsolation(ctx, t, suite, stackB, saB, saA, stackA.WireguardListenPort)
 
-	// Exactly one shared VPC backs both gateways: the network is created once on
-	// the first gateway and reused, never duplicated per gateway.
+	// The VPC is created once on the first gateway and reused, never duplicated.
 	n, err := suite.SharedNetworkCount(ctx)
 	if err != nil {
 		t.Fatalf("count shared networks: %v", err)
@@ -227,12 +183,9 @@ func TestGatewayCoexistence(t *testing.T) {
 	}
 }
 
-// assertFirewallIsolation fails the test unless every firewall rule scoped to
-// stack's gateway targets only ownSA (never otherSA), and the gateway's own
-// WireGuard UDP port appears in some rule's allowed UDP ports while the other
-// gateway's WG port (otherWG) does not. It proves, at the GCP firewall-rule
-// level, that the two coexisting gateways in the shared VPC are isolated by
-// targetServiceAccounts for both exposed and WireGuard ports.
+// assertFirewallIsolation fails unless every firewall rule for stack's gateway
+// targets only ownSA, and the gateway's own WireGuard port appears in some rule's
+// allowed UDP ports while otherWG does not.
 func assertFirewallIsolation(ctx context.Context, t *testing.T, suite *e2eharness.Suite, stack *e2eharness.Stack, ownSA, otherSA string, otherWG int) {
 	t.Helper()
 
@@ -248,11 +201,8 @@ func assertFirewallIsolation(ctx context.Context, t *testing.T, suite *e2eharnes
 	otherWGPort := strconv.Itoa(otherWG)
 	sawOwnWG := false
 	for _, rule := range rules {
-		// Every rule must be scoped to exactly this gateway's SA. The caller has
-		// already asserted ownSA != otherSA, so requiring the single target to be
-		// ownSA also proves the rule never carries the other gateway's SA: a rule
-		// leaking onto it would open this gateway's ports on the other gateway's VM
-		// in the shared VPC.
+		// The caller asserted ownSA != otherSA, so a single ownSA target also proves
+		// the rule never opens this gateway's ports on the other's VM.
 		if len(rule.TargetServiceAccounts) != 1 || rule.TargetServiceAccounts[0] != ownSA {
 			t.Fatalf("firewall rule %q targets %v, want exactly [%s] (and never the other gateway's SA %s)",
 				rule.Name, rule.TargetServiceAccounts, ownSA, otherSA)
@@ -276,21 +226,9 @@ func assertFirewallIsolation(ctx context.Context, t *testing.T, suite *e2eharnes
 	}
 }
 
-// TestGatewayDataPath validates the operator data path against real GCP: it
-// installs the operator, creates a Gateway CR that provisions a real e2-micro
-// gateway with an ephemeral IP, forwards in-cluster TCP (HTTP) and UDP echoes
-// (ClusterIP, NodePort, and cross-namespace) through the gateway, and asserts
-// each is reachable from the host on the gateway's public IP. It also asserts
-// non-forwarded public ports and internet ICMP are NOT reachable, proving the
-// GCP firewall and DNAT closure hold jointly. Teardown (registered by Start)
-// deletes the Gateway, waits for Crossplane to drain every GCP resource the run
-// created (asserting no orphans, including the hash-derived ServiceAccount and
-// Secret), then uninstalls.
-//
-// This is one of four sharded top-level tests, each provisioning its own GCP
-// gateway in parallel against the shared control plane. The shards split the
-// scenarios so wall-clock is bounded by the slowest shard rather than the sum;
-// each runs its subtests serially against its own single provisioned VM.
+// TestGatewayDataPath validates the data path against real GCP: forwarded TCP/UDP
+// echoes (ClusterIP, NodePort, cross-namespace) are reachable on the public IP while
+// non-forwarded ports and internet ICMP are not, proving firewall and DNAT closure.
 func TestGatewayDataPath(t *testing.T) {
 	t.Parallel()
 
@@ -312,9 +250,8 @@ func TestGatewayDataPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("tcp data path: %v", err)
 		}
-		// agnhost /hostname returns the serving pod name, which the backend
-		// Deployment prefixes with its own name; asserting the prefix proves the
-		// request reached the intended echo pod, not merely some pod.
+		// The marker's prefix proves the request reached the intended echo pod, not
+		// merely some pod.
 		assertBackendMarker(t, marker, stack.TCPBackendName)
 		t.Logf("tcp echo marker (echo pod name): %s", marker)
 	})
@@ -349,19 +286,14 @@ func TestGatewayDataPath(t *testing.T) {
 	})
 
 	t.Run("icmp-denied", func(t *testing.T) {
-		// The firewall no longer allows internet-wide ICMP, so a ping to the public
-		// IP must draw no reply. A reply is a leak.
+		// The firewall does not allow internet-wide ICMP, so a reply is a leak.
 		if err := pingDenied(ctx, stack); err != nil {
 			t.Fatalf("icmp negative probe: %v", err)
 		}
 	})
 
-	// Negative probes: a non-forwarded public port must NOT reach the pod. The
-	// GCP firewall opens only the forwarded ports and the WireGuard port, so
-	// these assert the firewall and DNAT closure jointly. Start has already
-	// asserted stack.NegativePort is disjoint from the forwarded ports and the
-	// WireGuard listen port, so a hit here is a real leak, not a misconfigured
-	// probe.
+	// Start asserted NegativePort is disjoint from the forwarded and WG ports, so a
+	// hit here is a real leak, not a misconfigured probe.
 	t.Run("tcp-denied", func(t *testing.T) {
 		if err := probeTCPDenied(ctx, stack, stack.NegativePort); err != nil {
 			t.Fatalf("tcp negative probe: %v", err)
@@ -374,21 +306,14 @@ func TestGatewayDataPath(t *testing.T) {
 		}
 	})
 
-	// forward-retarget points one forward at a backend, proves it carries traffic
-	// to it, then retargets the same forward to a second backend and proves the
-	// bytes follow: the data path tracks the retarget, not just the initial wiring.
-	// It runs after the negative probes (which target the disjoint negative port)
-	// so its transient open forward never overlaps them. It uses its own dedicated
-	// public port and a second backend Service, leaving the create-time forwards the
-	// other subtests assert on untouched.
+	// forward-retarget proves the data path tracks a retarget: it points a dedicated
+	// forward at one backend then retargets to a second, leaving create-time forwards
+	// untouched.
 	t.Run("forward-retarget", func(t *testing.T) {
 		client := suite.Client()
 
-		// When the subtest fails and GATEWAY_E2E_PRESERVE is set, leave the live
-		// cluster in its exact failing state (8453 forward still pointed at the
-		// retarget backend, backend B alive) so the data path can be inspected on the
-		// preserved cluster. Evaluated inside the cleanup, where t.Failed reflects the
-		// subtest's final result.
+		// Read inside the cleanup, where t.Failed reflects the final result, to leave
+		// a failing data path inspectable.
 		preserve := os.Getenv("GATEWAY_E2E_PRESERVE") != ""
 
 		const retargetBackend = "gateway-echo-retarget"
@@ -411,16 +336,13 @@ func TestGatewayDataPath(t *testing.T) {
 			}
 		})
 
-		// Deploy the second backend, then forward the dedicated port to the create-time
-		// TCP echo first; the marker proves traffic reaches the original backend before
-		// the retarget.
+		// Forward the dedicated port to the create-time echo first; the marker proves
+		// traffic reaches the original backend before the retarget.
 		if _, err := client.DeployEchoBackend(ctx, stack.Namespace, retargetBackend); err != nil {
 			t.Fatalf("deploy retarget backend: %v", err)
 		}
-		// Gate on the retarget backend actually serving before the forward is pointed
-		// at it below: DeployEchoBackend returns immediately and the echo Deployment
-		// has no readinessProbe, so without this the retarget's DNAT can go live before
-		// the backend has a ready endpoint and the probe blackholes for the full window.
+		// The echo has no readinessProbe, so gate on it serving before the retarget's
+		// DNAT goes live, else the probe blackholes for the full window.
 		if err := client.WaitDeploymentAvailable(ctx, stack.Namespace, retargetBackend, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("retarget backend not available: %v", err)
 		}
@@ -444,13 +366,8 @@ func TestGatewayDataPath(t *testing.T) {
 		}
 		assertBackendMarker(t, origin, stack.TCPBackendName)
 
-		// Retarget the same forward to the second backend in the Gateway's own
-		// namespace, then prove the marker now identifies that backend: the link
-		// re-renders its DNAT and the bytes follow the new Service. The link reloads
-		// its ConfigMap in place, so its DNAT can trail the operator's Ready
-		// condition and a single probe can still catch the old backend; poll until
-		// the marker leaves the origin backend, under lifecycleReadyTimeout, as the
-		// convergence gate.
+		// The link reloads its ConfigMap in place, so its DNAT can trail Ready and a
+		// single probe can catch the old backend; poll until the marker leaves origin.
 		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
 			return setForwardService(spec, stack.ForwardRetargetPort, retargetBackend, "")
 		}); err != nil {
@@ -467,12 +384,9 @@ func TestGatewayDataPath(t *testing.T) {
 	})
 }
 
-// TestGatewayForwardEdit validates that live forward edits on a provisioned
-// gateway take effect over the wire: adding a forward in place rolls the link
-// onto new nftables rules without a pod roll, and a forward to a not-yet-existing
-// backend Service is denied then admitted once the Service appears. It is one of
-// four sharded top-level tests, each provisioning its own GCP gateway; teardown
-// (registered by Start) drains every GCP resource the shard created.
+// TestGatewayForwardEdit validates that live forward edits take effect over the
+// wire: adding a forward rolls the link onto new nftables rules without a pod roll,
+// and a forward to a missing Service is denied then admitted once it appears.
 func TestGatewayForwardEdit(t *testing.T) {
 	t.Parallel()
 
@@ -489,17 +403,11 @@ func TestGatewayForwardEdit(t *testing.T) {
 	}
 	t.Logf("gateway public IP: %s", stack.Address)
 
-	// forward-edit adds a forward live and asserts the link picks up the new
-	// nftables rules by reloading its ConfigMap in place: no pod roll. The link
-	// watches the mounted ConfigMap and reconciles wg0 and nftables without tearing
-	// the tunnel down, so the data-path probe on the new port is the signal that
-	// the reload landed. It runs after the other positive probes so it does not
-	// interfere with them.
+	// forward-edit adds a forward live; the data-path probe on the new port is the
+	// signal the link reloaded its ConfigMap in place, with no pod roll.
 	t.Run("forward-edit", func(t *testing.T) {
 		client := suite.Client()
 
-		// Add a TCP forward on editedPublicPort to the in-namespace TCP echo. The
-		// edit changes the link ConfigMap, which the link reloads in place.
 		addForward := hk8s.GatewayForward{
 			Port:       stack.EditedPublicPort,
 			Protocol:   "TCP",
@@ -512,9 +420,8 @@ func TestGatewayForwardEdit(t *testing.T) {
 			t.Fatalf("add forward to gateway: %v", err)
 		}
 
-		// Ready returns once the operator has applied the new config and the link is
-		// Available; the in-place reload keeps the same pod, so the data-path probe
-		// on the new port confirms the reloaded nftables rules took effect.
+		// The in-place reload keeps the same pod, so the data-path probe on the new
+		// port confirms the reloaded nftables rules took effect.
 		if _, err := client.WaitGatewayReady(ctx, stack.Namespace, stack.GatewayName, editRollTimeout); err != nil {
 			t.Fatalf("gateway not ready after forward edit: %v", err)
 		}
@@ -529,16 +436,12 @@ func TestGatewayForwardEdit(t *testing.T) {
 		t.Logf("edited-forward echo marker (echo pod name): %s", marker)
 	})
 
-	// Live-classification subtests each attach one dedicated runtime forward (and,
-	// where needed, a dedicated backend Service or namespace) and remove it again,
-	// so they never touch the create-time forwards the data-path subtests assert
-	// on. Because the gateway is already provisioned via its valid create-time
-	// forwards, an invalid dedicated forward leaves the VM up and reports
-	// Ready=False with that forward's reason rather than tearing the VM down.
+	// The live-classification subtests each attach and remove a dedicated forward,
+	// never touching the valid create-time forwards, so an invalid dedicated forward
+	// leaves the VM up with Ready=False rather than tearing it down.
 
-	// service-created-after-gateway: a forward to a not-yet-existing backend Service
-	// is denied (ServiceNotFound) on the live gateway; creating the Service admits
-	// it and the new port becomes reachable.
+	// service-created-after-gateway: a forward to a missing Service is denied
+	// (ServiceNotFound); creating the Service admits it and the port becomes reachable.
 	t.Run("service-created-after-gateway", func(t *testing.T) {
 		client := suite.Client()
 
@@ -558,9 +461,8 @@ func TestGatewayForwardEdit(t *testing.T) {
 			}
 		})
 
-		// Add the forward before the backend exists: the operator must keep the
-		// gateway up (its create-time forwards stay valid) and report
-		// Ready=False/ServiceNotFound for the new forward.
+		// Adding the forward before the backend exists must keep the gateway up (its
+		// create-time forwards stay valid) and report Ready=False/ServiceNotFound.
 		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
 			return appendForward(spec, hk8s.GatewayForward{
 				Port: stack.ServiceCreatedPort, Protocol: "TCP", Service: svcName, TargetPort: stack.TCPBackendPort,
@@ -573,8 +475,8 @@ func TestGatewayForwardEdit(t *testing.T) {
 			t.Fatalf("gateway did not report Ready=False/%s for missing backend: %v", serviceNotFoundReason, err)
 		}
 
-		// Create the backend Service: the Service watch re-classifies the forward as
-		// valid, the gateway returns Ready, and the new port becomes reachable.
+		// Creating the Service re-classifies the forward as valid; the new port
+		// becomes reachable.
 		if _, err := client.DeployEchoBackend(ctx, stack.Namespace, svcName); err != nil {
 			t.Fatalf("deploy created-after backend: %v", err)
 		}
@@ -589,13 +491,9 @@ func TestGatewayForwardEdit(t *testing.T) {
 	})
 }
 
-// TestGatewayConsentLifecycle validates per-forward classification transitions
-// driven by backend and consent-label changes on a live provisioned gateway:
-// deleting a backend Service closes only its forward, and toggling the
-// cross-namespace ingress consent label denies, admits (reachable over the
-// wire), then re-denies a cross-namespace forward. It is one of four sharded
-// top-level tests, each provisioning its own GCP gateway; teardown (registered
-// by Start) drains every GCP resource the shard created.
+// TestGatewayConsentLifecycle validates per-forward classification transitions on a
+// live gateway: deleting a backend Service closes only its forward, and toggling the
+// consent label denies, admits, then re-denies a cross-namespace forward.
 func TestGatewayConsentLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -612,9 +510,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 	}
 	t.Logf("gateway public IP: %s", stack.Address)
 
-	// service-deleted: a forward to a live backend works, then deleting the backend
-	// Service drops only that forward (its port stops responding) while the
-	// create-time forwards keep working and the gateway keeps its VM.
+	// service-deleted: deleting a live backend Service drops only its forward, while
+	// the create-time forwards keep working and the gateway keeps its VM.
 	t.Run("service-deleted", func(t *testing.T) {
 		client := suite.Client()
 
@@ -644,17 +541,14 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("add forward to deletable service: %v", err)
 		}
-		// Ready=True is the fast signal that the operator classified the deletable
-		// forward as valid and opened it; the data path through a freshly-opened
-		// forward is already proven by the retained service-created probe, so this
-		// scenario asserts the admit transition via the condition only.
+		// The data path through a freshly-opened forward is already proven by the
+		// service-created probe, so this asserts the admit transition via Ready only.
 		if _, err := client.WaitGatewayReady(ctx, stack.Namespace, stack.GatewayName, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("gateway not ready with deletable forward: %v", err)
 		}
 
-		// Delete the backend: the Service watch re-classifies the forward as
-		// ServiceNotFound, the operator re-renders without it (closing the port), and
-		// the gateway reports Ready=False/ServiceNotFound while keeping its VM.
+		// Deleting the backend re-classifies the forward as ServiceNotFound; the
+		// operator re-renders without it (closing the port) while keeping its VM.
 		if err := client.DeleteService(ctx, stack.Namespace, svcName); err != nil {
 			t.Fatalf("delete deletable backend service: %v", err)
 		}
@@ -666,8 +560,7 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 			t.Fatalf("deleted-backend port did not stop responding: %v", err)
 		}
 
-		// A create-time forward must still work: dropping one forward does not
-		// disturb the others.
+		// Dropping one forward must not disturb the others.
 		survivor, err := probeTCPThroughGateway(ctx, stack)
 		if err != nil {
 			t.Fatalf("create-time tcp forward broke after unrelated backend delete: %v", err)
@@ -675,14 +568,9 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		assertBackendMarker(t, survivor, stack.TCPBackendName)
 	})
 
-	// consent-label-toggle: a cross-namespace forward into a NEW unlabelled
-	// namespace is denied, adding the consent label admits it (and the port becomes
-	// reachable), and removing the label re-denies it (and the port stops).
-	//
-	// The operator is cluster-scoped, so its informer cache and the
-	// Namespace/Service watches cover all namespaces, including the cross-namespace
-	// target. The consent-label change on that namespace is observed by the
-	// cluster-wide Namespace watch, which drives the re-classification.
+	// consent-label-toggle: a cross-namespace forward into an unlabelled namespace is
+	// denied; the operator's Namespace watch observes the consent label toggling and
+	// re-classifies it admitted then denied again.
 	t.Run("consent-label-toggle", func(t *testing.T) {
 		client := suite.Client()
 
@@ -700,8 +588,7 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 			}
 		})
 
-		// Create the target namespace WITHOUT the consent label and deploy the
-		// backend in it.
+		// The target namespace starts without the consent label.
 		if err := client.EnsureNamespace(ctx, consentNS); err != nil {
 			t.Fatalf("ensure consent namespace: %v", err)
 		}
@@ -723,10 +610,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 			t.Fatalf("cross-namespace forward into unlabelled ns not denied: %v", err)
 		}
 
-		// Label added: admitted. Ready=True is the fast admit signal; the probe then
-		// proves the freshly-consented cross-namespace forward carries traffic to the
-		// consent-namespace backend over the wire, not merely that the condition
-		// flipped.
+		// Label added: admitted. The probe proves the consented forward carries
+		// traffic over the wire, not merely that the condition flipped.
 		if err := client.SetNamespaceLabel(ctx, consentNS, consentLabel, consentValue); err != nil {
 			t.Fatalf("add consent label: %v", err)
 		}
@@ -752,12 +637,9 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		}
 	})
 
-	// backend-rollout proves a forward's DNAT targets the backend Service's stable
-	// ClusterIP, not a specific pod: after rolling every backend pod the forward
-	// still carries traffic, and the marker (agnhost /hostname, the serving pod's
-	// name) identifies the same backend but a fresh pod. It uses its own dedicated
-	// public port and backend Service, so it never disturbs the create-time forwards
-	// or the other lifecycle subtests.
+	// backend-rollout proves a forward's DNAT targets the Service's stable ClusterIP,
+	// not a specific pod: after rolling every backend pod the forward still carries
+	// traffic to a fresh one.
 	t.Run("backend-rollout", func(t *testing.T) {
 		client := suite.Client()
 
@@ -796,23 +678,17 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		}
 		assertBackendMarker(t, before, svcName)
 
-		// Roll the backend: every pod is replaced, so the forward must re-resolve to
-		// the same ClusterIP and reach a pod with a different name. WaitDeploymentAvailable
-		// only lets the rollout progress; at replicas=1 with the default RollingUpdate
-		// strategy the old pod keeps the Deployment Available across the roll and can
-		// linger in the Service endpoints, so a single post-roll probe can still catch
-		// the old marker. Polling until the marker changes, under lifecycleReadyTimeout,
-		// is the joint continuity + convergence gate: the roll plus the old-endpoint
-		// drain can exceed dataPathDeadline, so it needs the longer budget.
+		// At replicas=1 the old pod can linger in endpoints across the roll, so a
+		// single post-roll probe can catch the old marker; poll until it changes under
+		// the lifecycle budget the roll plus old-endpoint drain can need.
 		if err := client.RestartDeployment(ctx, stack.Namespace, svcName); err != nil {
 			t.Fatalf("restart rollout backend: %v", err)
 		}
 		if err := client.WaitDeploymentAvailable(ctx, stack.Namespace, svcName, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("rollout backend not available after roll: %v", err)
 		}
-		// Close the endpoint-population lag the same way the retarget subtest does: a
-		// Deployment can report Available before the fresh pod is registered as a ready
-		// endpoint, so gate the post-roll convergence probe on a ready endpoint.
+		// A Deployment can report Available before the fresh pod is a ready endpoint,
+		// so gate the convergence probe on one.
 		if err := client.WaitEndpointsReady(ctx, stack.Namespace, svcName, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("rollout backend has no ready endpoints after roll: %v", err)
 		}
@@ -824,13 +700,9 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 	})
 }
 
-// TestGatewayTargetPortLifecycle validates targetPort classification on a live
-// provisioned gateway (a forward to a non-published targetPort is denied and
-// unreachable, then admitted and reachable once corrected) and that a second
-// Gateway whose only forward targets an unlabelled namespace is denied without
-// ever provisioning a VM. It is one of four sharded top-level tests, each
-// provisioning its own GCP gateway; teardown (registered by Start) drains every
-// GCP resource the shard created.
+// TestGatewayTargetPortLifecycle validates targetPort classification (a forward to a
+// non-published targetPort is denied and unreachable, then admitted once corrected)
+// and that a Gateway with only an unlabelled cross-namespace forward provisions no VM.
 func TestGatewayTargetPortLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -847,11 +719,8 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 	}
 	t.Logf("gateway public IP: %s", stack.Address)
 
-	// targetPort-not-listening: a forward whose targetPort names a port the backend
-	// Service does not publish is denied (TargetPortNotListening); correcting the
-	// targetPort to a published port admits it and the port becomes reachable. It
-	// reuses the create-time TCP echo Service as the backend, attacking only its own
-	// dedicated public port.
+	// targetPort-not-listening: a forward whose targetPort the backend does not
+	// publish is denied (TargetPortNotListening); correcting it admits the forward.
 	t.Run("targetPort-not-listening", func(t *testing.T) {
 		client := suite.Client()
 
@@ -864,7 +733,6 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 			}
 		})
 
-		// Add a forward to the TCP echo with a targetPort it does not publish.
 		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
 			return appendForward(spec, hk8s.GatewayForward{
 				Port: stack.TargetPortScenarioPort, Protocol: "TCP",
@@ -877,22 +745,19 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 			"Ready", "False", targetPortNotListeningReason, lifecycleConditionTimeout); err != nil {
 			t.Fatalf("forward with non-published targetPort not denied: %v", err)
 		}
-		// The denied forward must also be closed at the firewall: prove the
-		// wrong-targetPort port is unreachable over the wire, not just that the
-		// condition reports it denied.
+		// Prove the denied forward is also closed at the firewall, not just reported
+		// denied by the condition.
 		if err := waitPortDenied(ctx, stack, stack.TargetPortScenarioPort, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("wrong-targetPort forward port did not stay closed: %v", err)
 		}
 
-		// Correct the targetPort to the published one: the operator admits the
-		// forward and the port becomes reachable.
+		// Correcting the targetPort admits the forward.
 		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
 			return setForwardTargetPort(spec, stack.TargetPortScenarioPort, stack.TCPBackendPort)
 		}); err != nil {
 			t.Fatalf("correct targetPort: %v", err)
 		}
-		// Ready=True is the fast admit signal; the probe then proves the corrected
-		// forward carries traffic to the create-time TCP echo backend over the wire.
+		// The probe proves the corrected forward carries traffic over the wire.
 		if _, err := client.WaitGatewayReady(ctx, stack.Namespace, stack.GatewayName, lifecycleReadyTimeout); err != nil {
 			t.Fatalf("gateway not ready after targetPort corrected: %v", err)
 		}
@@ -903,16 +768,15 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 		assertBackendMarker(t, marker, stack.TCPBackendName)
 	})
 
-	// cross-namespace-denied applies a SECOND Gateway whose only forward targets an
-	// unlabelled namespace. With zero valid forwards and nothing provisioned, the
-	// operator never creates a GCP VM; the subtest asserts the Ready=False denial
-	// reason and cleans up its Gateway and namespace.
+	// cross-namespace-denied applies a Gateway whose only forward targets an
+	// unlabelled namespace; with zero valid forwards the operator never creates a VM
+	// and reports the Ready=False denial reason.
 	t.Run("cross-namespace-denied", func(t *testing.T) {
 		client := suite.Client()
 		env := suite.Env()
 
-		// A namespace that exists but lacks the consent label; the denial reason is
-		// CrossNamespaceForwardDenied (not TargetNamespaceNotFound).
+		// The namespace exists but lacks the consent label, so the reason is
+		// CrossNamespaceForwardDenied, not TargetNamespaceNotFound.
 		deniedNS := stack.Namespace + "-denied-target"
 		if err := client.EnsureNamespace(ctx, deniedNS); err != nil {
 			t.Fatalf("ensure denied-target namespace: %v", err)
@@ -945,9 +809,8 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 				t.Logf("cleanup denied gateway %s: %v", deniedGateway, err)
 				return
 			}
-			// The denied Gateway never created an XGatewayGCP (validation stops first),
-			// so its finalizer clears immediately; wait so the namespace teardown
-			// does not race a finalizer-held object.
+			// The denied Gateway never created an XGatewayGCP, so its finalizer clears
+			// immediately; wait so the namespace teardown does not race it.
 			if err := client.WaitGatewayGone(cctx, stack.Namespace, deniedGateway, deniedConditionTimeout); err != nil {
 				t.Logf("cleanup wait denied gateway gone %s: %v", deniedGateway, err)
 			}
@@ -959,56 +822,44 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 		}
 	})
 
-	// link-pod-restart proves the data path survives losing the link pod: the link
-	// owns wg0 and the nftables DNAT ruleset, both of which live in the pod, so a
-	// replacement pod must re-establish the WireGuard tunnel to the persistent VM
-	// and re-apply the DNAT before traffic flows again. It snapshots the link pods,
-	// deletes them, waits for a Ready replacement with a new name (proving the old
-	// pod was actually torn down, since the delete is async), and proves a
-	// create-time forward carries traffic again. It adds no forward or backend, so
-	// it needs no cleanup; the create-time TCP echo it probes is restored by the new
-	// pod.
+	// link-pod-restart proves the data path survives losing the active link pod: the
+	// new holder re-establishes the tunnel and DNAT before traffic flows. It keys on
+	// the lease holder moving, the failover signal at any replica count.
 	t.Run("link-pod-restart", func(t *testing.T) {
 		client := suite.Client()
 
-		// Baseline: the create-time TCP forward works before the link pod is evicted.
+		// Baseline before the active link pod is deleted.
 		before, err := probeTCPThroughGateway(ctx, stack)
 		if err != nil {
 			t.Fatalf("create-time tcp forward broken before link restart: %v", err)
 		}
 		assertBackendMarker(t, before, stack.TCPBackendName)
 
-		// Snapshot the current link pods before evicting them. The delete is async and
-		// the Deployment can stay Available on the still-Ready old pod, so a name set
-		// captured now lets the wait below gate on a genuinely new replacement rather
-		// than the lingering original.
-		linkSelector := fmt.Sprintf("app.kubernetes.io/component=link,app.kubernetes.io/instance=%s", stack.GatewayName)
-		oldPods, err := client.PodNamesByLabel(ctx, stack.Namespace, linkSelector)
+		oldHolder, err := client.GetLeaseHolder(ctx, stack.Namespace, linkLeaseName(stack.GatewayName))
 		if err != nil {
-			t.Fatalf("list link pods before restart: %v", err)
+			t.Fatalf("read link lease holder before restart: %v", err)
+		}
+		if oldHolder == "" {
+			t.Fatal("link lease has no holder before restart; the active link never acquired leadership")
 		}
 
-		// Evict the link pods by their component+instance labels; the Deployment's
-		// Recreate strategy brings up a single replacement that re-owns wg0 and the
-		// nftables ruleset.
-		deleted, err := client.DeletePodsByLabel(ctx, stack.Namespace, linkSelector)
+		// At this shard's single replica the deleted pod is the lease holder, so
+		// leadership must move to its replacement.
+		deleted, err := client.DeletePodsByLabel(ctx, stack.Namespace, linkSelector(stack.GatewayName))
 		if err != nil {
 			t.Fatalf("delete link pods: %v", err)
 		}
 		if deleted < 1 {
-			t.Fatalf("link selector %q in ns %q matched no pods", linkSelector, stack.Namespace)
+			t.Fatalf("link selector in ns %q matched no pods", stack.Namespace)
 		}
 
-		// Wait for a Ready replacement whose name is not in the pre-delete set: the
-		// Recreate strategy gives the new pod a fresh name, so this proves the old pod
-		// was actually torn down and replaced, not that the async delete merely
-		// returned while the original stayed up.
-		if err := client.WaitForReplacementPod(ctx, stack.Namespace, linkSelector, oldPods, lifecycleReadyTimeout); err != nil {
-			t.Fatalf("link pod not replaced after restart: %v", err)
+		newHolder, err := client.WaitLeaseHolderChanges(ctx, stack.Namespace, linkLeaseName(stack.GatewayName), oldHolder, lifecycleReadyTimeout)
+		if err != nil {
+			t.Fatalf("link lease holder did not move after restart: %v", err)
 		}
+		t.Logf("link lease holder moved %s -> %s", oldHolder, newHolder)
 
-		// Traffic must resume through the replacement pod's freshly established tunnel
-		// and DNAT; the data-path retry absorbs the handshake and rule convergence.
+		// The data-path retry absorbs the new holder's handshake and rule convergence.
 		after, err := probeTCPThroughGateway(ctx, stack)
 		if err != nil {
 			t.Fatalf("create-time tcp forward did not resume after link restart: %v", err)
@@ -1016,15 +867,293 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 		assertBackendMarker(t, after, stack.TCPBackendName)
 	})
 
-	// Forward classification, retargeting, and validation transitions are covered by
-	// TestClassifyForwards and TestForwardValidationTransitions in the controller
-	// envtest; they are not duplicated here to keep each shard to a single VM.
+	// Forward classification and validation transitions live in the controller
+	// envtest, not duplicated here so each shard stays a single VM.
 }
 
-// assertBackendMarker fails the test unless marker (an agnhost /hostname pod
-// name) carries backend as a prefix. The serving pod's name is its Deployment's
-// name plus a generated suffix, so the prefix identifies which backend answered;
-// a mismatch means the forward routed to the wrong Service.
+// haFailoverTimeout bounds the wait for the link lease holder to move to a survivor:
+// one lease-duration plus the new holder publishing itself, not the tunnel bring-up
+// the data-path probe owns.
+const haFailoverTimeout = 90 * time.Second
+
+// haReplicas is the link replica count TestGatewayLinkHA provisions: one active plus
+// one standby, the minimum exercising leader election, fencing, failover, and a PDB.
+const haReplicas = 2
+
+// TestGatewayLinkHA validates the link's active-passive HA at two replicas behind
+// leader election: exactly the lease holder runs wg0 and the inet gateway table, and
+// the data path survives failover, a rolling update, and a budgeted eviction.
+func TestGatewayLinkHA(t *testing.T) {
+	t.Parallel()
+
+	suite := getSuite(t)
+	ctx := context.Background()
+
+	stack, err := suite.Start(ctx, t, e2eharness.WithLinkReplicas(haReplicas))
+	if err != nil {
+		t.Fatalf("start stack: %v", err)
+	}
+
+	if stack.Address == "" {
+		t.Fatal("gateway reported no public IP")
+	}
+	t.Logf("gateway public IP: %s", stack.Address)
+
+	client := suite.Client()
+	leaseName := linkLeaseName(stack.GatewayName)
+	selector := linkSelector(stack.GatewayName)
+
+	// Baseline before any HA scenario perturbs the active replica.
+	baseline, err := probeTCPThroughGateway(ctx, stack)
+	if err != nil {
+		t.Fatalf("create-time tcp forward broken at HA baseline: %v", err)
+	}
+	assertBackendMarker(t, baseline, stack.TCPBackendName)
+
+	// single-active proves exactly one replica owns wg0 and it is the lease holder.
+	t.Run("single-active", func(t *testing.T) {
+		holder, owners := assertSingleWG0Owner(ctx, t, client, stack.Namespace, selector, leaseName)
+		t.Logf("active link replica: %s (lease holder, sole wg0 owner)", holder)
+		if len(owners) != 1 || owners[0] != holder {
+			t.Fatalf("wg0 owners %v do not match lease holder %q", owners, holder)
+		}
+	})
+
+	// standby-idle proves every non-holder replica carries no data plane (neither wg0
+	// nor the inet gateway table); otherwise it would double-drive the tunnel.
+	t.Run("standby-idle", func(t *testing.T) {
+		holder, err := client.GetLeaseHolder(ctx, stack.Namespace, leaseName)
+		if err != nil {
+			t.Fatalf("read lease holder: %v", err)
+		}
+		if holder == "" {
+			t.Fatal("link lease has no holder; no active replica")
+		}
+		pods, err := client.PodNamesByLabel(ctx, stack.Namespace, selector)
+		if err != nil {
+			t.Fatalf("list link pods: %v", err)
+		}
+		standbys := 0
+		for _, pod := range pods {
+			if pod == holder {
+				continue
+			}
+			standbys++
+			if podHasWG0(ctx, t, client, stack.Namespace, pod) {
+				t.Errorf("standby %s has wg0; a demoted replica must not carry the interface", pod)
+			}
+			if podHasGatewayTable(ctx, t, client, stack.Namespace, pod) {
+				t.Errorf("standby %s has the inet gateway table; a demoted replica must not carry the nftables data plane", pod)
+			}
+		}
+		if standbys == 0 {
+			t.Fatalf("no standby replicas among link pods %v (holder %q); HA test needs >1 replica", pods, holder)
+		}
+	})
+
+	// failover proves leadership and the data plane move to a survivor when the
+	// active replica is lost.
+	t.Run("failover", func(t *testing.T) {
+		oldHolder, err := client.GetLeaseHolder(ctx, stack.Namespace, leaseName)
+		if err != nil {
+			t.Fatalf("read lease holder before failover: %v", err)
+		}
+		if oldHolder == "" {
+			t.Fatal("link lease has no holder before failover")
+		}
+
+		// Delete only the holder, leaving the standby; leadership must move to it.
+		if err := client.DeletePod(ctx, stack.Namespace, oldHolder); err != nil {
+			t.Fatalf("delete lease holder %s: %v", oldHolder, err)
+		}
+
+		newHolder, err := client.WaitLeaseHolderChanges(ctx, stack.Namespace, leaseName, oldHolder, haFailoverTimeout)
+		if err != nil {
+			t.Fatalf("lease holder did not move after holder deletion: %v", err)
+		}
+		t.Logf("failover: lease holder moved %s -> %s", oldHolder, newHolder)
+
+		// wg0 bring-up trails the lease acquire, so allow the failover budget.
+		if err := waitPodHasWG0(ctx, t, client, stack.Namespace, newHolder, haFailoverTimeout); err != nil {
+			t.Fatalf("new holder %s did not bring up wg0 after failover: %v", newHolder, err)
+		}
+
+		// The until-probe absorbs the new holder's handshake and DNAT convergence,
+		// which can exceed the steady-state window, hence the edit budget.
+		after, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("data path did not resume after failover: %v", err)
+		}
+		assertBackendMarker(t, after, stack.TCPBackendName)
+	})
+
+	// rolling-update proves a link rollout keeps the data path serviceable: with
+	// maxUnavailable=0 and leader election the holder stays up until a replacement is
+	// Ready, so traffic tolerates at most a brief failover blip.
+	t.Run("rolling-update", func(t *testing.T) {
+		if err := client.RestartDeployment(ctx, stack.Namespace, leaseName); err != nil {
+			t.Fatalf("restart link deployment: %v", err)
+		}
+
+		// The until-probe tolerates a brief blip while leadership moves to a rolled
+		// pod, but must converge within the edit budget.
+		during, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("data path not serviceable across link rolling update: %v", err)
+		}
+		assertBackendMarker(t, during, stack.TCPBackendName)
+
+		if err := client.WaitDeploymentAvailable(ctx, stack.Namespace, leaseName, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("link deployment not available after rolling update: %v", err)
+		}
+
+		// The single-active invariant must survive the roll.
+		holder, owners := assertSingleWG0Owner(ctx, t, client, stack.Namespace, selector, leaseName)
+		if len(owners) != 1 || owners[0] != holder {
+			t.Fatalf("after rolling update, wg0 owners %v do not match lease holder %q", owners, holder)
+		}
+	})
+
+	// pdb-protects proves the link PodDisruptionBudget targets the link pods: the
+	// controller reports one disruption allowed, then one eviction succeeds. The
+	// status assertion catches the real failure mode, a selector matching no pods.
+	t.Run("pdb-protects", func(t *testing.T) {
+		if err := client.SetLinkReplicas(ctx, stack.Namespace, stack.GatewayName, haReplicas); err != nil {
+			t.Fatalf("rescale link to %d replicas: %v", haReplicas, err)
+		}
+		if err := client.WaitDeploymentAvailable(ctx, stack.Namespace, leaseName, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("link deployment not available before eviction: %v", err)
+		}
+
+		// A mismatched selector would leave the status at NoPods with no disruption
+		// allowed, which this assertion fails on.
+		if err := waitPDBProtects(ctx, t, client, stack.Namespace, leaseName, haReplicas, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("link PDB did not reach protected status: %v", err)
+		}
+
+		pods, err := client.PodNamesByLabel(ctx, stack.Namespace, selector)
+		if err != nil {
+			t.Fatalf("list link pods: %v", err)
+		}
+		if len(pods) < haReplicas {
+			t.Fatalf("link has %d pods, want >=%d before eviction test", len(pods), haReplicas)
+		}
+
+		// With DisruptionsAllowed==1 one eviction is within budget; a second
+		// back-to-back would race the controller's recompute, so the test does not.
+		if err := client.EvictPod(ctx, stack.Namespace, pods[0]); err != nil {
+			t.Fatalf("within-budget link pod eviction rejected (want allowed under minAvailable=1 with %d replicas): %v", haReplicas, err)
+		}
+	})
+}
+
+// linkSelector is the label selector matching a gateway's link pods, mirroring the
+// operator's unexported linkSelectorLabels.
+func linkSelector(gatewayName string) string {
+	return fmt.Sprintf("app.kubernetes.io/component=link,app.kubernetes.io/instance=%s", gatewayName)
+}
+
+// linkLeaseName is the Lease the link runs leader election over: <gateway>-link. It
+// mirrors the operator's unexported linkComponentName.
+func linkLeaseName(gatewayName string) string {
+	return gatewayName + "-link"
+}
+
+// assertSingleWG0Owner fails unless exactly one link replica owns wg0 and it is the
+// lease holder, returning the holder and the observed owners.
+func assertSingleWG0Owner(ctx context.Context, t *testing.T, client *hk8s.Client, ns, selector, leaseName string) (holder string, owners []string) {
+	t.Helper()
+	holder, err := client.GetLeaseHolder(ctx, ns, leaseName)
+	if err != nil {
+		t.Fatalf("read lease holder: %v", err)
+	}
+	if holder == "" {
+		t.Fatal("link lease has no holder; no active replica")
+	}
+	pods, err := client.PodNamesByLabel(ctx, ns, selector)
+	if err != nil {
+		t.Fatalf("list link pods: %v", err)
+	}
+	for _, pod := range pods {
+		if podHasWG0(ctx, t, client, ns, pod) {
+			owners = append(owners, pod)
+		}
+	}
+	if len(owners) != 1 {
+		t.Fatalf("wg0 owners = %v among link pods %v, want exactly one (the lease holder %q)", owners, pods, holder)
+	}
+	return holder, owners
+}
+
+// podHasWG0 reports whether the link pod has the wg0 interface, via `ip link show
+// wg0`. Only the active replica runs wg0, so this distinguishes the holder from a
+// fenced standby.
+func podHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string) bool {
+	t.Helper()
+	_, _, err := client.ExecInPod(ctx, ns, pod, []string{"ip", "link", "show", "wg0"})
+	return err == nil
+}
+
+// podHasGatewayTable reports whether the link pod has the inet gateway nftables
+// table. Only the active replica programs it, so a standby carrying it is a stale
+// data plane.
+func podHasGatewayTable(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string) bool {
+	t.Helper()
+	_, _, err := client.ExecInPod(ctx, ns, pod, []string{"nft", "list", "table", "inet", "gateway"})
+	return err == nil
+}
+
+// waitPodHasWG0 polls until the link pod has wg0 or the timeout elapses. The new
+// holder brings wg0 up only after acquiring leadership, so the failover assertion
+// gives that a bounded window rather than racing it.
+func waitPodHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string, timeout time.Duration) error {
+	t.Helper()
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		if podHasWG0(dctx, t, client, ns, pod) {
+			return nil
+		}
+		select {
+		case <-dctx.Done():
+			return fmt.Errorf("wg0 not present on %s/%s after %s", ns, pod, timeout)
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitPDBProtects polls the named PodDisruptionBudget until the controller computes
+// full protection (Expected/CurrentHealthy==replicas, DesiredHealthy==replicas-1,
+// DisruptionsAllowed==1), proving the selector matches; a bad selector stalls at NoPods.
+func waitPDBProtects(ctx context.Context, t *testing.T, client *hk8s.Client, ns, name string, replicas int32, timeout time.Duration) error {
+	t.Helper()
+	dctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	var last policyv1.PodDisruptionBudgetStatus
+	for {
+		status, err := client.GetPodDisruptionBudgetStatus(dctx, ns, name)
+		if err == nil {
+			last = status
+			if status.ExpectedPods == replicas && status.CurrentHealthy == replicas &&
+				status.DesiredHealthy == replicas-1 && status.DisruptionsAllowed == 1 {
+				return nil
+			}
+		}
+		select {
+		case <-dctx.Done():
+			return fmt.Errorf("pdb %s/%s status not protected after %s: %+v", ns, name, timeout, last)
+		case <-ticker.C:
+		}
+	}
+}
+
+// assertBackendMarker fails unless marker (an agnhost /hostname pod name) carries
+// backend as a prefix. The pod name is its Deployment's name plus a suffix, so the
+// prefix identifies which backend answered; a mismatch is a misrouted forward.
 func assertBackendMarker(t *testing.T, marker, backend string) {
 	t.Helper()
 	if marker == "" {
@@ -1035,11 +1164,9 @@ func assertBackendMarker(t *testing.T, marker, backend string) {
 	}
 }
 
-// appendForward appends f to the Gateway spec's forwards slice in the
-// unstructured shape the API server stores: each scalar is an int64 or string,
-// with namespace and targetPort included only when set. It mirrors the encoding
-// hk8s.CreateGateway uses so a spec edited here round-trips identically, including
-// omitting a zero targetPort (which the CRD's minimum=1 would otherwise reject).
+// appendForward appends f to the spec's forwards slice in the unstructured shape
+// the API server stores, mirroring hk8s.CreateGateway. namespace and targetPort are
+// included only when set; a zero targetPort would fail the CRD's minimum=1.
 func appendForward(spec map[string]any, f hk8s.GatewayForward) error {
 	existing, _ := spec["forwards"].([]any)
 	entry := map[string]any{
@@ -1057,11 +1184,9 @@ func appendForward(spec map[string]any, f hk8s.GatewayForward) error {
 	return nil
 }
 
-// removeForward drops the forward on the given public port from the Gateway spec's
-// forwards slice, the inverse of appendForward. It is a no-op when no forward uses
-// the port, so a scenario's cleanup is idempotent. Used to detach a lifecycle
-// subtest's dedicated forward so the firewall ports stay disjoint for later
-// probes.
+// removeForward drops the forward on the given public port, the inverse of
+// appendForward. It is a no-op when no forward uses the port, so cleanup is
+// idempotent.
 func removeForward(spec map[string]any, port int) error {
 	existing, _ := spec["forwards"].([]any)
 	kept := make([]any, 0, len(existing))
@@ -1080,9 +1205,8 @@ func removeForward(spec map[string]any, port int) error {
 	return nil
 }
 
-// setForwardTargetPort sets the targetPort of the forward on the given public port,
-// for the targetPort lifecycle subtest's correction step. It errors if no forward
-// uses the port, so a misaddressed edit fails loudly rather than silently no-op'ing.
+// setForwardTargetPort sets the targetPort of the forward on the given public port.
+// It errors if no forward uses the port, so a misaddressed edit fails loudly.
 func setForwardTargetPort(spec map[string]any, port, targetPort int) error {
 	existing, _ := spec["forwards"].([]any)
 	for _, raw := range existing {
@@ -1099,11 +1223,8 @@ func setForwardTargetPort(spec map[string]any, port, targetPort int) error {
 }
 
 // setForwardService retargets the forward on the given public port to a different
-// backend Service, for the forward-retarget subtest. A non-empty namespace sets
-// the cross-namespace target; an empty one deletes the key so the forward defaults
-// to the Gateway's own namespace, mirroring appendForward's optional-field
-// encoding. It errors if no forward uses the port, so a misaddressed edit fails
-// loudly rather than silently no-op'ing.
+// Service, erroring if none uses the port. A non-empty namespace sets a
+// cross-namespace target; an empty one clears it to default to the Gateway's namespace.
 func setForwardService(spec map[string]any, port int, service, namespace string) error {
 	existing, _ := spec["forwards"].([]any)
 	for _, raw := range existing {

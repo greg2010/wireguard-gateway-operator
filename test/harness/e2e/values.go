@@ -10,15 +10,9 @@ import (
 	"github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
 
-// operatorValues is the subset of the wireguard-gateway-operator chart values the
-// e2e overlay sets. It is written to a temp file and passed to helm as -f,
-// layered over the chart's own values.yaml. The chart installs the operator once
-// per cluster: the overlay sets the run's images and pins nameOverride so the
-// operator Deployment has a deterministic name the suite waits on. The operator is
-// always cluster-scoped, so the one operator reconciles Gateways in every test
-// namespace and the overlay sets no scope toggle. Every per-Gateway field (gcp
-// region/zone, forwards, dnsHostnames) is expressed on the Gateway CR the suite
-// creates, not here. WG params (incl. listenPort) keep their chart defaults.
+// operatorValues is the e2e overlay layered over the chart's values.yaml: it sets
+// the run's images and pins nameOverride for a deterministic Deployment name. Every
+// per-Gateway field lives on the Gateway CR, not here.
 type operatorValues struct {
 	NameOverride string        `yaml:"nameOverride"`
 	Operator     operatorBlock `yaml:"operator"`
@@ -38,11 +32,8 @@ type imageValues struct {
 	Tag        string `yaml:"tag"`
 }
 
-// valuesParams bundles the inputs that shape the once-per-cluster operator
-// overlay.
+// valuesParams bundles the inputs that shape the operator overlay.
 type valuesParams struct {
-	// nameOverride pins the chart name so the operator Deployment has a
-	// deterministic name the suite waits on after the single install.
 	nameOverride string
 	// operatorImage and linkImage are the run's freshly built, kind-loaded images.
 	operatorImage k8s.ImageRef

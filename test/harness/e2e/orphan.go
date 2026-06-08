@@ -13,31 +13,23 @@ import (
 	"github.com/greg2010/wireguard-gateway-operator/test/harness/shared"
 )
 
-// gcpAuth bundles the gcloud invocation context: the project and the
-// service-account key used to authenticate. Every gcloud call activates the key
-// inline so the orphan check does not depend on the operator's ambient gcloud
-// login.
+// gcpAuth bundles the project and service-account key for gcloud. Every call
+// activates the key inline so the orphan check never depends on an ambient login.
 type gcpAuth struct {
 	projectID string
 	credsFile string
 }
 
-// resourceCount is one resource family's residual count after teardown, used in
-// the orphan assertion's failure message.
+// resourceCount is one resource family's residual count after teardown.
 type resourceCount struct {
 	kind  string
 	count int
 	names string
 }
 
-// assertNoOrphans polls every GCP resource family the gateway provisions,
-// until all reach zero or the deadline elapses. A non-zero residual after the
-// deadline is returned as an error naming the leaked resources.
-//
-// The compute resources (network, subnet, firewall, address, instance) inherit
-// the XR name and so match the run's namePrefix. The operator-derived GCP
-// ServiceAccount and Secret-Manager Secret instead carry the hash-derived gw-
-// ID, which never begins with namePrefix; they are matched by that derived ID.
+// assertNoOrphans polls every GCP resource family the gateway provisions until all
+// reach zero or the deadline elapses, returning an error naming any leak. Compute
+// resources match namePrefix; the operator-derived SA and Secret match the gw- ID.
 func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, namePrefix string, timeout time.Duration, log *zap.Logger) error {
 	derivedID := gcpID(namespace, gatewayName)
 	start := time.Now()
@@ -67,13 +59,9 @@ func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, 
 	}
 }
 
-// serialConsoleOutput returns the gateway VM's serial-port-1 console output,
-// where the keyfetch boot unit logs (it writes to journal+console). It resolves
-// the instance by namePrefix, the run-unique prefix every compute resource
-// inherits, and reads the console via gcloud. It is best-effort diagnostics: a
-// missing instance (already drained, or never created) yields a descriptive
-// string rather than an error, so a failed handshake whose VM is gone still
-// surfaces whatever booted.
+// serialConsoleOutput returns the gateway VM's serial-port-1 console output, where
+// the keyfetch boot unit logs. It is best-effort diagnostics: a missing instance
+// yields a descriptive string rather than an error.
 func serialConsoleOutput(ctx context.Context, auth gcpAuth, zone, namePrefix string) (string, error) {
 	names, err := listNames(ctx, auth,
 		[]string{"compute", "instances", "list"}, "name~^"+namePrefix, "name")
@@ -96,10 +84,8 @@ func serialConsoleOutput(ctx context.Context, auth gcpAuth, zone, namePrefix str
 	return out, nil
 }
 
-// gcpID replicates the operator's gcpID in
-// internal/controller/builders.go byte-for-byte; it is unexported there, so the
-// harness must duplicate it to match the SA/secret external-names the operator
-// derives.
+// gcpID replicates the operator's unexported gcpID byte-for-byte so the harness
+// matches the SA/secret external-names the operator derives.
 func gcpID(namespace, name string) string {
 	sum := sha256.Sum256([]byte(namespace + "/" + name))
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
@@ -110,20 +96,16 @@ func gcpID(namespace, name string) string {
 	return id
 }
 
-// countResources queries each GCP resource family the gateway provisions and
-// returns the per-family counts. Compute resources are matched against
-// namePrefix; the operator-derived ServiceAccount and Secret are matched
-// against derivedID, the hash external-name the operator assigns them.
+// countResources returns the per-family counts of every GCP resource family the
+// gateway provisions. Compute resources match namePrefix; the operator-derived
+// ServiceAccount and Secret match derivedID.
 func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID string) ([]resourceCount, error) {
 	queries := []struct {
-		kind string
-		args []string
-		// nameFilter is the gcloud --filter expression selecting this family's
-		// run-owned resources by its identifying field.
+		kind       string
+		args       []string
 		nameFilter string
-		// field is the resource attribute gcloud emits per match. It is the
-		// attribute nameFilter also matches against, so the count and the names
-		// in the failure message stay consistent.
+		// field is the attribute gcloud emits per match and the one nameFilter
+		// matches against, so the count and the reported names stay consistent.
 		field string
 	}{
 		{"instance", []string{"compute", "instances", "list"}, "name~^" + namePrefix, "name"},
@@ -147,9 +129,7 @@ func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID str
 }
 
 // listNames runs `gcloud <args> --filter=<f> --format='value(<field>)'` with the
-// run's project and key, returning the non-empty result lines. field is the
-// resource attribute the filter matches against, so the emitted values name
-// exactly the matched resources.
+// run's project and key, returning the non-empty result lines.
 func listNames(ctx context.Context, auth gcpAuth, args []string, filter, field string) ([]string, error) {
 	full := append([]string{}, args...)
 	full = append(full,
@@ -175,10 +155,9 @@ func listNames(ctx context.Context, auth gcpAuth, args []string, filter, field s
 // starve the teardown drain; it fails fast so the caller can surface or retry.
 const gcloudCallTimeout = 30 * time.Second
 
-// runGcloud invokes gcloud with the service-account key activated for the call
-// via CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE, so it does not mutate the
-// operator's active gcloud configuration. Each call is bounded by
-// gcloudCallTimeout so a single slow invocation cannot hang the suite.
+// runGcloud invokes gcloud with the service-account key activated per call via
+// CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE, so it does not mutate the operator's
+// active gcloud configuration. Each call is bounded by gcloudCallTimeout.
 func runGcloud(ctx context.Context, auth gcpAuth, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, gcloudCallTimeout)
 	defer cancel()

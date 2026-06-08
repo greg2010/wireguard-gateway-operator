@@ -1,13 +1,6 @@
 // Package linkint exercises the link daemon's rendered nftables ruleset against a
-// real nft binary inside a container, proving the document the daemon pipes to
-// `nft -f -` behaves as the in-place reload path assumes: it is self-replacing
-// (re-applying never accumulates duplicate rules) and dropping a forward removes
-// its DNAT rule.
-//
-// The test renders with internal/link.RenderNftables (the exact bytes the daemon
-// loads) and applies them with `nft -f`, the same atomic transaction the daemon
-// uses. It is self-contained: it stands up its own container and imports no test
-// harness.
+// real nft binary in a container, asserting the document is self-replacing and that
+// dropping a forward removes its DNAT rule.
 package linkint
 
 import (
@@ -26,20 +19,15 @@ import (
 )
 
 const (
-	// nftImage ships nft via apk; it is pinned so the netns programming under
-	// test runs against a known nftables build.
+	// nftImage is pinned so the netns programming runs against a known nftables build.
 	nftImage = "alpine:3.20"
 
-	// rulesetPath is where the rendered document is copied before `nft -f` loads
-	// it. Exec cannot pipe stdin, so the file stands in for `nft -f -`; the
+	// rulesetPath stands in for `nft -f -` because exec cannot pipe stdin; the
 	// transaction nft runs is identical.
 	rulesetPath = "/tmp/ruleset.nft"
 
-	// containerStartTimeout bounds bringing the container up.
 	containerStartTimeout = 2 * time.Minute
-
-	// execTimeout bounds a single nft/apk exec.
-	execTimeout = 30 * time.Second
+	execTimeout           = 30 * time.Second
 )
 
 func TestNftablesApplyIsSelfReplacing(t *testing.T) {
@@ -94,16 +82,9 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	}
 }
 
-// TestNftablesRetargetReplacesClusterIP models an e2e forward retarget: a forward
-// on a fixed public port and protocol is repointed from one Service to another
-// (same port, different target Service, hence a different ClusterIP). It applies
-// the forward resolving to ClusterIP_A, captures the kernel ruleset, then applies
-// the SAME forward resolving to ClusterIP_B and captures again, asserting the
-// second ruleset DNATs the port to B and accepts daddr B, carries no rule
-// referencing A, and still programs exactly one forward. This reproduces the
-// link's in-place reload contract on a retarget at the real-nft level, so a stale
-// A rule surviving (or the DNAT and companion accept rule diverging) would surface
-// here as a blackhole the link is responsible for.
+// TestNftablesRetargetReplacesClusterIP repoints a forward from ClusterIP_A to
+// ClusterIP_B and asserts the ruleset DNATs and accepts B, references A nowhere, and
+// programs exactly one forward, so a stale or diverging rule surfaces as a blackhole.
 func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -159,9 +140,8 @@ func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 }
 
 // startNftContainer brings up the pinned image, installs nft, and returns the
-// running container. NET_ADMIN lets nft program the container netns; Privileged
-// is set as a fallback for runtimes that do not honor the capability add alone.
-// The container is terminated when t finishes.
+// running container, terminated when t finishes. NET_ADMIN lets nft program the
+// netns; Privileged is a fallback for runtimes that ignore the capability add.
 func startNftContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 
@@ -188,8 +168,8 @@ func startNftContainer(ctx context.Context, t testing.TB) testcontainers.Contain
 	return ctr
 }
 
-// installPackages installs nft and the ip tooling used to stand up wg0. An apk
-// failure is a real failure of the test environment, not a reason to skip.
+// installPackages installs nft and the ip tooling. An apk failure is a real
+// environment failure, not a reason to skip.
 func installPackages(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	code, out := execInContainer(ctx, t, ctr, "apk", "add", "--no-cache", "nftables", "iproute2")
@@ -198,11 +178,9 @@ func installPackages(ctx context.Context, t testing.TB, ctr testcontainers.Conta
 	}
 }
 
-// createWG0 adds a dummy wg0 interface so the ruleset loads. The rendered rules
-// match the WireGuard interface by name with `iif "wg0"`, which nft resolves to
-// an interface index at load time and rejects when the interface is absent. In
-// production Apply creates wg0 before loading nft; the dummy interface reproduces
-// that precondition without a real WireGuard tunnel.
+// createWG0 adds a dummy wg0 so the ruleset loads: the rules match `iif "wg0"`,
+// which nft resolves to an interface index at load time and rejects when absent. It
+// reproduces production's precondition without a real WireGuard tunnel.
 func createWG0(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	code, out := execInContainer(ctx, t, ctr, "ip", "link", "add", "wg0", "type", "dummy")
@@ -262,24 +240,21 @@ func execInContainer(ctx context.Context, t testing.TB, ctr testcontainers.Conta
 	return code, string(out)
 }
 
-// countDNATRules counts the DNAT rule lines in an `nft list table` dump. Every
-// forward renders exactly one `dnat ip to` line in the prerouting chain, so the
-// count equals the number of forwards currently programmed.
+// countDNATRules counts the DNAT rule lines in an `nft list table` dump. Each
+// forward renders exactly one, so the count equals the forwards programmed.
 func countDNATRules(listing string) int {
 	return strings.Count(listing, "dnat ip to")
 }
 
-// dnatRuleFor returns the prerouting DNAT statement RenderNftables emits for f,
-// as it appears in `nft list table` output, used to assert a specific forward's
-// presence or absence.
+// dnatRuleFor returns the prerouting DNAT statement RenderNftables emits for f, as
+// it appears in `nft list table` output.
 func dnatRuleFor(f link.ResolvedForward) string {
 	return fmt.Sprintf("%s dport %d dnat ip to %s:%d", f.Protocol, f.PublicPort, f.ClusterIP, f.TargetPort)
 }
 
-// acceptRuleFor returns the forward-chain accept statement RenderNftables emits
-// for f, as it appears in `nft list table` output. The forward filter matches the
-// post-DNAT destination, so the rule keys on the resolved ClusterIP and target
-// port; a retarget must move it to the new ClusterIP in lockstep with the DNAT.
+// acceptRuleFor returns the forward-chain accept statement RenderNftables emits for
+// f. It keys on the post-DNAT destination (ClusterIP and target port), so a retarget
+// must move it in lockstep with the DNAT.
 func acceptRuleFor(f link.ResolvedForward) string {
 	return fmt.Sprintf("iif \"wg0\" ip daddr %s %s dport %d accept", f.ClusterIP, f.Protocol, f.TargetPort)
 }

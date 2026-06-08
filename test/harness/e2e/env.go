@@ -1,10 +1,6 @@
-// Package e2e wires the gateway end-to-end harness: a kind cluster, the Crossplane
-// core + GCP/Kubernetes providers, and the gateway chart provisioning a real GCP
-// gateway. The data-path test forwards an in-cluster echo Service through the
-// gateway and asserts the gateway's public IP is reachable from the host.
-//
-// The suite only runs when GATEWAY_E2E is set (the TestMain gate enforces this);
-// it talks to a real GCP project and is not part of `go test ./...`.
+// Package e2e wires the gateway end-to-end harness: a kind cluster, Crossplane core
+// plus the GCP/Kubernetes providers, and the gateway chart provisioning a real GCP
+// gateway. It runs only under GATEWAY_E2E and is not part of `go test ./...`.
 package e2e
 
 import (
@@ -18,29 +14,22 @@ import (
 // Env holds the GCP configuration the suite reads from the process
 // environment. `make test-e2e` (and the operator) source these from .env.
 type Env struct {
-	// ProjectID is the GCP project that owns the gateway VM, its network, and
-	// its Secret Manager secret.
+	// ProjectID is the GCP project that owns the gateway VM, its network, and its
+	// Secret Manager secret.
 	ProjectID string
-	// Region is the compute region for the subnet and any reserved address.
-	Region string
-	// Zone is the compute zone the gateway instance boots in.
-	Zone string
-	// CredsFile is the filesystem path to the provider-gcp service-account
-	// JSON key. The harness loads it into the cluster as the crossplane creds
-	// Secret.
+	Region    string
+	Zone      string
+	// CredsFile is the path to the provider-gcp service-account JSON key, loaded
+	// into the cluster as the crossplane creds Secret.
 	CredsFile string
-	// CredsNamespace is the namespace the creds Secret is created in.
-	// Defaults to crossplane-system.
+	// CredsNamespace is the creds Secret's namespace. Defaults to crossplane-system.
 	CredsNamespace string
-	// CredsSecret is the name of the creds Secret crossplane-config consumes.
-	// Defaults to gcp-creds.
+	// CredsSecret is the creds Secret name crossplane-config consumes. Defaults to
+	// gcp-creds.
 	CredsSecret string
-	// Keep, when true, skips all teardown (kind cluster delete, helm uninstall,
-	// namespace deletes, and the GCP-resource drain) so the cluster and the GCP
-	// gateway VM survive a run for live debugging, regardless of pass or fail.
-	// Set via GATEWAY_E2E_KEEP. Unlike GATEWAY_E2E_PRESERVE it does not gate on
-	// failure, so it leaks the GCP VM until manually drained; use it only for
-	// interactive iteration, never in CI.
+	// Keep skips all teardown so the cluster and GCP VM survive for debugging. Unlike
+	// GATEWAY_E2E_PRESERVE it does not gate on failure, so it leaks the VM until drained
+	// by hand; never use in CI.
 	Keep bool
 }
 
@@ -65,14 +54,9 @@ const (
 	defaultCredsSecret    = "gcp-creds"
 )
 
-// RequireEnv reads the GCP configuration from the environment and returns an
-// error naming the missing or invalid variables if any required variable is
-// unset or the creds file does not exist. It is called after the TestMain
-// GATEWAY_E2E gate, so reaching it with an unset variable is an operator
-// misconfiguration, not a skip condition; the caller propagates the error so
-// every opted-in test fails cleanly rather than skipping. It must not fail the
-// test directly: it runs inside a sync.Once, where runtime.Goexit from a
-// t.Fatal would abandon the once without recording a result.
+// RequireEnv reads the GCP configuration, returning an error naming any missing or
+// invalid variables. It returns the error rather than t.Fatal because it runs inside
+// a sync.Once, where runtime.Goexit would abandon the once without a result.
 func RequireEnv() (Env, error) {
 	env := Env{
 		ProjectID:      os.Getenv(envProjectID),
@@ -106,9 +90,8 @@ func RequireEnv() (Env, error) {
 			"(source them from .env; see .env.example)", missing)
 	}
 
-	// Resolve a relative creds path against the repo root rather than the test's
-	// working directory, so a direct `go test ./test/e2e/...` from the package dir
-	// reaches the same file `make test-e2e` does from the repo root.
+	// Resolve a relative creds path against the repo root, not the test's working
+	// directory, so direct `go test` and `make test-e2e` reach the same file.
 	if !filepath.IsAbs(env.CredsFile) {
 		env.CredsFile = filepath.Join(shared.RepoRoot(), env.CredsFile)
 	}
