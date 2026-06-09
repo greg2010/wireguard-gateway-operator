@@ -190,6 +190,7 @@ spec:
       provisioningModel: SPOT
       preemptible: true
       automaticRestart: false
+      onHostMaintenance: TERMINATE
     {{- end }}
   providerConfigRef:
     name: default

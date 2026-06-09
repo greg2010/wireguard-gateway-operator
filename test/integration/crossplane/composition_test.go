@@ -330,6 +330,12 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got := nestedBool(t, inst, "spec", "forProvider", "scheduling", "preemptible"); !got {
 					t.Errorf("instance scheduling.preemptible = false, want true under spot")
 				}
+				if got := nestedString(t, inst, "spec", "forProvider", "scheduling", "onHostMaintenance"); got != "TERMINATE" {
+					t.Errorf("instance scheduling.onHostMaintenance = %q, want TERMINATE", got)
+				}
+				if nestedBool(t, inst, "spec", "forProvider", "scheduling", "automaticRestart") {
+					t.Errorf("instance scheduling.automaticRestart = true, want false under spot")
+				}
 			},
 		},
 		{
