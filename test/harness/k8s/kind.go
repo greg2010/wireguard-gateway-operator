@@ -19,13 +19,11 @@ import (
 // e2eClusterName is the kind cluster the e2e suite provisions.
 const e2eClusterName = "gateway-e2e"
 
-// kubeletConfigPatch tunes the node kubelet for the link pod: allowedUnsafeSysctls
-// admits net.ipv4.ip_forward, and Watch detection plus a 10s sync floor caps the
-// mounted-ConfigMap lag so a post-Ready forward edit reaches the link in time.
+// kubeletConfigPatch tunes the node kubelet for the link pod: Watch detection plus a
+// 10s sync floor caps the mounted-ConfigMap lag so a post-Ready forward edit reaches
+// the link in time.
 const kubeletConfigPatch = `apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
-allowedUnsafeSysctls:
-- "net.ipv4.ip_forward"
 syncFrequency: 10s
 configMapAndSecretChangeDetectionStrategy: Watch
 `

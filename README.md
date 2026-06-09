@@ -82,6 +82,7 @@ Gateway-VM provisioning is backend-specific, and only GCP exists today.
 | Requirement | Notes | Docs |
 | --- | --- | --- |
 | Kubernetes cluster + kubectl | Any conformant cluster; typically one that cannot expose its own LoadBalancer. | [kubectl](https://kubernetes.io/docs/tasks/tools/) |
+| Privileged pods in gateway namespaces | The link pod runs a privileged init container to enable IPv4 forwarding; the namespace where you create a Gateway must not enforce restricted/baseline PodSecurity (label it `pod-security.kubernetes.io/enforce: privileged` if your cluster defaults to enforcement). | [Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/) |
 | Helm | Installs Crossplane core and the operator chart. | [Helm](https://helm.sh/docs/intro/install/) |
 | Crossplane | Installed in the cluster; realizes the gateway VM composition. | [Crossplane install](https://docs.crossplane.io/latest/get-started/install/) |
 | GCP provider (installed) | The Upbound provider-gcp packages, installed via Crossplane's package mechanism. | [Crossplane providers](https://docs.crossplane.io/latest/packages/providers/) |

@@ -705,33 +705,33 @@ func TestBuildLinkDeployment(t *testing.T) {
 	}
 
 	podSpec := dep.Spec.Template.Spec
-	if len(podSpec.InitContainers) != 0 {
-		t.Errorf("init containers = %d, want 0", len(podSpec.InitContainers))
+
+	// IP forwarding is enabled by a privileged init container writing the shared pod
+	// netns, not a kubelet-allowlisted pod sysctl.
+	if len(podSpec.InitContainers) != 1 {
+		t.Fatalf("init containers = %d, want 1", len(podSpec.InitContainers))
+	}
+	ic := podSpec.InitContainers[0]
+	if ic.Image != cfg.LinkImage {
+		t.Errorf("init container image = %q, want %q", ic.Image, cfg.LinkImage)
+	}
+	if !strings.Contains(strings.Join(ic.Command, " "), "echo 1 > /proc/sys/net/ipv4/ip_forward") {
+		t.Errorf("init container command = %v, want it to enable forwarding via echo 1 > /proc/sys/net/ipv4/ip_forward", ic.Command)
+	}
+	if ic.SecurityContext == nil || ic.SecurityContext.Privileged == nil || !*ic.SecurityContext.Privileged {
+		t.Errorf("init container privileged = %+v, want true", ic.SecurityContext)
+	}
+	if ic.SecurityContext == nil || ic.SecurityContext.RunAsUser == nil || *ic.SecurityContext.RunAsUser != 0 {
+		t.Errorf("init container runAsUser = %+v, want 0", ic.SecurityContext)
 	}
 
-	// IP forwarding is enabled by the kubelet via the pod-level sysctl, not a
-	// privileged init container or a /proc write.
-	if podSpec.SecurityContext == nil {
-		t.Fatal("pod securityContext = nil, want sysctls")
-	}
-	wantSysctl := corev1.Sysctl{Name: "net.ipv4.ip_forward", Value: "1"}
-	if !slices.Contains(podSpec.SecurityContext.Sysctls, wantSysctl) {
-		t.Errorf("pod sysctls = %+v, want to contain %+v", podSpec.SecurityContext.Sysctls, wantSysctl)
+	if podSpec.SecurityContext != nil && len(podSpec.SecurityContext.Sysctls) != 0 {
+		t.Errorf("pod sysctls = %+v, want none", podSpec.SecurityContext.Sysctls)
 	}
 
-	// No container, init or main, may be privileged.
-	privilegeChecks := []struct {
-		group      string
-		containers []corev1.Container
-	}{
-		{"init", podSpec.InitContainers},
-		{"main", podSpec.Containers},
-	}
-	for _, pc := range privilegeChecks {
-		for _, ctr := range pc.containers {
-			if ctr.SecurityContext != nil && ctr.SecurityContext.Privileged != nil && *ctr.SecurityContext.Privileged {
-				t.Errorf("%s container %q is privileged, want not privileged", pc.group, ctr.Name)
-			}
+	for _, ctr := range podSpec.Containers {
+		if ctr.SecurityContext != nil && ctr.SecurityContext.Privileged != nil && *ctr.SecurityContext.Privileged {
+			t.Errorf("main container %q is privileged, want not privileged", ctr.Name)
 		}
 	}
 

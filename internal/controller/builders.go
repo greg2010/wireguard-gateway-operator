@@ -570,12 +570,14 @@ func linkSelectorLabels(gw *wgnetv1alpha1.Gateway) map[string]string {
 }
 
 // buildLinkDeployment builds the link Deployment: root with NET_ADMIN to own wg0 and
-// nftables, leader-elected active-passive so RollingUpdate is safe at any replica
-// count. net.ipv4.ip_forward is a pod-level sysctl nodes must allowlist as unsafe.
+// nftables, leader-elected active-passive so RollingUpdate is safe at any replica count.
+// A privileged init container enables net.ipv4.ip_forward in the shared pod netns, so
+// nodes need no unsafe-sysctl allowlist.
 func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployment {
 	replicas := effectiveLinkReplicas(gw)
 	var runAsUser int64
 	allowPrivilegeEscalation := false
+	privileged := true
 	selector := linkSelectorLabels(gw)
 
 	// maxUnavailable=0 keeps a programmed pod alive throughout a roll; maxSurge=1
@@ -620,9 +622,6 @@ func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployme
 					ServiceAccountName:            linkComponentName(gw),
 					AutomountServiceAccountToken:  new(true),
 					TerminationGracePeriodSeconds: &terminationGracePeriod,
-					SecurityContext: &corev1.PodSecurityContext{
-						Sysctls: []corev1.Sysctl{{Name: "net.ipv4.ip_forward", Value: "1"}},
-					},
 					Affinity: &corev1.Affinity{
 						PodAntiAffinity: &corev1.PodAntiAffinity{
 							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
@@ -634,6 +633,16 @@ func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployme
 							}},
 						},
 					},
+					InitContainers: []corev1.Container{{
+						Name:            "enable-ip-forward",
+						Image:           cfg.LinkImage,
+						ImagePullPolicy: corev1.PullPolicy(cfg.LinkImagePullPolicy),
+						Command:         []string{"sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"},
+						SecurityContext: &corev1.SecurityContext{
+							RunAsUser:  &runAsUser,
+							Privileged: &privileged,
+						},
+					}},
 					Containers: []corev1.Container{{
 						Name:            componentLink,
 						Image:           cfg.LinkImage,
