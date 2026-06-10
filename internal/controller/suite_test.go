@@ -1,13 +1,17 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -15,6 +19,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/yaml"
 
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
@@ -22,10 +27,12 @@ import (
 // testEnv bundles a running envtest control plane and a client wired to the
 // operator's scheme, shared by the controller tests in this package.
 type testEnv struct {
-	env    *envtest.Environment
-	cfg    *rest.Config
-	client client.Client
-	scheme *runtime.Scheme
+	env            *envtest.Environment
+	cfg            *rest.Config
+	client         client.Client
+	scheme         *runtime.Scheme
+	operatorCfg    *rest.Config
+	operatorClient client.Client
 }
 
 // gatewayCRDPath is the controller-gen-emitted Gateway CRD, loaded into the test
@@ -73,6 +80,103 @@ func setupEnvtest(t *testing.T) *testEnv {
 	}
 
 	return &testEnv{env: env, cfg: cfg, client: c, scheme: scheme}
+}
+
+// setupEnvtestRBAC starts an envtest control plane (via setupEnvtest) and binds the
+// operator's generated ClusterRole to a real client-certificate identity, exposing
+// te.operatorClient / te.operatorCfg authenticated as it. Reconciler tests use the operator
+// client so the reconcile is authorized exactly as the deployed operator is; harness writes
+// keep te.client (system:masters).
+func setupEnvtestRBAC(t *testing.T) *testEnv {
+	t.Helper()
+	te := setupEnvtest(t)
+	ctx := context.Background()
+
+	role := loadOperatorClusterRole(t)
+	if err := te.client.Create(ctx, role); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create operator ClusterRole: %v", err)
+	}
+
+	const operatorUser = "wireguard-gateway-operator-test"
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: operatorUser},
+		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: role.Name},
+		Subjects:   []rbacv1.Subject{{Kind: "User", Name: operatorUser, APIGroup: "rbac.authorization.k8s.io"}},
+	}
+	if err := te.client.Create(ctx, binding); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create operator ClusterRoleBinding: %v", err)
+	}
+
+	// Mint a real client-certificate identity so tests authenticate via the operator's
+	// actual auth path rather than an impersonation header.
+	user, err := te.env.AddUser(envtest.User{Name: operatorUser, Groups: []string{"system:authenticated"}}, te.cfg)
+	if err != nil {
+		t.Fatalf("add operator user: %v", err)
+	}
+	opCfg := user.Config()
+	opClient, err := client.New(opCfg, client.Options{Scheme: te.scheme})
+	if err != nil {
+		t.Fatalf("build operator client: %v", err)
+	}
+	te.operatorCfg = opCfg
+	te.operatorClient = opClient
+
+	waitOperatorRBAC(ctx, t, opClient)
+	return te
+}
+
+// loadOperatorClusterRole decodes the generated operator ClusterRole from the chart so
+// the test binds exactly the shipped permission set (a dropped verb fails these tests).
+func loadOperatorClusterRole(t *testing.T) *rbacv1.ClusterRole {
+	t.Helper()
+	path := filepath.Join("..", "..", "k8s", "charts", "wireguard-gateway-operator", "templates", "role.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read operator role.yaml: %v", err)
+	}
+	// role.yaml is static controller-gen output; templating it would make Unmarshal
+	// bind a role that diverges from what ships.
+	if bytes.Contains(data, []byte("{{")) {
+		t.Fatalf("operator role.yaml is Helm-templated; loadOperatorClusterRole must render the chart before binding")
+	}
+	role := &rbacv1.ClusterRole{}
+	if err := yaml.Unmarshal(data, role); err != nil {
+		t.Fatalf("unmarshal operator role.yaml: %v", err)
+	}
+	role.ResourceVersion = ""
+	return role
+}
+
+const rbacPropagationTimeout = 15 * time.Second
+
+// waitOperatorRBAC blocks until the apiserver authorizer reflects the binding so the first
+// reconcile does not race RBAC propagation. It probes a verb the operator always holds; since
+// the role and binding are single objects, one authorized verb means the whole binding is live.
+func waitOperatorRBAC(ctx context.Context, t *testing.T, opClient client.Client) {
+	t.Helper()
+	pollUntil(ctx, t, rbacPropagationTimeout, "operator RBAC propagation (gateways/list allowed)", func() bool {
+		ssar := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Group: "wgnet.dev", Resource: "gateways", Verb: "list",
+				},
+			},
+		}
+		err := opClient.Create(ctx, ssar)
+		return err == nil && ssar.Status.Allowed
+	})
+}
+
+// newOperatorReconciler wires r's Client and APIReader to the RBAC-scoped operator client
+// so reconcile actions run under the operator's real permissions. Centralized so no call
+// site can accidentally keep the admin client.
+func newOperatorReconciler(te *testEnv, r GatewayReconciler) *GatewayReconciler {
+	r.Client = te.operatorClient
+	r.APIReader = te.operatorClient
+	if r.Scheme == nil {
+		r.Scheme = te.scheme
+	}
+	return &r
 }
 
 // preserveUnknownProps is the open object schema the minimal CRDs use so the

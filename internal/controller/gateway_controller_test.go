@@ -86,7 +86,7 @@ func sampleGateway(name, namespace string) *wgnetv1alpha1.Gateway {
 // client cannot model, is why these tests need a real control plane.
 func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReconciler, *wgnetv1alpha1.Gateway, client.ObjectKey, *int) {
 	t.Helper()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "wg-system"}}
 	if err := te.client.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
@@ -111,13 +111,7 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 	}
 
 	gen, calls := countingKeyGen()
-	r := &GatewayReconciler{
-		Client:      te.client,
-		APIReader:   te.client,
-		Scheme:      te.scheme,
-		Config:      reconcileConfig(),
-		GenerateKey: gen,
-	}
+	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 	return te, r, gw, client.ObjectKeyFromObject(gw), calls
 }
 
@@ -400,7 +394,7 @@ func reconcileUntilGone(ctx context.Context, t *testing.T, r *GatewayReconciler,
 // deleting the second (the last) tears it down.
 func TestReconcileSharedNetworkRefcount(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	cl := te.client
 
 	const ns = "wg-system"
@@ -409,7 +403,7 @@ func TestReconcileSharedNetworkRefcount(t *testing.T) {
 	mustCreate(ctx, t, cl, portedClusterIPService(ns, "vpn", 1194, corev1.ProtocolUDP))
 
 	gen, _ := countingKeyGen()
-	r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 	gw1 := sampleGateway("gw-one", ns)
 	gw2 := sampleGateway("gw-two", ns)
@@ -694,7 +688,7 @@ func headlessService(ns, name string) *corev1.Service {
 // provisions nothing, and transient reasons requeue rather than fail.
 func TestClassifyForwards(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	cl := te.client
 
 	type outcome struct {
@@ -818,7 +812,7 @@ func TestClassifyForwards(t *testing.T) {
 			mustCreate(ctx, t, cl, gw)
 
 			gen, _ := countingKeyGen()
-			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 			key := client.ObjectKeyFromObject(gw)
 
 			result := reconcileToClassification(ctx, t, r, key)
@@ -1047,7 +1041,7 @@ func (f *fakeEventRecorder) Eventf(regarding runtime.Object, _ runtime.Object, e
 // recorder is nil.
 func TestReconcilerFailEmitsEvent(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	cl := te.client
 
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "wg-system"}}
@@ -1069,7 +1063,7 @@ func TestReconcilerFailEmitsEvent(t *testing.T) {
 			mustCreate(ctx, t, cl, gw)
 
 			rec := &fakeEventRecorder{}
-			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig()}
+			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig()})
 			if tt.withRecorder {
 				r.Recorder = rec
 			}
@@ -1151,7 +1145,7 @@ func forwardServiceNames(forwards []link.Forward) []string {
 // Ready=False with the invalid forward's reason (a missing backend, ServiceNotFound).
 func TestMixedForwards(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	cl := te.client
 
 	const ns = "mixed"
@@ -1165,7 +1159,7 @@ func TestMixedForwards(t *testing.T) {
 	mustCreate(ctx, t, cl, gw)
 
 	gen, _ := countingKeyGen()
-	r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 	key := client.ObjectKeyFromObject(gw)
 
 	result := reconcileToClassification(ctx, t, r, key)
@@ -1203,7 +1197,7 @@ func TestMixedForwards(t *testing.T) {
 // pod, so a Ready idle standby must not mask a holder that is not Ready.
 func TestLinkActiveReadyGate(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	cl := te.client
 
 	tests := []struct {
@@ -1265,7 +1259,7 @@ func TestLinkActiveReadyGate(t *testing.T) {
 			key := client.ObjectKeyFromObject(gw)
 
 			gen, _ := countingKeyGen()
-			r := &GatewayReconciler{Client: cl, APIReader: cl, Scheme: te.scheme, Config: reconcileConfig(), GenerateKey: gen}
+			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 			// Provision the Gateway, then give the composite an address so the address
 			// gate is satisfied and the Ready outcome turns solely on the active tunnel.
@@ -1304,7 +1298,7 @@ func TestLinkActiveReadyGate(t *testing.T) {
 func startManager(ctx context.Context, t *testing.T, te *testEnv) client.Client {
 	t.Helper()
 
-	mgr, err := ctrl.NewManager(te.cfg, ctrl.Options{
+	mgr, err := ctrl.NewManager(te.operatorCfg, ctrl.Options{
 		Scheme: te.scheme,
 		// Disable the metrics listener so parallel managers in one test binary do
 		// not contend for a port.
@@ -1412,7 +1406,7 @@ func driveProvisionedReady(ctx context.Context, t *testing.T, direct client.Clie
 // Ready condition reconverge without a manual reconcile. Reads use the direct client.
 func TestForwardValidationTransitions(t *testing.T) {
 	ctx := context.Background()
-	te := setupEnvtest(t)
+	te := setupEnvtestRBAC(t)
 	direct := te.client
 	startManager(ctx, t, te)
 
