@@ -80,6 +80,7 @@ rules:
   verbs:
   - create
   - get
+  - patch
   - update
 - apiGroups:
   - infra.wgnet.dev
