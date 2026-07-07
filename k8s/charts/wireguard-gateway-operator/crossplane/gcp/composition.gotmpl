@@ -173,6 +173,11 @@ spec:
       {{- end }}
       disable-legacy-endpoints: "true"
       block-project-ssh-keys: "true"
+      {{- if dig "enableOsLogin" true $spec }}
+      enable-oslogin: "TRUE"
+      {{- else }}
+      enable-oslogin: "FALSE"
+      {{- end }}
     networkInterface:
       - network: {{ $spec.sharedNetworkName | quote }}
         accessConfig:

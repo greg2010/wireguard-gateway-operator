@@ -129,6 +129,7 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 		ProjectID:         &projectID,
 		ReservedIP:        &reservedIP,
 		Spot:              &spot,
+		EnableOsLogin:     new(cfg.EnableOSLogin),
 		ServiceAccountId:  &id,
 		SecretId:          &id,
 		WgKeySecretRef: &struct {

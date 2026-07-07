@@ -19,6 +19,10 @@ type Config struct {
 	// per-Gateway value is read from instance metadata at boot. Empty omits the field.
 	UserData string `envconfig:"GATEWAY_USER_DATA"`
 
+	// EnableOSLogin turns GCP OS Login on for every gateway VM, gating SSH access
+	// through IAM rather than instance metadata keys. Defaults on.
+	EnableOSLogin bool `envconfig:"GATEWAY_ENABLE_OSLOGIN" default:"true"`
+
 	// RequeueInterval is how often the reconciler re-polls the XGatewayGCP status,
 	// since the composite's status is not watched in realtime.
 	RequeueInterval time.Duration `envconfig:"GATEWAY_REQUEUE_INTERVAL" default:"30s"`

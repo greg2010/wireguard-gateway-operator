@@ -41,6 +41,8 @@ operator:
   logLevel: info
   # Emit structured JSON logs (zap production encoder). Maps PROD_LOG_FORMAT.
   jsonLog: true
+  # Enable GCP OS Login on gateway VMs (SSH access governed by IAM). Maps GATEWAY_ENABLE_OSLOGIN.
+  enableOsLogin: true
   resources:
     requests:
       cpu: 50m

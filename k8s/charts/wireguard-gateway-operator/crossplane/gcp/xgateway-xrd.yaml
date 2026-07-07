@@ -25,6 +25,7 @@ spec:
                 image: { type: string }
                 diskSizeGB: { type: integer }
                 spot: { type: boolean }
+                enableOsLogin: { type: boolean }
                 userData: { type: string }
                 sharedNetworkName: { type: string }
                 reservedIP: { type: boolean }

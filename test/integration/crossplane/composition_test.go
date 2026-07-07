@@ -197,6 +197,11 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "block-project-ssh-keys"); got != "true" {
 					t.Errorf("instance metadata block-project-ssh-keys = %q, want true", got)
 				}
+				// enableOsLogin is omitted from this spec, so the template's dig default
+				// governs and OS Login is on.
+				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "enable-oslogin"); got != "TRUE" {
+					t.Errorf("instance metadata enable-oslogin = %q, want TRUE (dig default)", got)
+				}
 				if got := nestedString(t, inst, "spec", "forProvider", "serviceAccount", "email"); got != saEmail {
 					t.Errorf("instance serviceAccount.email = %q, want %s", got, saEmail)
 				}
@@ -309,6 +314,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				"sharedNetworkName": sharedNetworkName,
 				"reservedIP":        false,
 				"spot":              true,
+				"enableOsLogin":     false,
 				"wgListenPort":      51820,
 				"serviceAccountId":  "gateway",
 				"secretId":          gatewaySecretID,
@@ -341,6 +347,10 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				}
 				if got := nestedString(t, inst, "spec", "forProvider", "desiredStatus"); got != "RUNNING" {
 					t.Errorf("instance desiredStatus = %q, want RUNNING", got)
+				}
+				// enableOsLogin is false on this spec, so OS Login is explicitly disabled.
+				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "enable-oslogin"); got != "FALSE" {
+					t.Errorf("instance metadata enable-oslogin = %q, want FALSE (enableOsLogin=false)", got)
 				}
 			},
 		},

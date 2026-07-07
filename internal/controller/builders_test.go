@@ -29,6 +29,7 @@ func testConfig() Config {
 		LinkImage:           "registry.example.com/gateway-link:test",
 		LinkImagePullPolicy: "IfNotPresent",
 		UserData:            "#ignition\n",
+		EnableOSLogin:       true,
 		RequeueInterval:     0,
 		SharedNetworkName:   "wgnet-test",
 		PodNamespace:        "gateway-operator",
@@ -183,6 +184,9 @@ func TestBuildXGatewayGCP(t *testing.T) {
 	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "reservedIP"); got != effectiveGCPReservedIP(gw) {
 		t.Errorf("reservedIP = %v, want %v", got, effectiveGCPReservedIP(gw))
 	}
+	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "enableOsLogin"); got != cfg.EnableOSLogin {
+		t.Errorf("enableOsLogin = %v, want %v", got, cfg.EnableOSLogin)
+	}
 
 	id := gcpID(gw.Namespace, gw.Name)
 	assertNestedString(t, u, id, "spec", "serviceAccountId")
@@ -228,12 +232,19 @@ func TestBuildXGatewayGCP(t *testing.T) {
 func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
 	cfg := testConfig()
 	cfg.UserData = ""
+	cfg.EnableOSLogin = false
 
 	gw := newGateway("edge", "wg-system", nil, nil)
 
 	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
+	}
+
+	// enableOsLogin is set unconditionally from config, so a false config value
+	// surfaces as an explicit false rather than an omitted field.
+	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "enableOsLogin"); got != false {
+		t.Errorf("enableOsLogin = %v, want false", got)
 	}
 
 	for _, field := range []string{"userData", "allowedPorts"} {

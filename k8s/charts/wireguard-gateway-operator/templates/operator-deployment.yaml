@@ -55,6 +55,8 @@ spec:
               value: {{ .Values.operator.logLevel | quote }}
             - name: PROD_LOG_FORMAT
               value: {{ .Values.operator.jsonLog | quote }}
+            - name: GATEWAY_ENABLE_OSLOGIN
+              value: {{ .Values.operator.enableOsLogin | quote }}
           ports:
             - name: health
               containerPort: {{ $healthPort }}

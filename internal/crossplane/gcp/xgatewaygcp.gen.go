@@ -10,6 +10,7 @@ type XGatewayGCPSpec struct {
 		Protocol string `json:"protocol"`
 	} `json:"allowedPorts,omitempty"`
 	DiskSizeGB        *int    `json:"diskSizeGB,omitempty"`
+	EnableOsLogin     *bool   `json:"enableOsLogin,omitempty"`
 	Image             *string `json:"image,omitempty"`
 	MachineType       string  `json:"machineType"`
 	ProjectID         *string `json:"projectID,omitempty"`
