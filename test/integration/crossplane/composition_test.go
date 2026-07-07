@@ -271,6 +271,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 
 				inst := desiredResource(t, resp, "instance")
 				assertSharedNetworkNIC(t, inst)
+				if got := nestedString(t, inst, "spec", "forProvider", "desiredStatus"); got != "RUNNING" {
+					t.Errorf("instance desiredStatus = %q, want RUNNING", got)
+				}
 				nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")
 				if len(nics) == 0 {
 					t.Fatalf("instance has no networkInterface")
@@ -335,6 +338,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				}
 				if nestedBool(t, inst, "spec", "forProvider", "scheduling", "automaticRestart") {
 					t.Errorf("instance scheduling.automaticRestart = true, want false under spot")
+				}
+				if got := nestedString(t, inst, "spec", "forProvider", "desiredStatus"); got != "RUNNING" {
+					t.Errorf("instance desiredStatus = %q, want RUNNING", got)
 				}
 			},
 		},

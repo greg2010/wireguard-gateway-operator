@@ -185,6 +185,7 @@ spec:
       email: {{ $saEmail | quote }}
       scopes:
         - https://www.googleapis.com/auth/cloud-platform
+    desiredStatus: RUNNING
     {{- if dig "spot" false $spec }}
     scheduling:
       provisioningModel: SPOT
