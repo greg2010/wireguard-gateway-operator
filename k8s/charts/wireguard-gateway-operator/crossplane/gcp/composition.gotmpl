@@ -59,6 +59,29 @@ spec:
     name: default
     kind: ClusterProviderConfig
 {{- end }}
+{{- if and (ne $saEmail "") (dig "enableOsLogin" true $spec) }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Firewall
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: firewall-iap
+spec:
+  forProvider:
+    direction: INGRESS
+    sourceRanges:
+      - 35.235.240.0/20
+    network: {{ $spec.sharedNetworkName | quote }}
+    targetServiceAccounts:
+      - {{ $saEmail | quote }}
+    allow:
+      - protocol: tcp
+        ports:
+          - "22"
+  providerConfigRef:
+    name: default
+    kind: ClusterProviderConfig
+{{- end }}
 {{- if $reservedIP }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1

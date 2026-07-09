@@ -60,6 +60,10 @@ const (
 	// sharedNetworkName is spec.sharedNetworkName, the VPC the shared-network
 	// composition creates; the template stamps it onto the Firewall and instance NIC.
 	sharedNetworkName = "wgnet-test"
+
+	// iapSourceRange is GCP's fixed source range for IAP TCP forwarding; the
+	// firewall-iap resource must allow SSH from exactly this range.
+	iapSourceRange = "35.235.240.0/20"
 )
 
 // runFunction holds the gRPC client and the shipped template source, shared by
@@ -143,6 +147,19 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if hasProtocol(allow, "icmp") {
 					t.Errorf("firewall allow must not open icmp to the internet, got %v", allow)
 				}
+
+				// enableOsLogin is omitted from this spec, so the template's dig
+				// default governs and the IAP SSH firewall rule must be desired.
+				fwIAP := desiredResource(t, resp, "firewall-iap")
+				if got := nestedString(t, fwIAP, "spec", "forProvider", "network"); got != sharedNetworkName {
+					t.Errorf("firewall-iap network = %q, want shared network %q", got, sharedNetworkName)
+				}
+				iapSourceRanges := nestedSlice(t, fwIAP, "spec", "forProvider", "sourceRanges")
+				assertSameSet(t, "firewall-iap sourceRanges", toStrings(t, iapSourceRanges), []string{iapSourceRange})
+				iapTargetSAs := nestedSlice(t, fwIAP, "spec", "forProvider", "targetServiceAccounts")
+				assertSameSet(t, "firewall-iap targetServiceAccounts", toStrings(t, iapTargetSAs), []string{saEmail})
+				iapAllow := nestedSlice(t, fwIAP, "spec", "forProvider", "allow")
+				assertSameSet(t, "firewall-iap tcp ports", allowPorts(t, iapAllow, "tcp"), []string{"22"})
 
 				addr := desiredResource(t, resp, "address")
 				if got := nestedString(t, addr, "spec", "forProvider", "addressType"); got != "EXTERNAL" {
@@ -351,6 +368,11 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				// enableOsLogin is false on this spec, so OS Login is explicitly disabled.
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "enable-oslogin"); got != "FALSE" {
 					t.Errorf("instance metadata enable-oslogin = %q, want FALSE (enableOsLogin=false)", got)
+				}
+				// OS Login is disabled on this spec, so IAP SSH has no way in and the
+				// IAP firewall rule must not be desired.
+				if _, ok := resp.GetDesired().GetResources()["firewall-iap"]; ok {
+					t.Errorf("firewall-iap must not be desired when enableOsLogin is false")
 				}
 			},
 		},
