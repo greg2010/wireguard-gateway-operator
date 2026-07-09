@@ -61,6 +61,10 @@ const (
 	// composition creates; the template stamps it onto the Firewall and instance NIC.
 	sharedNetworkName = "wgnet-test"
 
+	// providerConfigName is spec.providerConfigName, the Crossplane ClusterProviderConfig
+	// the template stamps onto every composed resource's providerConfigRef.name.
+	providerConfigName = "test-provider-config"
+
 	// iapSourceRange is GCP's fixed source range for IAP TCP forwarding; the
 	// firewall-iap resource must allow SSH from exactly this range.
 	iapSourceRange = "35.235.240.0/20"
@@ -89,20 +93,21 @@ func TestXGatewayGCPComposition(t *testing.T) {
 		{
 			name: "reserved IP with mixed tcp/udp ports renders full stack",
 			spec: map[string]any{
-				"region":            testRegion,
-				"zone":              testRegion + "-a",
-				"machineType":       "e2-small",
-				"image":             "projects/wgnet/global/images/gateway",
-				"diskSizeGB":        30,
-				"sharedNetworkName": sharedNetworkName,
-				"reservedIP":        true,
-				"userData":          "#cloud-config\n",
-				"wgListenPort":      51820,
-				"wgMTU":             1380,
-				"wgGatewayAddress":  "10.99.0.1",
-				"wgLinkAddress":     "10.99.0.2",
-				"wgSubnet":          "10.99.0.0/29",
-				"projectID":         testProjectID,
+				"region":             testRegion,
+				"zone":               testRegion + "-a",
+				"machineType":        "e2-small",
+				"image":              "projects/wgnet/global/images/gateway",
+				"diskSizeGB":         30,
+				"sharedNetworkName":  sharedNetworkName,
+				"providerConfigName": providerConfigName,
+				"reservedIP":         true,
+				"userData":           "#cloud-config\n",
+				"wgListenPort":       51820,
+				"wgMTU":              1380,
+				"wgGatewayAddress":   "10.99.0.1",
+				"wgLinkAddress":      "10.99.0.2",
+				"wgSubnet":           "10.99.0.0/29",
+				"projectID":          testProjectID,
 				"allowedPorts": []any{
 					map[string]any{"port": 443, "protocol": "tcp"},
 					map[string]any{"port": 80, "protocol": "tcp"},
@@ -137,6 +142,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got := nestedString(t, fw, "spec", "forProvider", "network"); got != sharedNetworkName {
 					t.Errorf("firewall network = %q, want shared network %q", got, sharedNetworkName)
 				}
+				if got := nestedString(t, fw, "spec", "providerConfigRef", "name"); got != providerConfigName {
+					t.Errorf("firewall providerConfigRef.name = %q, want %q", got, providerConfigName)
+				}
 				targetSAs := nestedSlice(t, fw, "spec", "forProvider", "targetServiceAccounts")
 				assertSameSet(t, "firewall targetServiceAccounts", toStrings(t, targetSAs), []string{saEmail})
 				allow := nestedSlice(t, fw, "spec", "forProvider", "allow")
@@ -153,6 +161,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				fwIAP := desiredResource(t, resp, "firewall-iap")
 				if got := nestedString(t, fwIAP, "spec", "forProvider", "network"); got != sharedNetworkName {
 					t.Errorf("firewall-iap network = %q, want shared network %q", got, sharedNetworkName)
+				}
+				if got := nestedString(t, fwIAP, "spec", "providerConfigRef", "name"); got != providerConfigName {
+					t.Errorf("firewall-iap providerConfigRef.name = %q, want %q", got, providerConfigName)
 				}
 				iapSourceRanges := nestedSlice(t, fwIAP, "spec", "forProvider", "sourceRanges")
 				assertSameSet(t, "firewall-iap sourceRanges", toStrings(t, iapSourceRanges), []string{iapSourceRange})
@@ -227,6 +238,10 @@ func TestXGatewayGCPComposition(t *testing.T) {
 
 				assertSharedNetworkNIC(t, inst)
 
+				if got := nestedString(t, inst, "spec", "providerConfigRef", "name"); got != providerConfigName {
+					t.Errorf("instance providerConfigRef.name = %q, want %q", got, providerConfigName)
+				}
+
 				natIP := nestedString(t, inst,
 					"spec", "forProvider", "networkInterface", "0", "accessConfig", "0", "natIp")
 				if natIP != reservedAddr {
@@ -248,6 +263,8 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			},
 		},
 		{
+			// providerConfigName is omitted from this spec, pinning the template's
+			// dig fallback to the "default" ClusterProviderConfig.
 			name: "no reservation reads ephemeral natIp back from instance",
 			spec: map[string]any{
 				"region":            testRegion,
@@ -315,6 +332,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if _, ok := ac0["natIp"]; ok {
 					t.Errorf("ephemeral accessConfig must not pin a natIp, got %v", ac0["natIp"])
 				}
+				if got := nestedString(t, inst, "spec", "providerConfigRef", "name"); got != "default" {
+					t.Errorf("instance providerConfigRef.name = %q, want default (providerConfigName omitted from spec)", got)
+				}
 
 				status := compositeStatus(t, resp)
 				if got := digString(status, "address"); got != ephemeralNatIP {
@@ -325,16 +345,17 @@ func TestXGatewayGCPComposition(t *testing.T) {
 		{
 			name: "spot emits SPOT scheduling block",
 			spec: map[string]any{
-				"region":            testRegion,
-				"zone":              testRegion + "-a",
-				"machineType":       "e2-small",
-				"sharedNetworkName": sharedNetworkName,
-				"reservedIP":        false,
-				"spot":              true,
-				"enableOsLogin":     false,
-				"wgListenPort":      51820,
-				"serviceAccountId":  "gateway",
-				"secretId":          gatewaySecretID,
+				"region":             testRegion,
+				"zone":               testRegion + "-a",
+				"machineType":        "e2-small",
+				"sharedNetworkName":  sharedNetworkName,
+				"providerConfigName": providerConfigName,
+				"reservedIP":         false,
+				"spot":               true,
+				"enableOsLogin":      false,
+				"wgListenPort":       51820,
+				"serviceAccountId":   "gateway",
+				"secretId":           gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
@@ -379,14 +400,15 @@ func TestXGatewayGCPComposition(t *testing.T) {
 		{
 			name: "instance and iam withheld until SA email is observed",
 			spec: map[string]any{
-				"region":            testRegion,
-				"zone":              testRegion + "-a",
-				"machineType":       "e2-small",
-				"sharedNetworkName": sharedNetworkName,
-				"reservedIP":        false,
-				"wgListenPort":      51820,
-				"serviceAccountId":  "gateway",
-				"secretId":          gatewaySecretID,
+				"region":             testRegion,
+				"zone":               testRegion + "-a",
+				"machineType":        "e2-small",
+				"sharedNetworkName":  sharedNetworkName,
+				"providerConfigName": providerConfigName,
+				"reservedIP":         false,
+				"wgListenPort":       51820,
+				"serviceAccountId":   "gateway",
+				"secretId":           gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
@@ -409,19 +431,20 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			// keyfetch rather than a chart-baked one.
 			name: "non-default wgListenPort and projectID reach instance metadata",
 			spec: map[string]any{
-				"region":            testRegion,
-				"zone":              testRegion + "-a",
-				"machineType":       "e2-small",
-				"sharedNetworkName": sharedNetworkName,
-				"reservedIP":        false,
-				"wgListenPort":      51999,
-				"wgMTU":             1280,
-				"wgGatewayAddress":  "10.50.0.1",
-				"wgLinkAddress":     "10.50.0.2",
-				"wgSubnet":          "10.50.0.0/29",
-				"projectID":         "other-project",
-				"serviceAccountId":  "gateway",
-				"secretId":          gatewaySecretID,
+				"region":             testRegion,
+				"zone":               testRegion + "-a",
+				"machineType":        "e2-small",
+				"sharedNetworkName":  sharedNetworkName,
+				"providerConfigName": providerConfigName,
+				"reservedIP":         false,
+				"wgListenPort":       51999,
+				"wgMTU":              1280,
+				"wgGatewayAddress":   "10.50.0.1",
+				"wgLinkAddress":      "10.50.0.2",
+				"wgSubnet":           "10.50.0.0/29",
+				"projectID":          "other-project",
+				"serviceAccountId":   "gateway",
+				"secretId":           gatewaySecretID,
 				"wgKeySecretRef": map[string]any{
 					"name": "gateway-wg-key",
 					"key":  "private",
@@ -502,7 +525,8 @@ func TestXGatewayNetworkComposition(t *testing.T) {
 	defer cancel()
 
 	req := rf.buildRequestFor(t, template, "XGatewayNetwork", map[string]any{
-		"name": sharedNetworkName,
+		"name":               sharedNetworkName,
+		"providerConfigName": providerConfigName,
 	}, nil)
 	resp, err := rf.client.RunFunction(ctx, req)
 	if err != nil {
@@ -524,6 +548,9 @@ func TestXGatewayNetworkComposition(t *testing.T) {
 	}
 	if got := nestedString(t, network, "metadata", "annotations", "crossplane.io/external-name"); got != sharedNetworkName {
 		t.Errorf("network external-name = %q, want %q", got, sharedNetworkName)
+	}
+	if got := nestedString(t, network, "spec", "providerConfigRef", "name"); got != providerConfigName {
+		t.Errorf("network providerConfigRef.name = %q, want %q", got, providerConfigName)
 	}
 	if got := nestedBool(t, network, "spec", "forProvider", "autoCreateSubnetworks"); !got {
 		t.Errorf("network autoCreateSubnetworks = false, want true")

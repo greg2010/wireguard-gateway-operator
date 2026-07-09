@@ -211,9 +211,11 @@ spec:
 EOF
 ```
 
-The `ClusterProviderConfig` name must be `default`: the gateway composition's GCP
-managed resources reference `providerConfigRef.name: default`. It and the provider
-CRDs must exist before any `Gateway` provisions.
+The `ClusterProviderConfig` name must match the operator's configured provider
+config (Helm `operator.providerConfigName` / env `GATEWAY_PROVIDER_CONFIG_NAME`,
+default `default`): the gateway composition's GCP managed resources reference it
+as `providerConfigRef.name`. It and the provider CRDs must exist before any
+`Gateway` provisions.
 
 **4. The operator.**
 

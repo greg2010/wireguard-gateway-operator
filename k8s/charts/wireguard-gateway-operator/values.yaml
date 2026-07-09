@@ -43,6 +43,10 @@ operator:
   jsonLog: true
   # Enable GCP OS Login on gateway VMs (SSH access governed by IAM). Maps GATEWAY_ENABLE_OSLOGIN.
   enableOsLogin: true
+  # Crossplane ClusterProviderConfig that composed GCP resources reference.
+  # Maps GATEWAY_PROVIDER_CONFIG_NAME. "default" matches the conventional config;
+  # set a distinct value to isolate this install's credentials/project.
+  providerConfigName: default
   resources:
     requests:
       cpu: 50m

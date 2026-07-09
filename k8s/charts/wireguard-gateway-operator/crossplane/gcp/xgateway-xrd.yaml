@@ -28,6 +28,7 @@ spec:
                 enableOsLogin: { type: boolean }
                 userData: { type: string }
                 sharedNetworkName: { type: string }
+                providerConfigName: { type: string }
                 reservedIP: { type: boolean }
                 projectID: { type: string }
                 wgListenPort: { type: integer }

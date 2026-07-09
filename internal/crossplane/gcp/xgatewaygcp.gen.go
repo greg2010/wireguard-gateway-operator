@@ -9,20 +9,21 @@ type XGatewayGCPSpec struct {
 		Port     int    `json:"port"`
 		Protocol string `json:"protocol"`
 	} `json:"allowedPorts,omitempty"`
-	DiskSizeGB        *int    `json:"diskSizeGB,omitempty"`
-	EnableOsLogin     *bool   `json:"enableOsLogin,omitempty"`
-	Image             *string `json:"image,omitempty"`
-	MachineType       string  `json:"machineType"`
-	ProjectID         *string `json:"projectID,omitempty"`
-	Region            string  `json:"region"`
-	ReservedIP        *bool   `json:"reservedIP,omitempty"`
-	SecretId          *string `json:"secretId,omitempty"`
-	ServiceAccountId  *string `json:"serviceAccountId,omitempty"`
-	SharedNetworkName string  `json:"sharedNetworkName"`
-	Spot              *bool   `json:"spot,omitempty"`
-	UserData          *string `json:"userData,omitempty"`
-	WgGatewayAddress  *string `json:"wgGatewayAddress,omitempty"`
-	WgKeySecretRef    *struct {
+	DiskSizeGB         *int    `json:"diskSizeGB,omitempty"`
+	EnableOsLogin      *bool   `json:"enableOsLogin,omitempty"`
+	Image              *string `json:"image,omitempty"`
+	MachineType        string  `json:"machineType"`
+	ProjectID          *string `json:"projectID,omitempty"`
+	ProviderConfigName *string `json:"providerConfigName,omitempty"`
+	Region             string  `json:"region"`
+	ReservedIP         *bool   `json:"reservedIP,omitempty"`
+	SecretId           *string `json:"secretId,omitempty"`
+	ServiceAccountId   *string `json:"serviceAccountId,omitempty"`
+	SharedNetworkName  string  `json:"sharedNetworkName"`
+	Spot               *bool   `json:"spot,omitempty"`
+	UserData           *string `json:"userData,omitempty"`
+	WgGatewayAddress   *string `json:"wgGatewayAddress,omitempty"`
+	WgKeySecretRef     *struct {
 		Key  string `json:"key"`
 		Name string `json:"name"`
 	} `json:"wgKeySecretRef,omitempty"`

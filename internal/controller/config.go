@@ -32,6 +32,11 @@ type Config struct {
 	// values so they never contend for one VPC.
 	SharedNetworkName string `envconfig:"GATEWAY_SHARED_NETWORK_NAME" required:"true"`
 
+	// ProviderConfigName is the Crossplane ClusterProviderConfig every composed GCP
+	// resource references. Defaults to "default"; set a distinct value to bind an
+	// install to its own provider credentials and project.
+	ProviderConfigName string `envconfig:"GATEWAY_PROVIDER_CONFIG_NAME" default:"default"`
+
 	// PodNamespace is where the operator pod itself runs, used to place the
 	// singleton shared-network composite alongside the operator. Supplied via the
 	// downward API.

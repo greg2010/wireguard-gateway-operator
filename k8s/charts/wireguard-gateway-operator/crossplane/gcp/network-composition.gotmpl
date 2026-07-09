@@ -10,5 +10,5 @@ spec:
   forProvider:
     autoCreateSubnetworks: true
   providerConfigRef:
-    name: default
+    name: {{ dig "providerConfigName" "default" $spec | quote }}
     kind: ClusterProviderConfig

@@ -115,23 +115,24 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 	wgSubnet := effectiveWGSubnet(gw)
 
 	spec := gcp.XGatewayGCPSpec{
-		Region:            gw.Spec.GCP.Region,
-		Zone:              gw.Spec.GCP.Zone,
-		MachineType:       gw.Spec.GCP.MachineType,
-		SharedNetworkName: cfg.SharedNetworkName,
-		Image:             &image,
-		DiskSizeGB:        &diskSizeGB,
-		WgListenPort:      int(effectiveWireguardPort(gw)),
-		WgMTU:             int(effectiveWGMTU(gw)),
-		WgGatewayAddress:  &wgGatewayAddress,
-		WgLinkAddress:     &wgLinkAddress,
-		WgSubnet:          &wgSubnet,
-		ProjectID:         &projectID,
-		ReservedIP:        &reservedIP,
-		Spot:              &spot,
-		EnableOsLogin:     new(cfg.EnableOSLogin),
-		ServiceAccountId:  &id,
-		SecretId:          &id,
+		Region:             gw.Spec.GCP.Region,
+		Zone:               gw.Spec.GCP.Zone,
+		MachineType:        gw.Spec.GCP.MachineType,
+		SharedNetworkName:  cfg.SharedNetworkName,
+		ProviderConfigName: &cfg.ProviderConfigName,
+		Image:              &image,
+		DiskSizeGB:         &diskSizeGB,
+		WgListenPort:       int(effectiveWireguardPort(gw)),
+		WgMTU:              int(effectiveWGMTU(gw)),
+		WgGatewayAddress:   &wgGatewayAddress,
+		WgLinkAddress:      &wgLinkAddress,
+		WgSubnet:           &wgSubnet,
+		ProjectID:          &projectID,
+		ReservedIP:         &reservedIP,
+		Spot:               &spot,
+		EnableOsLogin:      new(cfg.EnableOSLogin),
+		ServiceAccountId:   &id,
+		SecretId:           &id,
 		WgKeySecretRef: &struct {
 			Key  string `json:"key"`
 			Name string `json:"name"`
@@ -182,7 +183,8 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 // attached Gateway. The provider label is fixed to gcp.
 func buildXGatewayNetwork(cfg Config) *unstructured.Unstructured {
 	spec := map[string]any{
-		"name": cfg.SharedNetworkName,
+		"name":               cfg.SharedNetworkName,
+		"providerConfigName": cfg.ProviderConfigName,
 		"crossplane": map[string]any{
 			"compositionSelector": map[string]any{
 				"matchLabels": map[string]any{providerLabelKey: string(wgnetv1alpha1.ProviderGCP)},

@@ -57,6 +57,8 @@ spec:
               value: {{ .Values.operator.jsonLog | quote }}
             - name: GATEWAY_ENABLE_OSLOGIN
               value: {{ .Values.operator.enableOsLogin | quote }}
+            - name: GATEWAY_PROVIDER_CONFIG_NAME
+              value: {{ .Values.operator.providerConfigName | quote }}
           ports:
             - name: health
               containerPort: {{ $healthPort }}

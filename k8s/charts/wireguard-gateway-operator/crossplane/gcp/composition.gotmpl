@@ -3,6 +3,7 @@
 {{- $spec := $xr.spec -}}
 {{- $region := $spec.region -}}
 {{- $reservedIP := dig "reservedIP" false $spec -}}
+{{- $providerConfig := dig "providerConfigName" "default" $spec -}}
 {{- $saEmail := dig "status" "atProvider" "email" "" (getComposedResource . "service-account") -}}
 {{- $addressIP := dig "status" "atProvider" "address" "" (getComposedResource . "address") -}}
 {{- $tcpPorts := list -}}
@@ -56,7 +57,7 @@ spec:
           - {{ . | quote }}
           {{- end }}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
 {{- if and (ne $saEmail "") (dig "enableOsLogin" true $spec) }}
@@ -79,7 +80,7 @@ spec:
         ports:
           - "22"
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
 {{- if $reservedIP }}
@@ -94,7 +95,7 @@ spec:
     addressType: EXTERNAL
     region: {{ $region | quote }}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
 ---
@@ -107,7 +108,7 @@ metadata:
 spec:
   forProvider: {}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 ---
 apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
@@ -121,7 +122,7 @@ spec:
     replication:
       auto: {}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 ---
 apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
@@ -137,7 +138,7 @@ spec:
       name: {{ $spec.wgKeySecretRef.name | quote }}
       key: {{ $spec.wgKeySecretRef.key | quote }}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- if ne $saEmail "" }}
 ---
@@ -153,7 +154,7 @@ spec:
     secretIdSelector:
       matchControllerRef: true
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
 {{- if $instanceReady }}
@@ -222,7 +223,7 @@ spec:
       onHostMaintenance: TERMINATE
     {{- end }}
   providerConfigRef:
-    name: default
+    name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
 ---

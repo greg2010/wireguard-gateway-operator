@@ -32,6 +32,7 @@ func testConfig() Config {
 		EnableOSLogin:       true,
 		RequeueInterval:     0,
 		SharedNetworkName:   "wgnet-test",
+		ProviderConfigName:  "test-provider-config",
 		PodNamespace:        "gateway-operator",
 	}
 }
@@ -163,6 +164,7 @@ func TestBuildXGatewayGCP(t *testing.T) {
 	// sharedNetworkName flows from operator config; every other input flows from
 	// gw.Spec (here all defaulted).
 	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "sharedNetworkName")
+	assertNestedString(t, u, cfg.ProviderConfigName, "spec", "providerConfigName")
 
 	assertNestedString(t, u, "test-project", "spec", "projectID")
 	assertNestedString(t, u, effectiveGCPImage(gw), "spec", "image")
@@ -1091,6 +1093,7 @@ func TestBuildXGatewayNetwork(t *testing.T) {
 	}
 
 	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "name")
+	assertNestedString(t, u, cfg.ProviderConfigName, "spec", "providerConfigName")
 	assertNestedString(t, u, "gcp", "spec", "crossplane", "compositionSelector", "matchLabels", "provider")
 
 	if refs := u.GetOwnerReferences(); len(refs) != 0 {
