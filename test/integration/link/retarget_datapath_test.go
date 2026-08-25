@@ -8,9 +8,8 @@ import (
 	"time"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
-	"github.com/moby/moby/api/types/container"
+	"github.com/greg2010/wireguard-gateway-operator/test/harness/netns"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // A three-netns topology forwards traffic through wg0 to a separate cluster netns
@@ -47,7 +46,7 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", ClusterIP: dpClusterIPA, TargetPort: dpTargetPort}
 	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", ClusterIP: dpClusterIPB, TargetPort: dpTargetPort}
 
-	applyRuleset(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardA}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardA}))
 
 	if got := probeOnce(ctx, t, ctr); got != dpMarkerA {
 		t.Fatalf("before retarget: fresh probe = %q, want %q (DNAT to A not working)", got, dpMarkerA)
@@ -59,7 +58,7 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 		t.Fatalf("before retarget: held connection = %q, want %q", got, dpMarkerA)
 	}
 
-	applyRuleset(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardB}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardB}))
 
 	reused := held.request(ctx, t)
 	if reused == "" {
@@ -74,42 +73,15 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 }
 
 // startDataPathContainer brings up the three-netns topology with a wg0 veth peer,
-// unlike startNftContainer whose dummy wg0 cannot carry forwarded traffic.
+// unlike startNftContainer whose dummy wg0 cannot carry forwarded traffic. python3
+// runs the stand-in backends and the probes.
 func startDataPathContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 
-	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:      nftImage,
-			Entrypoint: []string{"sleep", "infinity"},
-			Labels:     map[string]string{"gateway.test": "integration"},
-			HostConfigModifier: func(hc *container.HostConfig) {
-				hc.CapAdd = append(hc.CapAdd, "NET_ADMIN")
-				hc.Privileged = true
-			},
-			WaitingFor: wait.ForExec([]string{"true"}).WithStartupTimeout(containerStartTimeout),
-		},
-		Started: true,
-	})
-	if err != nil {
-		t.Fatalf("start data-path container: %v", err)
-	}
-	t.Cleanup(func() { _ = ctr.Terminate(context.Background()) })
-
-	installDataPathPackages(ctx, t, ctr)
+	ctr := netns.Start(ctx, t, "python3")
 	setupTopology(ctx, t, ctr)
 	startBackends(ctx, t, ctr)
 	return ctr
-}
-
-// installDataPathPackages adds nft, the ip tooling, and python3 (the listeners
-// and probes). An apk failure is a real environment failure, not a skip.
-func installDataPathPackages(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
-	t.Helper()
-	code, out := execInContainer(ctx, t, ctr, "apk", "add", "--no-cache", "nftables", "iproute2", "python3")
-	if code != 0 {
-		t.Fatalf("apk add nftables iproute2 python3 failed (exit %d):\n%s", code, out)
-	}
 }
 
 // topologyScript builds the client/gateway/cluster netns plumbing: wg0 is the
@@ -146,7 +118,7 @@ sysctl -w net.ipv4.ip_forward=1
 // setupTopology runs topologyScript in the container.
 func setupTopology(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
-	code, out := execInContainer(ctx, t, ctr, "sh", "-c", topologyScript)
+	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", topologyScript)
 	if code != 0 {
 		t.Fatalf("set up netns topology (exit %d):\n%s", code, out)
 	}
@@ -181,7 +153,7 @@ func startBackends(ctx context.Context, t testing.TB, ctr testcontainers.Contain
 	}
 	for _, b := range []struct{ ip, marker string }{{dpClusterIPA, dpMarkerA}, {dpClusterIPB, dpMarkerB}} {
 		cmd := fmt.Sprintf("ip netns exec cluster python3 /tmp/backend.py %s %s &", b.ip, b.marker)
-		if code, out := execInContainer(ctx, t, ctr, "sh", "-c", cmd); code != 0 {
+		if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd); code != 0 {
 			t.Fatalf("start backend %s (exit %d):\n%s", b.ip, code, out)
 		}
 	}
@@ -195,7 +167,7 @@ func waitClusterListening(ctx context.Context, t testing.TB, ctr testcontainers.
 	deadline := time.Now().Add(15 * time.Second)
 	want := fmt.Sprintf(":%d", dpTargetPort)
 	for time.Now().Before(deadline) {
-		code, out := execInContainer(ctx, t, ctr, "ip", "netns", "exec", "cluster", "ss", "-ltn")
+		code, out := netns.Exec(ctx, t, ctr, "ip", "netns", "exec", "cluster", "ss", "-ltn")
 		if code == 0 && strings.Count(out, want) >= 2 {
 			return
 		}
@@ -229,7 +201,7 @@ func probeOnce(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 	}
 	secs := fmt.Sprintf("%.0f", dpProbeTimeout.Seconds())
 	cmd := fmt.Sprintf("ip netns exec client python3 /tmp/probe.py 10.99.0.2 %d %s", dpRetargetPort, secs)
-	code, out := execInContainer(ctx, t, ctr, "sh", "-c", cmd)
+	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd)
 	if code != 0 {
 		t.Fatalf("probe exec failed (exit %d):\n%s", code, out)
 	}
@@ -277,13 +249,13 @@ while True:
 // returns a handle once the connection is established.
 func openHeldConnection(ctx context.Context, t testing.TB, ctr testcontainers.Container) *heldConnection {
 	t.Helper()
-	if code, out := execInContainer(ctx, t, ctr, "sh", "-c", "echo 0 > /tmp/held_gen"); code != 0 {
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", "echo 0 > /tmp/held_gen"); code != 0 {
 		t.Fatalf("init generation file (exit %d):\n%s", code, out)
 	}
 	if err := ctr.CopyToContainer(ctx, []byte(heldScript), "/tmp/held.py", 0o644); err != nil {
 		t.Fatalf("copy held script: %v", err)
 	}
-	if code, out := execInContainer(ctx, t, ctr, "sh", "-c", "ip netns exec client python3 /tmp/held.py &"); code != 0 {
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", "ip netns exec client python3 /tmp/held.py &"); code != 0 {
 		t.Fatalf("start held connection (exit %d):\n%s", code, out)
 	}
 	h := &heldConnection{ctr: ctr}
@@ -298,7 +270,7 @@ func (h *heldConnection) waitConnected(ctx context.Context, t testing.TB) {
 	deadline := time.Now().Add(15 * time.Second)
 	want := fmt.Sprintf(":%d", dpRetargetPort)
 	for time.Now().Before(deadline) {
-		code, out := execInContainer(ctx, t, h.ctr, "ip", "netns", "exec", "client", "ss", "-tn", "state", "established")
+		code, out := netns.Exec(ctx, t, h.ctr, "ip", "netns", "exec", "client", "ss", "-tn", "state", "established")
 		if code == 0 && strings.Contains(out, want) {
 			return
 		}
@@ -313,13 +285,13 @@ func (h *heldConnection) waitConnected(ctx context.Context, t testing.TB) {
 func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
 	t.Helper()
 	h.gen++
-	if code, out := execInContainer(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("echo %d > /tmp/held_gen", h.gen)); code != 0 {
+	if code, out := netns.Exec(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("echo %d > /tmp/held_gen", h.gen)); code != 0 {
 		t.Fatalf("bump generation (exit %d):\n%s", code, out)
 	}
 	replyPath := fmt.Sprintf("/tmp/held_reply.%d", h.gen)
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		code, out := execInContainer(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("cat %s 2>/dev/null", replyPath))
+		code, out := netns.Exec(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("cat %s 2>/dev/null", replyPath))
 		if code == 0 {
 			reply := strings.TrimSpace(out)
 			if reply == "" || strings.HasPrefix(reply, "ERR:") {
@@ -332,12 +304,12 @@ func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
 	return ""
 }
 
-// close terminates the held-connection server.
+// close terminates the held-connection server. It runs on context.Background()
+// because the test's own context may already be cancelled by cleanup time; Exec
+// applies its own deadline.
 func (h *heldConnection) close(t testing.TB) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
-	defer cancel()
-	_, _ = execInContainer(ctx, t, h.ctr, "sh", "-c", "pkill -f held.py || true")
+	_, _ = netns.Exec(context.Background(), t, h.ctr, "sh", "-c", "pkill -f held.py || true")
 }
 
 // parseMarker extracts the marker from a probe's GOT:/ERR: output, returning ""

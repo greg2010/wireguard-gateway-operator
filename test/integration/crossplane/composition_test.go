@@ -575,10 +575,18 @@ func newRunFunction(t *testing.T) *runFunction {
 		},
 		Started: true,
 	})
+	// Registered before the error check: a start that fails its wait strategy still
+	// returns a live container, which would otherwise leak for the runtime's lifetime.
+	if ctr != nil {
+		t.Cleanup(func() {
+			if terr := ctr.Terminate(context.Background()); terr != nil {
+				t.Logf("terminate function container: %v", terr)
+			}
+		})
+	}
 	if err != nil {
 		t.Fatalf("start function container: %v", err)
 	}
-	t.Cleanup(func() { _ = ctr.Terminate(context.Background()) })
 
 	host, err := ctr.Host(ctx)
 	if err != nil {
@@ -593,7 +601,11 @@ func newRunFunction(t *testing.T) *runFunction {
 	if err != nil {
 		t.Fatalf("dial function: %v", err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() {
+		if cerr := conn.Close(); cerr != nil {
+			t.Logf("close function client: %v", cerr)
+		}
+	})
 
 	return &runFunction{
 		client:   fnv1.NewFunctionRunnerServiceClient(conn),
@@ -667,7 +679,7 @@ func observedResource(t *testing.T, name string, body map[string]any) *fnv1.Reso
 // this test file so the test always validates the bytes the chart ships.
 func loadTemplate(t *testing.T) string {
 	t.Helper()
-	return readChartTemplate(t, "gcp/composition.gotmpl")
+	return readChartFile(t, filepath.Join("crossplane", "gcp", "composition.gotmpl"))
 }
 
 // loadNetworkTemplate reads the shipped shared-network composition template,
@@ -675,25 +687,7 @@ func loadTemplate(t *testing.T) string {
 // each instance and firewall onto.
 func loadNetworkTemplate(t *testing.T) string {
 	t.Helper()
-	return readChartTemplate(t, "gcp/network-composition.gotmpl")
-}
-
-// readChartTemplate reads a template at the given path relative to the crossplane
-// chart directory, resolving it relative to this test file so it does not depend
-// on the process working directory.
-func readChartTemplate(t *testing.T, relPath string) string {
-	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
-	path := filepath.Join(repoRoot, "k8s", "charts", "wireguard-gateway-operator", "crossplane", relPath)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read template %s: %v", path, err)
-	}
-	return string(b)
+	return readChartFile(t, filepath.Join("crossplane", "gcp", "network-composition.gotmpl"))
 }
 
 // goTemplatingImage returns the function-go-templating package the providers chart

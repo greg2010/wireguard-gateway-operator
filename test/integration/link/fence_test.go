@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
+	"github.com/greg2010/wireguard-gateway-operator/test/harness/netns"
 	"github.com/testcontainers/testcontainers-go"
 )
 
@@ -26,7 +27,7 @@ func TestFenceRemovesDataPlane(t *testing.T) {
 		{Name: "tcp-svc", PublicPort: 8443, Protocol: "tcp", ClusterIP: "10.96.1.1", TargetPort: 443},
 		{Name: "udp-svc", PublicPort: 30000, Protocol: "udp", ClusterIP: "10.96.2.2", TargetPort: 9000},
 	}
-	applyRuleset(ctx, t, ctr, renderRuleset(t, forwards))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, forwards))
 
 	// The fence is only meaningful if there is a data plane to tear down.
 	if !wg0Present(ctx, t, ctr) {
@@ -52,10 +53,10 @@ func TestFenceRemovesDataPlane(t *testing.T) {
 // delete the inet gateway table. Each must succeed since the test programmed both.
 func fence(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
-	if code, out := execInContainer(ctx, t, ctr, "ip", "link", "del", "wg0"); code != 0 {
+	if code, out := netns.Exec(ctx, t, ctr, "ip", "link", "del", "wg0"); code != 0 {
 		t.Fatalf("fence: ip link del wg0 failed (exit %d):\n%s", code, out)
 	}
-	if code, out := execInContainer(ctx, t, ctr, "nft", "delete", "table", "inet", "gateway"); code != 0 {
+	if code, out := netns.Exec(ctx, t, ctr, "nft", "delete", "table", "inet", "gateway"); code != 0 {
 		t.Fatalf("fence: nft delete table inet gateway failed (exit %d):\n%s", code, out)
 	}
 }
@@ -63,7 +64,7 @@ func fence(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 // wg0Present reports whether the wg0 interface exists in the container.
 func wg0Present(ctx context.Context, t testing.TB, ctr testcontainers.Container) bool {
 	t.Helper()
-	code, _ := execInContainer(ctx, t, ctr, "ip", "link", "show", "wg0")
+	code, _ := netns.Exec(ctx, t, ctr, "ip", "link", "show", "wg0")
 	return code == 0
 }
 
@@ -71,6 +72,6 @@ func wg0Present(ctx context.Context, t testing.TB, ctr testcontainers.Container)
 // container. The identifier matches RenderNftables and the fence's delete target.
 func gatewayTablePresent(ctx context.Context, t testing.TB, ctr testcontainers.Container) bool {
 	t.Helper()
-	code, _ := execInContainer(ctx, t, ctr, "nft", "list", "table", "inet", "gateway")
+	code, _ := netns.Exec(ctx, t, ctr, "nft", "list", "table", "inet", "gateway")
 	return code == 0
 }
