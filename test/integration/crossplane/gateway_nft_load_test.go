@@ -2,6 +2,7 @@ package crossplane
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -17,6 +18,9 @@ import (
 // The container's own eth0 satisfies the ruleset's `iif "eth0"`, which nft resolves
 // to an interface index at load time.
 func TestGatewayNftLoadsIntoKernel(t *testing.T) {
+	if os.Getenv("GATEWAY_INTEGRATION") == "" {
+		t.Skip("set GATEWAY_INTEGRATION to run the nft kernel-load integration test")
+	}
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)

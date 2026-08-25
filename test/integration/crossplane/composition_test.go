@@ -5,9 +5,12 @@ package crossplane
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
 	"sigs.k8s.io/yaml"
@@ -70,11 +74,10 @@ const (
 	iapSourceRange = "35.235.240.0/20"
 )
 
-// runFunction holds the gRPC client and the shipped template source, shared by
-// every table case so the function container starts once.
+// runFunction holds the gRPC client to the shared function container, which every
+// test renders its own composition template against.
 type runFunction struct {
-	client   fnv1.FunctionRunnerServiceClient
-	template string
+	client fnv1.FunctionRunnerServiceClient
 }
 
 func TestXGatewayGCPComposition(t *testing.T) {
@@ -83,6 +86,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 	}
 
 	rf := newRunFunction(t)
+	template := loadTemplate(t)
 
 	tests := []struct {
 		name     string
@@ -495,7 +499,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			req := rf.buildRequest(t, tt.spec, tt.observed)
+			req := rf.buildRequestFor(t, template, "XGatewayGCP", tt.spec, tt.observed)
 			resp, err := rf.client.RunFunction(ctx, req)
 			if err != nil {
 				t.Fatalf("RunFunction: %v", err)
@@ -557,16 +561,51 @@ func TestXGatewayNetworkComposition(t *testing.T) {
 	}
 }
 
-// newRunFunction starts the function container once, dials it over plaintext
-// gRPC, and loads the shipped template. The container is terminated when t
-// finishes.
+// TestMain terminates the function container after the last test. Its lifetime
+// spans both composition tests, so no single test's cleanup can own it.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if functionStop != nil {
+		if err := functionStop(); err != nil {
+			log.Printf("stop function container: %v", err)
+		}
+	}
+	os.Exit(code)
+}
+
+var (
+	functionOnce sync.Once
+	functionConn *grpc.ClientConn
+	functionStop func() error
+	functionErr  error
+)
+
+// newRunFunction returns a client for the function container, starting it on
+// first use. Both composition tests render against the one container.
 func newRunFunction(t *testing.T) *runFunction {
 	t.Helper()
+
+	// Resolved outside the once so the failure is reported against whichever test
+	// asks, rather than only the first.
+	image := goTemplatingImage(t)
+	functionOnce.Do(func() {
+		functionConn, functionStop, functionErr = startFunction(image)
+	})
+	if functionErr != nil {
+		t.Fatalf("start function: %v", functionErr)
+	}
+
+	return &runFunction{client: fnv1.NewFunctionRunnerServiceClient(functionConn)}
+}
+
+// startFunction boots the function image and returns a connection that has
+// reached READY, plus a terminator that is safe to call whatever the error.
+func startFunction(image string) (*grpc.ClientConn, func() error, error) {
 	ctx := context.Background()
 
 	ctr, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        goTemplatingImage(t),
+			Image:        image,
 			Cmd:          []string{"--insecure"},
 			ExposedPorts: []string{functionPort},
 			Labels:       map[string]string{"gateway.test": "integration"},
@@ -575,54 +614,66 @@ func newRunFunction(t *testing.T) *runFunction {
 		},
 		Started: true,
 	})
-	// Registered before the error check: a start that fails its wait strategy still
+	// Built before the error check: a start that fails its wait strategy still
 	// returns a live container, which would otherwise leak for the runtime's lifetime.
+	stop := func() error { return nil }
 	if ctr != nil {
-		t.Cleanup(func() {
-			if terr := ctr.Terminate(context.Background()); terr != nil {
-				t.Logf("terminate function container: %v", terr)
-			}
-		})
+		stop = func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return ctr.Terminate(ctx)
+		}
 	}
 	if err != nil {
-		t.Fatalf("start function container: %v", err)
+		return nil, stop, err
 	}
 
 	host, err := ctr.Host(ctx)
 	if err != nil {
-		t.Fatalf("container host: %v", err)
+		return nil, stop, fmt.Errorf("container host: %w", err)
 	}
 	port, err := ctr.MappedPort(ctx, functionPort)
 	if err != nil {
-		t.Fatalf("mapped port: %v", err)
+		return nil, stop, fmt.Errorf("mapped port: %w", err)
 	}
 
 	conn, err := grpc.NewClient(host+":"+port.Port(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("dial function: %v", err)
+		return nil, stop, fmt.Errorf("dial function: %w", err)
 	}
-	t.Cleanup(func() {
-		if cerr := conn.Close(); cerr != nil {
-			t.Logf("close function client: %v", cerr)
-		}
-	})
+	terminate := stop
+	stop = func() error { return errors.Join(conn.Close(), terminate()) }
 
-	return &runFunction{
-		client:   fnv1.NewFunctionRunnerServiceClient(conn),
-		template: loadTemplate(t),
+	if err := waitForReady(conn); err != nil {
+		return nil, stop, err
 	}
+	return conn, stop, nil
 }
 
-// buildRequest assembles a RunFunctionRequest for the per-gateway XGatewayGCP
-// composition from spec and observed resources, with the XR named xrName so the
-// function's observed-resource keying lines up.
-func (rf *runFunction) buildRequest(t *testing.T, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
-	t.Helper()
-	return rf.buildRequestFor(t, rf.template, "XGatewayGCP", spec, observed)
+// waitForReady blocks until the connection completes its HTTP/2 handshake. The
+// function image is distroless, so the wait strategy can only probe the mapped
+// port from outside: that proves the runtime's port forwarder accepts, not that
+// the server inside has called listen, and the first RPC then races the server's
+// startup and dies on a broken pipe.
+func waitForReady(conn *grpc.ClientConn) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return nil
+		}
+		conn.Connect()
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("function container never became gRPC-ready: last state %s", state)
+		}
+	}
 }
 
 // buildRequestFor assembles a RunFunctionRequest for an arbitrary composition
-// template and XR kind in the infra.wgnet.dev group, so one running container can
+// template and XR kind in the infra.wgnet.dev group, with the XR named xrName so
+// the function's observed-resource keying lines up. One running container can
 // render either composition.
 func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
 	t.Helper()
@@ -692,14 +743,10 @@ func loadNetworkTemplate(t *testing.T) string {
 
 // goTemplatingImage returns the function-go-templating package the providers chart
 // pins, so that values file is the single source of truth for the digest the test
-// boots. The path resolves relative to this test file, not the working directory.
+// boots.
 func goTemplatingImage(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..",
+	path := filepath.Join(repoRoot(t),
 		"k8s", "infra", "crossplane", "crossplane-providers", "values.yaml")
 	b, err := os.ReadFile(path)
 	if err != nil {

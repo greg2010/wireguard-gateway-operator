@@ -64,6 +64,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # The suite renders the chart with helm to assert the shipped Ignition.
+      - uses: azure/setup-helm@v4
       - run: make test-integration
 
   e2e:
