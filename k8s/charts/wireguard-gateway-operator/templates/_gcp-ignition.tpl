@@ -1,9 +1,12 @@
 {{/*
-Renders the gateway VM's Ignition v3.4.0 config as a JSON string (toJson, no Butane).
+Renders the GCE gateway VM's Ignition v3.4.0 config as a JSON string (toJson, no Butane).
+Every asset it ships is GCE-specific — the keyfetch unit reads the GCE metadata server and
+GCP Secret Manager, the ruleset admits GCP's IAP range, and the sshd drop-in points at the
+GCE guest agent — so it is scoped to the GCP provider alongside crossplane/gcp.
 The output is byte-identical across Gateways: the keyfetch unit reads per-Gateway values
 from instance metadata at boot, and gateway.nft ships as a template the unit fills.
 */}}
-{{- define "wireguard-gateway-operator.ignition" -}}
+{{- define "wireguard-gateway-operator.gcpIgnition" -}}
 {{- $keyfetchUnit := `[Unit]
 Description=Fetch gateway WireGuard bundle and write wg0 netdev
 After=network-online.target
@@ -34,9 +37,10 @@ ExecReload=/usr/sbin/nft -f /etc/nftables/gateway.nft
 WantedBy=multi-user.target
 ` -}}
 {{- $files := list
-  (dict "path" "/opt/gateway/keyfetch.sh" "mode" 493 "src" "files/keyfetch.sh")
-  (dict "path" "/etc/nftables/gateway.nft" "mode" 420 "src" "files/gateway.nft")
-  (dict "path" "/etc/sysctl.d/50-gateway-forward.conf" "mode" 420 "src" "files/50-gateway-forward.conf")
+  (dict "path" "/opt/gateway/keyfetch.sh" "mode" 493 "src" "files/gcp/keyfetch.sh")
+  (dict "path" "/etc/nftables/gateway.nft" "mode" 420 "src" "files/gcp/gateway.nft")
+  (dict "path" "/etc/sysctl.d/50-gateway-forward.conf" "mode" 420 "src" "files/gcp/50-gateway-forward.conf")
+  (dict "path" "/etc/ssh/sshd_config.d/10-google-oslogin.conf" "mode" 420 "src" "files/gcp/10-google-oslogin.conf")
 -}}
 {{- $storageFiles := list -}}
 {{- range $files -}}

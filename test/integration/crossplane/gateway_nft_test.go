@@ -1,21 +1,19 @@
 package crossplane
 
 import (
-	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 )
 
 var (
 	// gatewayNftPath is the shipped VM ruleset, relative to the operator chart.
-	gatewayNftPath = filepath.Join("files", "gateway.nft")
+	gatewayNftPath = filepath.Join("files", "gcp", "gateway.nft")
 
 	// keyfetchPath is the boot script that renders the ruleset, relative to the
 	// operator chart.
-	keyfetchPath = filepath.Join("files", "keyfetch.sh")
+	keyfetchPath = filepath.Join("files", "gcp", "keyfetch.sh")
 )
 
 // nftTestValues stand in for the metadata attributes keyfetch.sh substitutes into
@@ -167,22 +165,4 @@ func ruleIndex(rules []string, match func(string) bool) int {
 		}
 	}
 	return -1
-}
-
-// readChartFile reads a file at the given path relative to the operator chart
-// directory, resolving it relative to this test file so it does not depend on
-// the process working directory.
-func readChartFile(t *testing.T, relPath string) string {
-	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..", "..")
-	path := filepath.Join(repoRoot, "k8s", "charts", "wireguard-gateway-operator", relPath)
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read chart file %s: %v", path, err)
-	}
-	return string(b)
 }
