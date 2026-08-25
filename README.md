@@ -89,6 +89,7 @@ Gateway-VM provisioning is backend-specific, and only GCP exists today.
 | GCP provider (configured) | A `ClusterProviderConfig` with `credentials.source=Secret` referencing a service-account key. | [Provider authentication](https://docs.upbound.io/manuals/packages/providers/authentication/) |
 | GCP project + APIs | A project with billing and the compute, secretmanager, iam, and cloudresourcemanager APIs enabled. | [gcloud CLI](https://docs.cloud.google.com/sdk/docs/install) |
 | GCP service-account key | A JSON key for a service account with the roles the composition needs, delivered as the Secret the `ClusterProviderConfig` references. | [Create SA key](https://docs.cloud.google.com/iam/docs/keys-create-delete) |
+| OS Login IAM (optional) | Only for break-glass SSH to a gateway VM: grant the SSH caller `roles/compute.osLogin` (or `roles/compute.osAdminLogin`) plus IAP tunnel access on the project. Gateways provision without it. | [OS Login](https://docs.cloud.google.com/compute/docs/oslogin) |
 
 ## Installation
 
@@ -348,6 +349,55 @@ kubectl label namespace other-ns wgnet.dev/allow-gateway-ingress=true
 Backend Services of type `ClusterIP` and `NodePort` are supported (both carry a
 routable ClusterIP to DNAT to). `ExternalName` and headless Services are
 rejected: the Gateway reports `Ready=False` with reason `UnsupportedServiceType`.
+
+## Operations
+
+### Recreating a gateway VM
+
+The VM's ignition is applied at first boot only, so a change to
+`spec.gcp.image` or to anything rendered into user data reaches a running
+gateway only by replacing the instance. Delete the composed managed resource
+alone:
+
+```sh
+kubectl get instances.compute.gcp.m.upbound.io -n <gateway-namespace>
+kubectl delete instances.compute.gcp.m.upbound.io -n <gateway-namespace> <instance>
+```
+
+The composed resources share the `Gateway`'s namespace; the composite XR carries
+the Gateway's own name, so pick the `Instance` by its `crossplane.io/composite`
+label if several gateways live there.
+
+The composition rebuilds it in roughly two minutes, during which the tunnel and
+every forwarded port are down. `NetworkPolicy` and forward changes need none of
+this; they reconcile in place.
+
+With `reservedIP: true` the rebuilt instance reattaches the same reserved
+address. With `reservedIP: false` it takes an ephemeral one, so even this
+instance-only rebuild lands on a new public IP and every `dnsHostnames` name has
+to re-propagate.
+
+Do not widen the deletion to force a rebuild. Deleting the `XGatewayGCP`
+composite destroys the Address, Firewall, service account, Secrets, and Instance
+and releases the reserved public IP, though the VPC survives. Deleting the last
+`Gateway` CR in the cluster additionally tears down the VPC, which is refcounted
+across Gateways.
+
+### Break-glass SSH
+
+Gateway VMs carry no SSH keys and `block-project-ssh-keys` is set, so access is
+OS Login over IAP TCP forwarding. The gateway firewall admits `22` from the IAP
+range `35.235.240.0/20` only, targeted at the VM's service account.
+
+```sh
+gcloud compute ssh <instance> --zone=<zone> --tunnel-through-iap --project=<project>
+```
+
+Authorization is IAM: the caller needs `roles/compute.osLogin` (or
+`roles/compute.osAdminLogin` for root) on the project, plus IAP tunnel access.
+Revoking the role revokes the shell, with nothing to clean up on the VM.
+Setting `operator.enableOsLogin=false` disables OS Login and drops the IAP
+firewall rule, leaving no login path at all.
 
 ## Development
 
