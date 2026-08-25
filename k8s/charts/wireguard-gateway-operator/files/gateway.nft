@@ -1,6 +1,7 @@
 table inet gateway {
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
+		iif "eth0" ip saddr 35.235.240.0/20 tcp dport 22 accept
 		iif "eth0" meta l4proto { tcp, udp } th dport != __WG_LISTEN_PORT__ dnat ip to __WG_LINK_ADDRESS__
 	}
 
