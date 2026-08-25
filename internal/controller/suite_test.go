@@ -170,13 +170,13 @@ func waitOperatorRBAC(ctx context.Context, t *testing.T, opClient client.Client)
 // newOperatorReconciler wires r's Client and APIReader to the RBAC-scoped operator client
 // so reconcile actions run under the operator's real permissions. Centralized so no call
 // site can accidentally keep the admin client.
-func newOperatorReconciler(te *testEnv, r GatewayReconciler) *GatewayReconciler {
+func newOperatorReconciler(te *testEnv, r *GatewayReconciler) *GatewayReconciler {
 	r.Client = te.operatorClient
 	r.APIReader = te.operatorClient
 	if r.Scheme == nil {
 		r.Scheme = te.scheme
 	}
-	return &r
+	return r
 }
 
 // preserveUnknownProps is the open object schema the minimal CRDs use so the

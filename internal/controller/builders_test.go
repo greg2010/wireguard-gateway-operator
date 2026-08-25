@@ -575,6 +575,29 @@ func hasOpenEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev
 	return false
 }
 
+// hasProtocolOnlyEgress reports whether any egress rule permits the whole of proto to a
+// 0.0.0.0/0 peer, the port-less shape an unresolved (named) backend port renders.
+func hasProtocolOnlyEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol) bool {
+	for _, r := range rules {
+		open := false
+		for _, peer := range r.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				open = true
+				break
+			}
+		}
+		if !open {
+			continue
+		}
+		for _, p := range r.Ports {
+			if p.Protocol != nil && *p.Protocol == proto && p.Port == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // hasNoPeerEgressPort reports whether any egress rule permits proto/port with no `to`
 // peer (all destinations), as the apiserver rule is, since in-cluster apiserver
 // addressing varies by environment.
@@ -619,43 +642,71 @@ func hasDNSEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Pro
 	return false
 }
 
+// fixedEgressRules is the count of egress rules buildLinkNetworkPolicy emits before the
+// per-forward ones: kube-dns, the WireGuard underlay, and the apiserver.
+const fixedEgressRules = 3
+
 // TestBuildLinkNetworkPolicy pins the egress allowlist: DNS, the apiserver (TCP 443 and
-// 6443), the WireGuard underlay, and one rule per forward at its effective target port,
-// with an unset TargetPort defaulting to the public port.
+// 6443), the WireGuard underlay, and one rule per forward carrying exactly the Service
+// port plus the pod-side port that Service DNATs to, since egress is evaluated after
+// kube-proxy rewrites the destination on some CNIs and before it on others.
 func TestBuildLinkNetworkPolicy(t *testing.T) {
+	// port 0 means the entry must carry no port at all, allowing the whole protocol.
+	type wantPort struct {
+		proto corev1.Protocol
+		port  int32
+	}
+
 	tests := []struct {
-		name      string
-		forwards  []wgnetv1alpha1.Forward
-		wantPorts []struct {
-			proto corev1.Protocol
-			port  int32
-		}
+		name     string
+		backends []forwardBackend
+		// wantRules are the per-forward egress rules, in order, each holding the
+		// exact port entries that rule must carry.
+		wantRules [][]wantPort
 	}{
 		{
-			name: "tcp and udp forwards with explicit and defaulted target ports",
-			forwards: []wgnetv1alpha1.Forward{
-				{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443},
-				{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
+			name: "tcp and udp forwards whose service port is the pod port",
+			backends: []forwardBackend{
+				{Forward: wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443}, BackendPort: 8443},
+				{Forward: wgnetv1alpha1.Forward{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"}, BackendPort: 1194},
 			},
-			wantPorts: []struct {
-				proto corev1.Protocol
-				port  int32
-			}{
-				{corev1.ProtocolTCP, 8443},
-				{corev1.ProtocolUDP, 1194},
+			wantRules: [][]wantPort{
+				{{corev1.ProtocolTCP, 8443}},
+				{{corev1.ProtocolUDP, 1194}},
 			},
 		},
 		{
+			name: "service target ports differing from the service port are allowed too",
+			backends: []forwardBackend{
+				{Forward: wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}, BackendPort: 10443},
+				{Forward: wgnetv1alpha1.Forward{Port: 80, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}, BackendPort: 10080},
+			},
+			wantRules: [][]wantPort{
+				{{corev1.ProtocolTCP, 443}, {corev1.ProtocolTCP, 10443}},
+				{{corev1.ProtocolTCP, 80}, {corev1.ProtocolTCP, 10080}},
+			},
+		},
+		{
+			// A named Service targetPort resolves to 0: the pod port is unknown, so the
+			// rule drops its ports entirely rather than emit one the pod never listens
+			// on. nftables inside the link is then the only port restriction.
+			name: "unresolved backend port allows the whole protocol",
+			backends: []forwardBackend{
+				{Forward: wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}},
+			},
+			wantRules: [][]wantPort{{{corev1.ProtocolTCP, 0}}},
+		},
+		{
 			name:     "no forwards still permits control-plane egress",
-			forwards: nil,
+			backends: nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", tt.forwards, nil)
+			gw := newGateway("edge", "wg-system", forwardSpecs(tt.backends), nil)
 
-			np := buildLinkNetworkPolicy(gw, gw.Spec.Forwards)
+			np := buildLinkNetworkPolicy(gw, tt.backends)
 
 			if np.Name != "edge-link" {
 				t.Errorf("networkpolicy name = %q, want edge-link", np.Name)
@@ -678,9 +729,30 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 			if !hasNoPeerEgressPort(egress, corev1.ProtocolTCP, 6443) {
 				t.Errorf("egress missing apiserver TCP 6443 rule (Lease leader election): %+v", egress)
 			}
-			for _, w := range tt.wantPorts {
-				if !hasOpenEgressPort(egress, w.proto, w.port) {
-					t.Errorf("egress missing forward %s %d rule: %+v", w.proto, w.port, egress)
+
+			if len(egress) != fixedEgressRules+len(tt.wantRules) {
+				t.Fatalf("egress rules = %d, want %d: %+v", len(egress), fixedEgressRules+len(tt.wantRules), egress)
+			}
+			for i, want := range tt.wantRules {
+				rule := egress[fixedEgressRules+i]
+				if len(rule.To) != 1 || rule.To[0].IPBlock == nil || rule.To[0].IPBlock.CIDR != "0.0.0.0/0" {
+					t.Errorf("forward rule %d peer = %+v, want a single 0.0.0.0/0 IPBlock", i, rule.To)
+				}
+				if len(rule.Ports) != len(want) {
+					t.Errorf("forward rule %d ports = %+v, want %d entries", i, rule.Ports, len(want))
+					continue
+				}
+				for j, w := range want {
+					got := rule.Ports[j]
+					if got.Protocol == nil || *got.Protocol != w.proto {
+						t.Errorf("forward rule %d port %d protocol = %v, want %s", i, j, got.Protocol, w.proto)
+					}
+					switch {
+					case w.port == 0 && got.Port != nil:
+						t.Errorf("forward rule %d port %d = %v, want no port", i, j, got.Port)
+					case w.port != 0 && (got.Port == nil || got.Port.IntVal != w.port):
+						t.Errorf("forward rule %d port %d = %v, want %d", i, j, got.Port, w.port)
+					}
 				}
 			}
 		})

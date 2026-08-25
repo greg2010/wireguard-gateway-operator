@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -65,6 +67,11 @@ const (
 	reasonTargetPortNotListening      = "TargetPortNotListening"
 )
 
+// reasonUnresolvedBackendPort is an event-only reason: the forward is still valid, so
+// it never reaches the Ready condition. It marks a backend Service whose named
+// targetPort widens the link's egress rule to the whole protocol.
+const reasonUnresolvedBackendPort = "UnresolvedBackendPort"
+
 // crossNamespaceIngressLabel is the opt-in consent label a target namespace must carry
 // before a Gateway elsewhere may forward public traffic into it, so a Gateway owner
 // cannot expose an arbitrary namespace's Service to the internet.
@@ -98,6 +105,12 @@ type GatewayReconciler struct {
 
 	// GenerateKey supplies WireGuard keypairs. Nil defaults to wg.GenerateKeypair.
 	GenerateKey KeyGenerator
+
+	// unresolvedWarned maps a Gateway UID to the signature of the unresolved-backend-port
+	// set it was last warned about, so the steady-state requeue does not re-emit an
+	// identical Warning every pass. It is in-memory on purpose: a controller restart
+	// warns once more per affected Gateway, which is cheaper than a status field.
+	unresolvedWarned sync.Map
 }
 
 // +kubebuilder:rbac:groups=wgnet.dev,resources=gateways,verbs=get;list;watch;create;update;patch;delete
@@ -176,7 +189,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureXGatewayNetwork(ctx); err != nil {
 		return r.fail(ctx, &gw, "ensure shared network", err)
 	}
-	if err := r.ensureXGatewayGCP(ctx, &gw, valid); err != nil {
+	if err := r.ensureXGatewayGCP(ctx, &gw, forwardSpecs(valid)); err != nil {
 		return r.fail(ctx, &gw, "ensure xgatewaygcp", err)
 	}
 
@@ -224,10 +237,31 @@ type invalidForward struct {
 	message string
 }
 
+// forwardBackend is a valid forward paired with the pod-side port its backend Service
+// DNATs to. BackendPort is 0 when the Service names its targetPort, which resolving
+// would require reading EndpointSlices.
+type forwardBackend struct {
+	Forward     wgnetv1alpha1.Forward
+	BackendPort int32
+}
+
+// forwardSpecs extracts the forward specs from classification output, for the
+// consumers that render the spec alone.
+func forwardSpecs(backends []forwardBackend) []wgnetv1alpha1.Forward {
+	forwards := make([]wgnetv1alpha1.Forward, 0, len(backends))
+	for _, b := range backends {
+		forwards = append(forwards, b.Forward)
+	}
+	return forwards
+}
+
 // classifyForwards partitions a Gateway's forwards into the valid subset it may DNAT
 // to and the invalid ones, preserving spec order. A non-NotFound API error fails the
-// whole reconcile rather than misclassifying; reads use the uncached APIReader.
-func (r *GatewayReconciler) classifyForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway) (valid []wgnetv1alpha1.Forward, invalid []invalidForward, err error) {
+// whole reconcile rather than misclassifying; reads use the uncached APIReader. As a
+// side effect it emits an UnresolvedBackendPort Warning per valid forward whose backend
+// port stayed unresolved, gated on the set changing since the last pass.
+func (r *GatewayReconciler) classifyForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway) (valid []forwardBackend, invalid []invalidForward, err error) {
+	var unresolved []unresolvedBackend
 	for _, f := range gw.Spec.Forwards {
 		ns := effectiveForwardNamespace(f, gw)
 
@@ -266,33 +300,98 @@ func (r *GatewayReconciler) classifyForwards(ctx context.Context, gw *wgnetv1alp
 			continue
 		}
 
-		port := effectiveTargetPort(f)
-		if !serviceListensOn(&svc, port, corev1.Protocol(f.Protocol)) {
+		port := effectiveServicePort(f)
+		sp := servicePortFor(&svc, port, corev1.Protocol(f.Protocol))
+		if sp == nil {
 			invalid = append(invalid, invalidForward{reasonTargetPortNotListening,
 				fmt.Sprintf("forward backend Service %q in namespace %q does not publish %s port %d",
 					f.Service, ns, f.Protocol, port)})
 			continue
 		}
 
-		valid = append(valid, f)
+		backendPort := backendPortOf(sp)
+		if backendPort == 0 {
+			unresolved = append(unresolved, unresolvedBackend{
+				service: f.Service, namespace: ns, targetPort: sp.TargetPort.String(), protocol: string(f.Protocol),
+			})
+		}
+
+		valid = append(valid, forwardBackend{Forward: f, BackendPort: backendPort})
 	}
+	r.warnUnresolvedBackendPorts(gw, unresolved)
 	return valid, invalid, nil
 }
 
-// serviceListensOn reports whether svc publishes a service port matching port and
-// proto, comparing against the published spec.ports[].port (not the pods'
-// containerPort). An empty Service-port protocol defaults to TCP per the API.
-func serviceListensOn(svc *corev1.Service, port int32, proto corev1.Protocol) bool {
-	for _, p := range svc.Spec.Ports {
+// unresolvedBackend is a valid forward whose backend Service names its targetPort, so
+// the link's egress rule widens to the whole protocol.
+type unresolvedBackend struct {
+	service    string
+	namespace  string
+	targetPort string
+	protocol   string
+}
+
+// warnUnresolvedBackendPorts emits one Warning per unresolved backend, but only when
+// the set differs from the one last warned about for gw. Every reconcile pass would
+// otherwise re-emit an identical Warning, since the condition is steady state rather
+// than an event.
+func (r *GatewayReconciler) warnUnresolvedBackendPorts(gw *wgnetv1alpha1.Gateway, unresolved []unresolvedBackend) {
+	if r.Recorder == nil {
+		return
+	}
+
+	key := unresolvedWarnKey(gw)
+	if len(unresolved) == 0 {
+		r.unresolvedWarned.Delete(key)
+		return
+	}
+
+	signature := fmt.Sprintf("%v", unresolved)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == signature {
+		return
+	}
+	r.unresolvedWarned.Store(key, signature)
+
+	for _, u := range unresolved {
+		r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonUnresolvedBackendPort, actionReconcile,
+			"forward backend Service %q in namespace %q names its targetPort %q: the link's egress policy allows every %s port to the backend rather than that one",
+			u.service, u.namespace, u.targetPort, u.protocol)
+	}
+}
+
+// unresolvedWarnKey identifies a Gateway instance for unresolvedWarned. It carries
+// the UID so a delete and recreate of a same-named Gateway warns afresh instead of
+// inheriting its predecessor's suppression entry.
+func unresolvedWarnKey(gw *wgnetv1alpha1.Gateway) string {
+	return client.ObjectKeyFromObject(gw).String() + "/" + string(gw.UID)
+}
+
+// servicePortFor returns the service port svc publishes for port and proto, or nil if
+// it publishes none. It matches the published spec.ports[].port (not the pods'
+// containerPort); an empty Service-port protocol defaults to TCP per the API.
+func servicePortFor(svc *corev1.Service, port int32, proto corev1.Protocol) *corev1.ServicePort {
+	for i := range svc.Spec.Ports {
+		p := &svc.Spec.Ports[i]
 		svcProto := p.Protocol
 		if svcProto == "" {
 			svcProto = corev1.ProtocolTCP
 		}
 		if p.Port == port && svcProto == proto {
-			return true
+			return p
 		}
 	}
-	return false
+	return nil
+}
+
+// backendPortOf is the pod-side port kube-proxy rewrites sp's destination to: its
+// numeric targetPort. A named targetPort yields 0 (unresolved), since resolving the
+// name needs the backing EndpointSlices. An unset targetPort never reaches here: the
+// API server defaults it to the service port on write.
+func backendPortOf(sp *corev1.ServicePort) int32 {
+	if sp.TargetPort.Type == intstr.String {
+		return 0
+	}
+	return sp.TargetPort.IntVal
 }
 
 // anyTransientReason reports whether any invalid forward carries a reason a backend
@@ -427,6 +526,7 @@ func (r *GatewayReconciler) releaseFinalizer(ctx context.Context, gw *wgnetv1alp
 	if err := r.Update(ctx, gw); err != nil {
 		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
 	}
+	r.unresolvedWarned.Delete(unresolvedWarnKey(gw))
 	return ctrl.Result{}, nil
 }
 
@@ -507,7 +607,7 @@ func (r *GatewayReconciler) ensureXGatewayNetwork(ctx context.Context) error {
 // ensureLink server-side-applies the link's ServiceAccount, Role, RoleBinding,
 // ConfigMap, NetworkPolicy, and Deployment, all owner-ref'd. The PDB is applied only
 // at replicas>1 and deleted below that so a stale PDB cannot block drains.
-func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, forwards []wgnetv1alpha1.Forward) error {
+func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend) error {
 	if err := r.apply(ctx, gw, buildLinkServiceAccount(gw)); err != nil {
 		return err
 	}
@@ -518,14 +618,14 @@ func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Ga
 		return err
 	}
 
-	cm, err := buildLinkConfigMap(gw, address, forwards)
+	cm, err := buildLinkConfigMap(gw, address, forwardSpecs(backends))
 	if err != nil {
 		return err
 	}
 	if err := r.apply(ctx, gw, cm); err != nil {
 		return err
 	}
-	if err := r.apply(ctx, gw, buildLinkNetworkPolicy(gw, forwards)); err != nil {
+	if err := r.apply(ctx, gw, buildLinkNetworkPolicy(gw, backends)); err != nil {
 		return err
 	}
 	if err := r.apply(ctx, gw, buildLinkDeployment(gw, r.Config)); err != nil {

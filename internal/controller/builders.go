@@ -412,7 +412,7 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, forwards []wg
 			PublicPort: int(f.Port),
 			Protocol:   proto,
 			Service:    forwardServiceFQDN(f, gw),
-			TargetPort: int(effectiveTargetPort(f)),
+			TargetPort: int(effectiveServicePort(f)),
 		})
 	}
 
@@ -452,8 +452,8 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, forwards []wg
 
 // buildLinkNetworkPolicy builds the link pod's egress allowlist: cluster DNS, the
 // apiserver (Lease leader election), the WireGuard underlay, and each forward's backend
-// target port. The link's own nftables default-DROP is the inner containment layer.
-func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.Forward) *networkingv1.NetworkPolicy {
+// ports. The link's own nftables default-DROP is the inner containment layer.
+func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend) *networkingv1.NetworkPolicy {
 	dnsPort53UDP := corev1.ProtocolUDP
 	dnsPort53TCP := corev1.ProtocolTCP
 	wgProto := corev1.ProtocolUDP
@@ -499,17 +499,15 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.
 
 	// The backend peer is 0.0.0.0/0, not the Service CIDR: egress is evaluated against
 	// the ClusterIP on some CNIs and the pod IP on others, and the nftables default-DROP
-	// is the real containment.
-	for _, f := range forwards {
-		proto := corev1ProtocolOf(f.Protocol)
-		targetPort := intstr.FromInt32(effectiveTargetPort(f))
+	// is the real containment. Both the Service port and the pod-side port it DNATs to
+	// are allowed for the same reason: a CNI enforcing egress after kube-proxy DNAT
+	// (k3s kube-router) sees the pod port, one enforcing before it sees the Service port.
+	for _, b := range backends {
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			To: []networkingv1.NetworkPolicyPeer{{
 				IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"},
 			}},
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &proto, Port: &targetPort},
-			},
+			Ports: backendEgressPorts(b),
 		})
 	}
 
@@ -525,6 +523,30 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.
 			Egress:      egress,
 		},
 	}
+}
+
+// backendEgressPorts is the port allowlist of a forward's egress rule: the Service
+// port it DNATs to, plus the pod-side port kube-proxy rewrites that to when the Service
+// remaps it.
+//
+// An unresolved (named) backend port cannot be enumerated without reading the backing
+// EndpointSlices, so the rule is left port-less. The peer is already 0.0.0.0/0, so that
+// leaves the link pod's IPv4 egress on the forward's protocol unrestricted: the link's
+// nftables ruleset is forward-only and has no output chain, so it does not contain
+// traffic the pod itself originates. This is a deliberate tradeoff, taken so a named
+// targetPort keeps working rather than blackholing the forward, and classifyForwards
+// warns when it applies; EndpointSlice-based resolution would remove it.
+func backendEgressPorts(b forwardBackend) []networkingv1.NetworkPolicyPort {
+	proto := corev1ProtocolOf(b.Forward.Protocol)
+	if b.BackendPort == 0 {
+		return []networkingv1.NetworkPolicyPort{{Protocol: &proto}}
+	}
+	svcPort := effectiveServicePort(b.Forward)
+	ports := []networkingv1.NetworkPolicyPort{{Protocol: &proto, Port: new(intstr.FromInt32(svcPort))}}
+	if b.BackendPort != svcPort {
+		ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &proto, Port: new(intstr.FromInt32(b.BackendPort))})
+	}
+	return ports
 }
 
 // corev1ProtocolOf maps a Gateway L4 protocol to its corev1 equivalent for
@@ -553,9 +575,10 @@ func forwardServiceFQDN(f wgnetv1alpha1.Forward, gw *wgnetv1alpha1.Gateway) stri
 	return fmt.Sprintf("%s.%s.svc.cluster.local", f.Service, effectiveForwardNamespace(f, gw))
 }
 
-// effectiveTargetPort is the backend port a forward DNATs to: its TargetPort, or
-// its public Port when TargetPort is unset.
-func effectiveTargetPort(f wgnetv1alpha1.Forward) int32 {
+// effectiveServicePort is the backend Service port a forward DNATs to: its TargetPort,
+// or its public Port when TargetPort is unset. This is the Service's published port,
+// not the pod-side port that Service may remap it to.
+func effectiveServicePort(f wgnetv1alpha1.Forward) int32 {
 	if f.TargetPort == 0 {
 		return f.Port
 	}

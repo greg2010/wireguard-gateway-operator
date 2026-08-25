@@ -21,6 +21,8 @@ const agnhostImage = "registry.k8s.io/e2e-test-images/agnhost:2.53"
 // budget absorbs the backing Deployments' startup, so no readiness wait is done.
 type EchoFixtures struct {
 	TCPService string
+	// TCPPort is the port the TCP echo Service publishes, which is what a forward
+	// targets. The Service remaps it to a different pod port.
 	TCPPort    int
 	UDPService string
 	UDPPort    int
@@ -34,6 +36,12 @@ const (
 	echoXNSName      = "gateway-echo-xns"
 	echoTCPPort      = 8080
 	echoUDPPort      = 8081
+
+	// echoTCPTargetPort is the pod port the TCP echo Service remaps echoTCPPort to, so
+	// the data path covers a Service whose targetPort differs from its port: the link
+	// must be allowed to egress to the pod port kube-proxy DNATs to, not just the
+	// published one.
+	echoTCPTargetPort = 9080
 )
 
 // EchoBackend is a single HTTP echo Service the link can DNAT a forward to. It
@@ -51,13 +59,13 @@ type EchoBackend struct {
 // returns their in-namespace addresses. It does not wait for Available; the data-path
 // probes retry long enough to cover pod startup.
 func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixtures, error) {
-	tcpArgs := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
+	tcpArgs := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPTargetPort)}
 	udpArgs := []string{"netexec", fmt.Sprintf("--udp-port=%d", echoUDPPort), "--http-port=0"}
 
-	if err := c.applyEcho(ctx, ns, echoTCPName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, tcpArgs); err != nil {
+	if err := c.applyEcho(ctx, ns, echoTCPName, echoTCPPort, echoTCPTargetPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, tcpArgs); err != nil {
 		return EchoFixtures{}, err
 	}
-	if err := c.applyEcho(ctx, ns, echoUDPName, echoUDPPort, corev1.ProtocolUDP, corev1.ServiceTypeClusterIP, udpArgs); err != nil {
+	if err := c.applyEcho(ctx, ns, echoUDPName, echoUDPPort, echoUDPPort, corev1.ProtocolUDP, corev1.ServiceTypeClusterIP, udpArgs); err != nil {
 		return EchoFixtures{}, err
 	}
 
@@ -74,7 +82,7 @@ func (c *Client) DeployEchoFixtures(ctx context.Context, ns string) (EchoFixture
 // path. Its name is distinct from the ClusterIP fixtures so both can coexist.
 func (c *Client) DeployNodePortEcho(ctx context.Context, ns string) (EchoBackend, error) {
 	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
-	if err := c.applyEcho(ctx, ns, echoNodePortName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeNodePort, args); err != nil {
+	if err := c.applyEcho(ctx, ns, echoNodePortName, echoTCPPort, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeNodePort, args); err != nil {
 		return EchoBackend{}, err
 	}
 	return EchoBackend{Namespace: ns, Service: echoNodePortName, Port: echoTCPPort}, nil
@@ -89,7 +97,7 @@ func (c *Client) DeployEchoInNamespace(ctx context.Context, ns string, nsLabels 
 		return EchoBackend{}, fmt.Errorf("create namespace %s: %w", ns, err)
 	}
 	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
-	if err := c.applyEcho(ctx, ns, echoXNSName, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
+	if err := c.applyEcho(ctx, ns, echoXNSName, echoTCPPort, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
 		return EchoBackend{}, err
 	}
 	return EchoBackend{Namespace: ns, Service: echoXNSName, Port: echoTCPPort}, nil
@@ -100,16 +108,17 @@ func (c *Client) DeployEchoInNamespace(ctx context.Context, ns string, nsLabels 
 // forward to. It does not wait for Available; the data-path probes cover pod startup.
 func (c *Client) DeployEchoBackend(ctx context.Context, ns, name string) (EchoBackend, error) {
 	args := []string{"netexec", fmt.Sprintf("--http-port=%d", echoTCPPort)}
-	if err := c.applyEcho(ctx, ns, name, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
+	if err := c.applyEcho(ctx, ns, name, echoTCPPort, echoTCPPort, corev1.ProtocolTCP, corev1.ServiceTypeClusterIP, args); err != nil {
 		return EchoBackend{}, err
 	}
 	return EchoBackend{Namespace: ns, Service: name, Port: echoTCPPort}, nil
 }
 
-// applyEcho creates one echo Deployment+Service of the given Service type.
-// Idempotent on the already-exists path so re-running Start in a reused namespace
-// is safe.
-func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto corev1.Protocol, svcType corev1.ServiceType, args []string) error {
+// applyEcho creates one echo Deployment+Service of the given Service type, publishing
+// port and DNATing it to targetPort, which is where the container listens (the caller's
+// args must agree). Idempotent on the already-exists path so re-running Start in a
+// reused namespace is safe.
+func (c *Client) applyEcho(ctx context.Context, ns, name string, port, targetPort int, proto corev1.Protocol, svcType corev1.ServiceType, args []string) error {
 	labels := map[string]string{"app": name}
 	replicas := int32(1)
 
@@ -126,7 +135,7 @@ func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto
 						Image: agnhostImage,
 						Args:  args,
 						Ports: []corev1.ContainerPort{{
-							ContainerPort: int32(port),
+							ContainerPort: int32(targetPort),
 							Protocol:      proto,
 						}},
 					}},
@@ -145,7 +154,7 @@ func (c *Client) applyEcho(ctx context.Context, ns, name string, port int, proto
 			Selector: labels,
 			Ports: []corev1.ServicePort{{
 				Port:       int32(port),
-				TargetPort: intstr.FromInt(port),
+				TargetPort: intstr.FromInt(targetPort),
 				Protocol:   proto,
 			}},
 		},

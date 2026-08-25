@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -111,7 +112,7 @@ func reconcileFixture(ctx context.Context, t *testing.T) (*testEnv, *GatewayReco
 	}
 
 	gen, calls := countingKeyGen()
-	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 	return te, r, gw, client.ObjectKeyFromObject(gw), calls
 }
 
@@ -403,7 +404,7 @@ func TestReconcileSharedNetworkRefcount(t *testing.T) {
 	mustCreate(ctx, t, cl, portedClusterIPService(ns, "vpn", 1194, corev1.ProtocolUDP))
 
 	gen, _ := countingKeyGen()
-	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 	gw1 := sampleGateway("gw-one", ns)
 	gw2 := sampleGateway("gw-two", ns)
@@ -812,7 +813,7 @@ func TestClassifyForwards(t *testing.T) {
 			mustCreate(ctx, t, cl, gw)
 
 			gen, _ := countingKeyGen()
-			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 			key := client.ObjectKeyFromObject(gw)
 
 			result := reconcileToClassification(ctx, t, r, key)
@@ -845,6 +846,214 @@ func TestClassifyForwards(t *testing.T) {
 			}
 			if tt.want.wantRequeue != 0 && result.RequeueAfter != tt.want.wantRequeue {
 				t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, tt.want.wantRequeue)
+			}
+		})
+	}
+}
+
+// TestBackendPortOf pins the pod-side port classification hands to the NetworkPolicy
+// builder: a numeric targetPort as-is, and zero when the Service names it, which only
+// the backing EndpointSlices could resolve. An unset targetPort is not a case here: the
+// API server defaults it (see TestClassifyForwardsResolvesBackendPort).
+func TestBackendPortOf(t *testing.T) {
+	tests := []struct {
+		name string
+		port corev1.ServicePort
+		want int32
+	}{
+		{
+			name: "numeric target port resolves to the pod port",
+			port: corev1.ServicePort{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10443)},
+			want: 10443,
+		},
+		{
+			name: "named target port is unresolved",
+			port: corev1.ServicePort{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("https")},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := backendPortOf(&tt.port); got != tt.want {
+				t.Errorf("backendPortOf = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClassifyForwardsResolvesBackendPort runs against a real API server because every
+// case turns on server-side behaviour the fake client does not reproduce: an unset
+// targetPort is defaulted to the Service port on write, a forward must pick the
+// targetPort of the one published port it matches out of several, and a named targetPort
+// survives the write to reach the unresolved path, which warns.
+func TestClassifyForwardsResolvesBackendPort(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	tests := []struct {
+		name string
+		// ports are the backing Service's published ports.
+		ports []corev1.ServicePort
+		// forwardPort is the public port of the single forward under test; the
+		// forward carries no TargetPort, so it matches the Service port of the same
+		// number.
+		forwardPort int32
+		want        int32
+		// wantWarning expects one UnresolvedBackendPort Warning event.
+		wantWarning bool
+	}{
+		{
+			name:        "api server defaults an unset target port to the service port",
+			ports:       []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP}},
+			forwardPort: 443,
+			want:        443,
+		},
+		{
+			name: "forward matching the second published port resolves that port's target",
+			ports: []corev1.ServicePort{
+				{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10443)},
+				{Name: "http", Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10080)},
+			},
+			forwardPort: 80,
+			want:        10080,
+		},
+		{
+			name:        "named target port stays unresolved and warns",
+			ports:       []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("https")}},
+			forwardPort: 443,
+			want:        0,
+			wantWarning: true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gwNS := fmt.Sprintf("bp-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(gwNS, nil))
+
+			mustCreate(ctx, t, cl, &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: gwNS},
+				Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, Ports: tt.ports},
+			})
+
+			gw := newGateway(gwNS, gwNS, []wgnetv1alpha1.Forward{
+				{Port: tt.forwardPort, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			}, nil)
+			rec := &fakeEventRecorder{}
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), Recorder: rec})
+
+			valid, invalid, err := r.classifyForwards(ctx, gw)
+			if err != nil {
+				t.Fatalf("classify forwards: %v", err)
+			}
+			if len(invalid) != 0 {
+				t.Fatalf("invalid = %+v, want none", invalid)
+			}
+			if len(valid) != 1 {
+				t.Fatalf("valid = %d, want 1", len(valid))
+			}
+			if got := valid[0].BackendPort; got != tt.want {
+				t.Errorf("backend port = %d, want %d", got, tt.want)
+			}
+
+			// A second pass stands in for the steady-state requeue: the warning is tied
+			// to the unresolved set changing, so the event counts below also assert it
+			// is not re-emitted every reconcile.
+			if _, _, err := r.classifyForwards(ctx, gw); err != nil {
+				t.Fatalf("classify forwards (second pass): %v", err)
+			}
+
+			if !tt.wantWarning {
+				if len(rec.events) != 0 {
+					t.Errorf("recorded %+v, want no events", rec.events)
+				}
+				return
+			}
+			if len(rec.events) != 1 {
+				t.Fatalf("recorded %d events, want 1: %+v", len(rec.events), rec.events)
+			}
+			ev := rec.events[0]
+			if ev.eventtype != corev1.EventTypeWarning || ev.reason != reasonUnresolvedBackendPort {
+				t.Errorf("event = %s/%s, want %s/%s", ev.eventtype, ev.reason, corev1.EventTypeWarning, reasonUnresolvedBackendPort)
+			}
+			if !strings.Contains(ev.note, "https") {
+				t.Errorf("event note = %q, want it to name the unresolved targetPort", ev.note)
+			}
+		})
+	}
+}
+
+// TestReconcileNetworkPolicyAllowsRemappedBackendPort pins the whole port-resolution
+// path through a real apply: a Service remapping 443 to pod port 10443 must leave the
+// applied NetworkPolicy allowing egress to 10443, the port kube-proxy DNATs to, while a
+// named targetPort must leave a protocol-only rule. Reading the object back from the API
+// server also rejects a port the schema would refuse and proves the port-less shape
+// survives a server-side apply.
+func TestReconcileNetworkPolicyAllowsRemappedBackendPort(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	tests := []struct {
+		name       string
+		namespace  string
+		targetPort intstr.IntOrString
+		// wantPorts are the numeric TCP ports the applied policy must open to
+		// 0.0.0.0/0.
+		wantPorts []int32
+		// wantProtocolOnly expects a port-less (whole-protocol) egress rule instead,
+		// the shape an unresolved backend port renders.
+		wantProtocolOnly bool
+	}{
+		{
+			name:       "numeric target port opens both the service port and the pod port",
+			namespace:  "np-remap",
+			targetPort: intstr.FromInt32(10443),
+			wantPorts:  []int32{443, 10443},
+		},
+		{
+			name:             "named target port leaves a protocol-only rule",
+			namespace:        "np-named",
+			targetPort:       intstr.FromString("https"),
+			wantProtocolOnly: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mustCreate(ctx, t, cl, namespaceWithLabels(tt.namespace, nil))
+
+			svc := portedClusterIPService(tt.namespace, "web", 443, corev1.ProtocolTCP)
+			svc.Spec.Ports[0].Name = "https"
+			svc.Spec.Ports[0].TargetPort = tt.targetPort
+			mustCreate(ctx, t, cl, svc)
+
+			gw := newGateway("edge", tt.namespace, []wgnetv1alpha1.Forward{
+				{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			}, nil)
+			mustCreate(ctx, t, cl, gw)
+
+			gen, _ := countingKeyGen()
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+			drainReconcile(ctx, t, r, client.ObjectKeyFromObject(gw))
+
+			var np networkingv1.NetworkPolicy
+			mustGet(ctx, t, cl, client.ObjectKey{Namespace: tt.namespace, Name: "edge-link"}, &np)
+
+			for _, port := range tt.wantPorts {
+				if !hasOpenEgressPort(np.Spec.Egress, corev1.ProtocolTCP, port) {
+					t.Errorf("applied networkpolicy missing egress to TCP %d: %+v", port, np.Spec.Egress)
+				}
+			}
+			if tt.wantProtocolOnly {
+				if !hasProtocolOnlyEgress(np.Spec.Egress, corev1.ProtocolTCP) {
+					t.Errorf("applied networkpolicy has no protocol-only TCP egress rule: %+v", np.Spec.Egress)
+				}
+				if hasOpenEgressPort(np.Spec.Egress, corev1.ProtocolTCP, 443) {
+					t.Errorf("applied networkpolicy pins TCP 443 for an unresolved backend port: %+v", np.Spec.Egress)
+				}
 			}
 		})
 	}
@@ -1063,7 +1272,7 @@ func TestReconcilerFailEmitsEvent(t *testing.T) {
 			mustCreate(ctx, t, cl, gw)
 
 			rec := &fakeEventRecorder{}
-			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig()})
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig()})
 			if tt.withRecorder {
 				r.Recorder = rec
 			}
@@ -1159,7 +1368,7 @@ func TestMixedForwards(t *testing.T) {
 	mustCreate(ctx, t, cl, gw)
 
 	gen, _ := countingKeyGen()
-	r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 	key := client.ObjectKeyFromObject(gw)
 
 	result := reconcileToClassification(ctx, t, r, key)
@@ -1259,7 +1468,7 @@ func TestLinkActiveReadyGate(t *testing.T) {
 			key := client.ObjectKeyFromObject(gw)
 
 			gen, _ := countingKeyGen()
-			r := newOperatorReconciler(te, GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 			// Provision the Gateway, then give the composite an address so the address
 			// gate is satisfied and the Ready outcome turns solely on the active tunnel.
