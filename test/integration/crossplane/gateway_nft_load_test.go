@@ -3,6 +3,7 @@ package crossplane
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,13 +11,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 )
 
-// TestGatewayNftLoadsIntoKernel feeds the rendered VM ruleset to a real nft and
-// reads the result back, so a syntax error or a construct this kernel rejects
-// fails here instead of bricking a booting gateway. The kernel's own dump of the
-// gateway table is then re-checked for the IAP-accept-before-DNAT ordering, which
-// the file-level assertion cannot prove survives nft's parse and normalisation.
-// The container's own eth0 satisfies the ruleset's `iif "eth0"`, which nft resolves
-// to an interface index at load time.
+// TestGatewayNftLoadsIntoKernel loads the ruleset into a real nft so a syntax
+// error or a construct this kernel rejects fails here, not on a booting gateway.
 func TestGatewayNftLoadsIntoKernel(t *testing.T) {
 	if os.Getenv("GATEWAY_INTEGRATION") == "" {
 		t.Skip("set GATEWAY_INTEGRATION to run the nft kernel-load integration test")
@@ -27,14 +23,26 @@ func TestGatewayNftLoadsIntoKernel(t *testing.T) {
 	defer cancel()
 
 	ctr := netns.Start(ctx, t)
-	ruleset := renderGatewayNft(t)
 
-	netns.Apply(ctx, t, ctr, ruleset)
+	for _, mode := range nftModes {
+		t.Run(mode.name, func(t *testing.T) {
+			// The file has no add/flush prelude, so each mode needs a cleared netns.
+			if code, out := netns.Exec(ctx, t, ctr, "nft", "flush", "ruleset"); code != 0 {
+				t.Fatalf("nft flush ruleset failed (exit %d):\n%s", code, out)
+			}
 
-	t.Logf("kernel ruleset after load:\n%s", netns.List(ctx, t, ctr, "ruleset"))
+			netns.Apply(ctx, t, ctr, renderGatewayNft(t, mode.verdict))
+			t.Logf("kernel ruleset after load:\n%s", netns.List(ctx, t, ctr, "ruleset"))
 
-	// Scoped to the gateway table so the assertion cannot latch onto a prerouting
-	// chain some other table in the container's netns happens to own.
-	table := netns.List(ctx, t, ctr, "table", "inet", "gateway")
-	assertPreroutingOrder(t, preroutingChain(t, table))
+			// Scoped to the gateway table so the assertion cannot latch onto
+			// another table's prerouting chain.
+			table := netns.List(ctx, t, ctr, "table", "inet", "gateway")
+			assertPreroutingOrder(t, preroutingChain(t, table))
+
+			if strings.Contains(table, "masquerade") != (mode.verdict == "masquerade") {
+				t.Errorf("traffic policy %s: kernel table masquerade presence wrong after nft's normalisation:\n%s",
+					mode.policy, table)
+			}
+		})
+	}
 }

@@ -32,9 +32,8 @@ const (
 	dpProbeTimeout = 5 * time.Second
 )
 
-// TestNftablesRetargetDataPathFollowsClusterIP asserts the data path follows a
-// retargeted ClusterIP: a fresh pre-retarget flow reaches A, an established flow
-// stays pinned to A, and a fresh post-retarget flow reaches B.
+// TestNftablesRetargetDataPathFollowsClusterIP asserts a fresh flow reaches the new
+// target while an established flow stays pinned to the old one by conntrack.
 func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -43,10 +42,10 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 
 	ctr := startDataPathContainer(ctx, t)
 
-	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", ClusterIP: dpClusterIPA, TargetPort: dpTargetPort}
-	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", ClusterIP: dpClusterIPB, TargetPort: dpTargetPort}
+	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPA, TargetPort: dpTargetPort}
+	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPB, TargetPort: dpTargetPort}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardA}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardA}))
 
 	if got := probeOnce(ctx, t, ctr); got != dpMarkerA {
 		t.Fatalf("before retarget: fresh probe = %q, want %q (DNAT to A not working)", got, dpMarkerA)
@@ -58,7 +57,7 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 		t.Fatalf("before retarget: held connection = %q, want %q", got, dpMarkerA)
 	}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardB}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardB}))
 
 	reused := held.request(ctx, t)
 	if reused == "" {
@@ -72,9 +71,8 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	}
 }
 
-// startDataPathContainer brings up the three-netns topology with a wg0 veth peer,
-// unlike startNftContainer whose dummy wg0 cannot carry forwarded traffic. python3
-// runs the stand-in backends and the probes.
+// startDataPathContainer gives wg0 a veth peer: the dummy wg0 the other tests use cannot
+// carry forwarded traffic. python3 runs the stand-in backends and the probes.
 func startDataPathContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 
@@ -84,9 +82,8 @@ func startDataPathContainer(ctx context.Context, t testing.TB) testcontainers.Co
 	return ctr
 }
 
-// topologyScript builds the client/gateway/cluster netns plumbing: wg0 is the
-// gateway end of the client veth, and the stand-in ClusterIPs live behind a second
-// veth in the cluster netns so DNAT'd packets are forwarded, not delivered locally.
+// topologyScript puts the stand-in ClusterIPs behind a second veth in the cluster netns,
+// so DNAT'd packets are forwarded through the accept rules rather than delivered locally.
 const topologyScript = `set -e
 ip netns add client
 ip link add vc-gw type veth peer name wg0
@@ -115,7 +112,6 @@ ip route add 10.96.0.20/32 dev vs-gw
 sysctl -w net.ipv4.ip_forward=1
 `
 
-// setupTopology runs topologyScript in the container.
 func setupTopology(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", topologyScript)
@@ -124,9 +120,8 @@ func setupTopology(ctx context.Context, t testing.TB, ctr testcontainers.Contain
 	}
 }
 
-// backendScript is a line-oriented TCP server bound to one ClusterIP that replies
-// with its marker on every read and keeps the connection open, so a single
-// connection can carry multiple requests (the reuse the test depends on).
+// backendScript keeps the connection open after replying with its marker, so one
+// connection can carry several requests: the reuse the held-flow assertion depends on.
 const backendScript = `import socket, sys
 ip = sys.argv[1]
 marker = sys.argv[2]
@@ -160,8 +155,6 @@ func startBackends(ctx context.Context, t testing.TB, ctr testcontainers.Contain
 	waitClusterListening(ctx, t, ctr)
 }
 
-// waitClusterListening polls until both ClusterIP:port listeners are up in the
-// cluster netns, failing if neither appears before the deadline.
 func waitClusterListening(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
@@ -176,9 +169,8 @@ func waitClusterListening(ctx context.Context, t testing.TB, ctr testcontainers.
 	t.Fatalf("cluster backends did not start listening on port %d within deadline", dpTargetPort)
 }
 
-// probeScript dials a fresh connection from the client netns, sends one request,
-// and prints the reply prefixed GOT: (or ERR: on failure). The fresh connection
-// forces a prerouting DNAT re-evaluation, like the e2e probe's per-poll dial.
+// probeScript dials a fresh connection per probe, which forces a prerouting DNAT
+// re-evaluation, and prints the reply prefixed GOT: (or ERR: on failure).
 const probeScript = `import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(float(sys.argv[3]))
@@ -208,17 +200,15 @@ func probeOnce(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 	return parseMarker(out)
 }
 
-// heldConnection is a client connection kept open across a retarget so the test can
-// observe whether conntrack pins the flow to the old target. It is driven through
-// the filesystem via a generation counter and per-generation reply files.
+// heldConnection is a client connection kept open across a retarget, so the test can
+// observe whether conntrack pins the established flow to the old target.
 type heldConnection struct {
 	ctr testcontainers.Container
 	gen int
 }
 
-// heldScript opens one connection, then on each generation bump sends a request on
-// the held socket and writes the reply to /tmp/held_reply.<gen>. Keeping the socket
-// open between requests is what makes the flow ESTABLISHED across the retarget.
+// heldScript keeps one socket open between requests, which is what makes the flow
+// ESTABLISHED across the retarget; each reply lands in /tmp/held_reply.<gen>.
 const heldScript = `import socket, os, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)
@@ -245,8 +235,6 @@ while True:
     os.rename(tmp, "/tmp/held_reply.%d" % gen)
 `
 
-// openHeldConnection starts the held-connection server in the client netns and
-// returns a handle once the connection is established.
 func openHeldConnection(ctx context.Context, t testing.TB, ctr testcontainers.Container) *heldConnection {
 	t.Helper()
 	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", "echo 0 > /tmp/held_gen"); code != 0 {
@@ -279,9 +267,8 @@ func (h *heldConnection) waitConnected(ctx context.Context, t testing.TB) {
 	t.Fatalf("held connection did not establish to port %d within deadline", dpRetargetPort)
 }
 
-// request sends one request on the held connection and returns the backend
-// marker, or "" if the held flow blackholed (no reply before the wait elapses).
-// It bumps the generation file, then polls for the matching reply file.
+// request sends one request on the held connection and returns the backend marker, or ""
+// when the held flow blackholed: no reply before the wait elapses.
 func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
 	t.Helper()
 	h.gen++
@@ -304,9 +291,8 @@ func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
 	return ""
 }
 
-// close terminates the held-connection server. It runs on context.Background()
-// because the test's own context may already be cancelled by cleanup time; Exec
-// applies its own deadline.
+// close runs on context.Background() because the test's own context may already be
+// cancelled by cleanup time; Exec applies its own deadline.
 func (h *heldConnection) close(t testing.TB) {
 	t.Helper()
 	_, _ = netns.Exec(context.Background(), t, h.ctr, "sh", "-c", "pkill -f held.py || true")
@@ -315,7 +301,7 @@ func (h *heldConnection) close(t testing.TB) {
 // parseMarker extracts the marker from a probe's GOT:/ERR: output, returning ""
 // for an ERR line so callers treat a failed probe as a blackhole.
 func parseMarker(out string) string {
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		line = strings.TrimSpace(line)
 		if m, ok := strings.CutPrefix(line, "GOT:"); ok {
 			return m

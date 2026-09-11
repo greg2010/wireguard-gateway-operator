@@ -16,18 +16,33 @@ var (
 	keyfetchPath = filepath.Join("files", "gcp", "keyfetch.sh")
 )
 
-// nftTestValues stand in for the metadata attributes keyfetch.sh substitutes into
-// the ruleset at instance boot, keyed by placeholder. Every placeholder keyfetch.sh
-// substitutes needs an entry here.
-var nftTestValues = map[string]string{
-	"__WG_LISTEN_PORT__":  "51820",
-	"__WG_LINK_ADDRESS__": "10.99.0.2",
+// nftModes pairs each traffic policy with the postrouting verdict keyfetch.sh
+// substitutes for it.
+var nftModes = []struct {
+	name    string
+	policy  string
+	verdict string
+}{
+	{name: "cluster", policy: "cluster", verdict: "masquerade"},
+	{name: "local", policy: "local", verdict: "return"},
 }
 
-// preroutingOrder lists the prerouting rules whose relative order the gateway
-// ruleset depends on, in the order they must appear. The DNAT diverts every
-// non-WireGuard port at eth0 to the link, so an accept placed after it is never
-// reached: accept ends nat chain traversal.
+// nftTestValues stand in for the metadata attributes keyfetch.sh substitutes at boot.
+// Every placeholder keyfetch.sh substitutes needs an entry here.
+func nftTestValues(verdict string) map[string]string {
+	return map[string]string{
+		"__WG_LISTEN_PORT__":         "51820",
+		"__WG_LINK_ADDRESS__":        "10.99.0.2",
+		"__WG_POSTROUTING_VERDICT__": verdict,
+	}
+}
+
+// verdictCase matches keyfetch.sh's postrouting_verdict case arm, so a change to the
+// shipped mapping fails here rather than silently masquerading a Local gateway.
+var verdictCase = regexp.MustCompile(`(?m)^\s*([a-z]+)\)\s*printf '%s' "([a-z]+)" ;;`)
+
+// preroutingOrder lists rules in the order they must appear: the catch-all DNAT
+// diverts every non-WireGuard port, so an accept placed after it is never reached.
 var preroutingOrder = []struct {
 	name  string
 	match func(rule string) bool
@@ -49,12 +64,46 @@ var preroutingOrder = []struct {
 	},
 }
 
-// TestGatewayNftAllowsIAPSSH asserts the shipped VM ruleset lets IAP-sourced SSH
-// reach the local sshd. It reads the chart file directly, so it runs without a
-// container runtime and catches an ordering regression even where the loading
-// test cannot run.
-func TestGatewayNftAllowsIAPSSH(t *testing.T) {
-	assertPreroutingOrder(t, preroutingChain(t, renderGatewayNft(t)))
+// TestGatewayNftRendersPerTrafficPolicy asserts Cluster masquerades tunnel egress and
+// Local masquerades nothing. It reads the chart files, so it needs no container runtime.
+func TestGatewayNftRendersPerTrafficPolicy(t *testing.T) {
+	for _, mode := range nftModes {
+		t.Run(mode.name, func(t *testing.T) {
+			ruleset := renderGatewayNft(t, mode.verdict)
+			assertPreroutingOrder(t, preroutingChain(t, ruleset))
+
+			hasMasquerade := strings.Contains(ruleset, "masquerade")
+			wantMasquerade := mode.verdict == "masquerade"
+			if hasMasquerade != wantMasquerade {
+				t.Errorf("traffic policy %s: ruleset contains masquerade = %t, want %t\n%s",
+					mode.policy, hasMasquerade, wantMasquerade, ruleset)
+			}
+			want := `oifname "wg0" ` + mode.verdict
+			if !strings.Contains(ruleset, want) {
+				t.Errorf("traffic policy %s: ruleset missing %q\n%s", mode.policy, want, ruleset)
+			}
+		})
+	}
+}
+
+// TestKeyfetchVerdictMapping asserts the shipped boot script and nftModes cannot drift
+// apart on the policy-to-verdict mapping.
+func TestKeyfetchVerdictMapping(t *testing.T) {
+	matches := verdictCase.FindAllStringSubmatch(readChartFile(t, keyfetchPath), -1)
+	got := make(map[string]string, len(matches))
+	for _, m := range matches {
+		got[m[1]] = m[2]
+	}
+	for _, mode := range nftModes {
+		if mode.policy == "cluster" {
+			// cluster is the fallback arm ("*)"), not a named case.
+			continue
+		}
+		if got[mode.policy] != mode.verdict {
+			t.Errorf("%s maps traffic policy %q to %q, want %q; the shipped mapping and nftModes have drifted",
+				keyfetchPath, mode.policy, got[mode.policy], mode.verdict)
+		}
+	}
 }
 
 // assertPreroutingOrder checks every rule in preroutingOrder is present and that
@@ -83,18 +132,17 @@ var placeholderPattern = regexp.MustCompile(`__[A-Z0-9_]+__`)
 // invocation keyfetch.sh renders the ruleset with.
 var keyfetchSubstitution = regexp.MustCompile(`s\|(__[A-Z0-9_]+__)\|[^|]*\|g`)
 
-// renderGatewayNft yields the bytes the VM feeds to `nft -f`, substituting exactly
-// the placeholders keyfetch.sh substitutes rather than a hand-kept copy of that
-// list: a sed expression dropped from keyfetch.sh's render_nft must fail here, not
-// brick a booting gateway. It fails if the two files have drifted in either direction.
-func renderGatewayNft(t *testing.T) string {
+// renderGatewayNft yields the bytes the VM feeds to `nft -f`. It parses the
+// placeholder list out of keyfetch.sh, so drift in either direction fails here.
+func renderGatewayNft(t *testing.T, verdict string) string {
 	t.Helper()
 
 	raw := readChartFile(t, gatewayNftPath)
 
+	values := nftTestValues(verdict)
 	var pairs []string
 	for _, placeholder := range keyfetchPlaceholders(t) {
-		value, ok := nftTestValues[placeholder]
+		value, ok := values[placeholder]
 		if !ok {
 			t.Fatalf("%s substitutes %s, which has no test value in nftTestValues", keyfetchPath, placeholder)
 		}
@@ -136,7 +184,7 @@ func preroutingChain(t *testing.T, ruleset string) []string {
 
 	var rules []string
 	inChain := false
-	for _, line := range strings.Split(ruleset, "\n") {
+	for line := range strings.SplitSeq(ruleset, "\n") {
 		rule := strings.TrimSpace(line)
 		switch {
 		case !inChain:

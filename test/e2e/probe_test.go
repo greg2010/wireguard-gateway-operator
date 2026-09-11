@@ -15,14 +15,12 @@ import (
 	e2eharness "github.com/greg2010/wireguard-gateway-operator/test/harness/e2e"
 )
 
-// dataPathDeadline bounds the host-side reachability retries: only the residual
-// nftables DNAT and route convergence after readiness flips, not tunnel bring-up,
-// which readiness already gates on.
+// dataPathDeadline covers only the nftables DNAT and route convergence left after
+// readiness flips, not tunnel bring-up, which readiness already gates on.
 const dataPathDeadline = 90 * time.Second
 
-// deniedProbeTimeout bounds a single negative probe, whose pass signal is the
-// absence of a response. Kept far below dataPathDeadline so a closed port is not
-// mistaken for a slow one.
+// deniedProbeTimeout bounds one negative probe, whose pass signal is silence. Kept far
+// below dataPathDeadline so a closed port is not mistaken for a slow one.
 const deniedProbeTimeout = 8 * time.Second
 
 // probeTCPThroughGateway issues an HTTP GET to the gateway's public IP on the
@@ -31,16 +29,14 @@ func probeTCPThroughGateway(ctx context.Context, stack *e2eharness.Stack) (strin
 	return probeTCPThroughGatewayPort(ctx, stack, stack.TCPPublicPort)
 }
 
-// probeTCPThroughGatewayPort issues an HTTP GET to the gateway's public IP on the
-// given forwarded TCP port and returns the body, the agnhost /hostname marker that
-// proves the request traversed the tunnel to an in-cluster echo pod.
+// probeTCPThroughGatewayPort returns the agnhost /hostname marker, which proves the
+// request traversed the tunnel to an in-cluster echo pod.
 func probeTCPThroughGatewayPort(ctx context.Context, stack *e2eharness.Stack, port int) (string, error) {
 	return probeTCPThroughGatewayPortUntil(ctx, stack, port, dataPathDeadline)
 }
 
-// probeTCPThroughGatewayPortUntil is probeTCPThroughGatewayPort with an explicit
-// retry budget, for a just-changed forward whose new nftables rule the readiness
-// gate does not trail.
+// probeTCPThroughGatewayPortUntil takes an explicit retry budget, for a just-changed
+// forward whose new nftables rule the readiness gate does not trail.
 func probeTCPThroughGatewayPortUntil(ctx context.Context, stack *e2eharness.Stack, port int, deadline time.Duration) (string, error) {
 	var body string
 	err := retryUntil(ctx, deadline, func(ctx context.Context) error {
@@ -57,11 +53,15 @@ func probeTCPThroughGatewayPortUntil(ctx context.Context, stack *e2eharness.Stac
 	return body, nil
 }
 
-// httpMarker issues one HTTP GET on port and returns the trimmed body, the agnhost
-// /hostname marker. A non-200 or transport error is returned so a caller's retry
-// loop keeps polling.
+// httpMarker returns the agnhost /hostname marker. A non-200 or transport error is
+// returned so a caller's retry loop keeps polling.
 func httpMarker(ctx context.Context, stack *e2eharness.Stack, port int) (string, error) {
-	url := markerURL(stack, port)
+	return httpBody(ctx, markerURL(stack, port))
+}
+
+// httpBody issues one HTTP GET and returns the trimmed body. A non-200 or transport
+// error is returned so a caller's retry loop keeps polling.
+func httpBody(ctx context.Context, url string) (string, error) {
 	// Dial fresh every poll so a connection reused from before a retarget cannot
 	// mask a data-path failure.
 	client := &http.Client{
@@ -93,9 +93,44 @@ func markerURL(stack *e2eharness.Stack, port int) string {
 	return fmt.Sprintf("http://%s/hostname", authority)
 }
 
-// probeUDPThroughGateway sends payload to the forwarded UDP port and returns the
-// echoed bytes. agnhost's UDP server replies only to commands, hence the "echo
-// <msg>" datagram.
+// clientIPURL builds the agnhost /clientip URL. netexec answers with the source address
+// it observes, which is what the traffic policy determines.
+func clientIPURL(stack *e2eharness.Stack, port int) string {
+	authority := net.JoinHostPort(stack.Address, strconv.Itoa(port))
+	return fmt.Sprintf("http://%s/clientip", authority)
+}
+
+// probeClientIPThroughGateway returns the source address netexec observes, without its
+// port. It retries on the data-path budget, like the marker probes.
+func probeClientIPThroughGateway(ctx context.Context, stack *e2eharness.Stack) (string, error) {
+	return probeClientIPThroughGatewayPort(ctx, stack, stack.TCPPublicPort)
+}
+
+// probeClientIPThroughGatewayPort is probeClientIPThroughGateway on an explicit
+// forwarded TCP port, for a forward added after the stack started.
+func probeClientIPThroughGatewayPort(ctx context.Context, stack *e2eharness.Stack, port int) (string, error) {
+	url := clientIPURL(stack, port)
+	var body string
+	err := retryUntil(ctx, dataPathDeadline, func(ctx context.Context) error {
+		got, err := httpBody(ctx, url)
+		if err != nil {
+			return err
+		}
+		body = got
+		return nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("clientip probe %s: %w", url, err)
+	}
+	host, _, err := net.SplitHostPort(body)
+	if err != nil {
+		return "", fmt.Errorf("parse clientip body %q from %s: %w", body, url, err)
+	}
+	return host, nil
+}
+
+// probeUDPThroughGateway returns the echoed bytes. agnhost's UDP server replies only to
+// commands, hence the "echo <msg>" datagram.
 func probeUDPThroughGateway(ctx context.Context, stack *e2eharness.Stack, payload string) (string, error) {
 	addr := net.JoinHostPort(stack.Address, strconv.Itoa(stack.UDPPublicPort))
 
@@ -128,9 +163,8 @@ func probeUDPThroughGateway(ctx context.Context, stack *e2eharness.Stack, payloa
 	return got, nil
 }
 
-// probeTCPDenied asserts a TCP connect to a non-forwarded port does NOT establish
-// within deniedProbeTimeout; the GCP firewall drops the SYN so the dial times out.
-// A successful connection is the failure signal.
+// probeTCPDenied asserts a connect does not establish within deniedProbeTimeout: the GCP
+// firewall drops the SYN, so a successful connection is the failure signal.
 func probeTCPDenied(ctx context.Context, stack *e2eharness.Stack, port int) error {
 	addr := net.JoinHostPort(stack.Address, strconv.Itoa(port))
 	dctx, cancel := context.WithTimeout(ctx, deniedProbeTimeout)
@@ -151,9 +185,8 @@ func probeTCPDenied(ctx context.Context, stack *e2eharness.Stack, port int) erro
 	return fmt.Errorf("tcp connect to non-forwarded port %s failed without timing out (want a dropped SYN, got: %w)", addr, err)
 }
 
-// probeUDPDenied asserts that a UDP datagram to a non-forwarded port draws NO reply
-// within deniedProbeTimeout: silence is the pass signal, a reply is the failure. It
-// must not reuse the positive retry helper, which would wait the full deadline.
+// probeUDPDenied asserts a datagram draws no reply within deniedProbeTimeout. It must
+// not reuse the positive retry helper, which would wait the full deadline.
 func probeUDPDenied(ctx context.Context, stack *e2eharness.Stack, port int, payload string) error {
 	addr := net.JoinHostPort(stack.Address, strconv.Itoa(port))
 	dctx, cancel := context.WithTimeout(ctx, deniedProbeTimeout)
@@ -188,9 +221,8 @@ func probeUDPDenied(ctx context.Context, stack *e2eharness.Stack, port int, payl
 	return fmt.Errorf("udp reply from non-forwarded port %s: %q; want no reply", addr, strings.TrimSpace(string(buf[:n])))
 }
 
-// waitPortDenied polls probeTCPDenied until the port is dropped or deadline
-// elapses, returning the last probe error on timeout. It waits out the firewall
-// re-render a closed forward triggers, which leaves the port briefly reachable.
+// waitPortDenied polls probeTCPDenied, waiting out the firewall re-render a closed
+// forward triggers, which leaves the port briefly reachable.
 func waitPortDenied(ctx context.Context, stack *e2eharness.Stack, port int, deadline time.Duration) error {
 	dctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
@@ -210,9 +242,8 @@ func waitPortDenied(ctx context.Context, stack *e2eharness.Stack, port int, dead
 	}
 }
 
-// pingDenied asserts an ICMP echo draws NO reply within deniedProbeTimeout. Ping
-// exits non-zero on both a drop and a startup error, so the no-reply pass keys on
-// the transmit/receive summary line (or a context kill), never the exit code alone.
+// pingDenied asserts an ICMP echo draws no reply within deniedProbeTimeout. Ping exits
+// non-zero on both a drop and a startup error, so the pass keys on the summary line.
 func pingDenied(ctx context.Context, stack *e2eharness.Stack) error {
 	dctx, cancel := context.WithTimeout(ctx, deniedProbeTimeout)
 	defer cancel()
@@ -231,17 +262,15 @@ func pingDenied(ctx context.Context, stack *e2eharness.Stack) error {
 	return fmt.Errorf("ping to %s did not run as expected (no probe sent, so the ICMP drop is unproven); err=%v, output:\n%s", stack.Address, err, trimmed)
 }
 
-// pingTransmittedNoReply reports whether out carries ping's summary showing a probe
-// was transmitted and zero replies came back, the portable marker that ping ran and
-// was dropped. iputils prints "0 received"; BSD/macOS prints "0 packets received".
+// pingTransmittedNoReply reports whether ping's summary shows a probe transmitted and no
+// reply. iputils prints "0 received"; BSD/macOS prints "0 packets received".
 func pingTransmittedNoReply(out string) bool {
 	return strings.Contains(out, "packets transmitted") &&
 		(strings.Contains(out, "0 received") || strings.Contains(out, "0 packets received"))
 }
 
-// probeUntilMarkerChanges polls until the marker differs from before (non-empty),
-// proving convergence to a fresh pod across a backend roll where the old pod can
-// briefly stay in endpoints. before must be the non-empty pre-roll marker.
+// probeUntilMarkerChanges proves convergence to a fresh pod across a backend roll, where
+// the old pod can briefly stay in endpoints. before must be the pre-roll marker.
 func probeUntilMarkerChanges(ctx context.Context, stack *e2eharness.Stack, port int, before string, deadline time.Duration) (string, error) {
 	var after string
 	err := retryUntil(ctx, deadline, func(ctx context.Context) error {
@@ -261,15 +290,22 @@ func probeUntilMarkerChanges(ctx context.Context, stack *e2eharness.Stack, port 
 	return after, nil
 }
 
+// retryMinAttemptBudget is the budget below which retryUntil stops rather than starting
+// an attempt that would fail on the expiring context instead of on what it tests.
+const retryMinAttemptBudget = 3 * time.Second
+
 // retryUntil invokes fn every second until it returns nil or deadline elapses,
-// returning fn's last error on timeout.
+// returning the last error fn produced with at least retryMinAttemptBudget left.
 func retryUntil(ctx context.Context, deadline time.Duration, fn func(context.Context) error) error {
 	dctx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var last error
-	for {
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 && !hasBudget(dctx, retryMinAttemptBudget) {
+			return last
+		}
 		last = fn(dctx)
 		if last == nil {
 			return nil
@@ -280,4 +316,11 @@ func retryUntil(ctx context.Context, deadline time.Duration, fn func(context.Con
 		case <-ticker.C:
 		}
 	}
+}
+
+// hasBudget reports whether ctx has at least need left before its deadline. A context
+// without a deadline always has budget.
+func hasBudget(ctx context.Context, need time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Until(deadline) >= need
 }

@@ -24,11 +24,11 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	ctr := startNftContainer(ctx, t)
 
 	twoForwards := []link.ResolvedForward{
-		{Name: "tcp-svc", PublicPort: 8443, Protocol: "tcp", ClusterIP: "10.96.1.1", TargetPort: 443},
-		{Name: "udp-svc", PublicPort: 30000, Protocol: "udp", ClusterIP: "10.96.2.2", TargetPort: 9000},
+		{Name: "tcp-svc", PublicPort: 8443, Protocol: "tcp", Target: "10.96.1.1", TargetPort: 443},
+		{Name: "udp-svc", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.2", TargetPort: 9000},
 	}
 
-	rulesetTwo := renderRuleset(t, twoForwards)
+	rulesetTwo := renderRuleset(t, link.RuntimeConfig{}, twoForwards)
 
 	netns.Apply(ctx, t, ctr, rulesetTwo)
 	firstListing := listTable(ctx, t, ctr)
@@ -50,7 +50,7 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	}
 
 	oneForward := []link.ResolvedForward{twoForwards[0]}
-	rulesetOne := renderRuleset(t, oneForward)
+	rulesetOne := renderRuleset(t, link.RuntimeConfig{}, oneForward)
 	netns.Apply(ctx, t, ctr, rulesetOne)
 	prunedListing := listTable(ctx, t, ctr)
 
@@ -67,9 +67,8 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	}
 }
 
-// TestNftablesRetargetReplacesClusterIP repoints a forward from ClusterIP_A to
-// ClusterIP_B and asserts the ruleset DNATs and accepts B, references A nowhere, and
-// programs exactly one forward, so a stale or diverging rule surfaces as a blackhole.
+// TestNftablesRetargetReplacesClusterIP repoints a forward to a second ClusterIP: a rule
+// left on the old one, or a DNAT and accept pair that diverge, blackholes traffic.
 func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -86,16 +85,16 @@ func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 		clusterIPB       = "10.96.0.20"
 	)
 
-	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, ClusterIP: clusterIPA, TargetPort: retargetTarget}
-	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, ClusterIP: clusterIPB, TargetPort: retargetTarget}
+	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, Target: clusterIPA, TargetPort: retargetTarget}
+	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, Target: clusterIPB, TargetPort: retargetTarget}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardA}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardA}))
 	beforeListing := listTable(ctx, t, ctr)
 	if dnat := dnatRuleFor(forwardA); !strings.Contains(beforeListing, dnat) {
 		t.Fatalf("before retarget: DNAT to ClusterIP_A missing: %q\n%s", dnat, beforeListing)
 	}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, []link.ResolvedForward{forwardB}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardB}))
 	afterListing := listTable(ctx, t, ctr)
 
 	wantDNAT := dnatRuleFor(forwardB)
@@ -124,8 +123,6 @@ func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 	}
 }
 
-// startNftContainer starts the shared nft container and adds the dummy wg0 the
-// rendered ruleset needs.
 func startNftContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 	ctr := netns.Start(ctx, t)
@@ -133,9 +130,8 @@ func startNftContainer(ctx context.Context, t testing.TB) testcontainers.Contain
 	return ctr
 }
 
-// createWG0 adds a dummy wg0 so the ruleset loads: the rules match `iif "wg0"`,
-// which nft resolves to an interface index at load time and rejects when absent. It
-// reproduces production's precondition without a real WireGuard tunnel.
+// createWG0 adds a dummy wg0: the rules match `iif "wg0"`, which nft resolves to an
+// interface index at load time and rejects when the device is absent.
 func createWG0(ctx context.Context, t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	code, out := netns.Exec(ctx, t, ctr, "ip", "link", "add", "wg0", "type", "dummy")
@@ -144,18 +140,17 @@ func createWG0(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 	}
 }
 
-// renderRuleset renders forwards through the production RenderNftables, the same
-// bytes the daemon pipes to `nft -f -`.
-func renderRuleset(t testing.TB, forwards []link.ResolvedForward) string {
+// renderRuleset renders forwards through the production RenderNftables for rc's mode,
+// the same bytes the daemon pipes to `nft -f -`.
+func renderRuleset(t testing.TB, rc link.RuntimeConfig, forwards []link.ResolvedForward) string {
 	t.Helper()
-	out, err := link.RenderNftables(forwards)
+	out, err := link.RenderNftables(rc, forwards)
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
 	return out
 }
 
-// listTable returns the kernel's view of the gateway table after an apply.
 func listTable(ctx context.Context, t testing.TB, ctr testcontainers.Container) string {
 	t.Helper()
 	return netns.List(ctx, t, ctr, "table", "inet", "gateway")
@@ -170,12 +165,11 @@ func countDNATRules(listing string) int {
 // dnatRuleFor returns the prerouting DNAT statement RenderNftables emits for f, as
 // it appears in `nft list table` output.
 func dnatRuleFor(f link.ResolvedForward) string {
-	return fmt.Sprintf("%s dport %d dnat ip to %s:%d", f.Protocol, f.PublicPort, f.ClusterIP, f.TargetPort)
+	return fmt.Sprintf("%s dport %d dnat ip to %s:%d", f.Protocol, f.PublicPort, f.Target, f.TargetPort)
 }
 
-// acceptRuleFor returns the forward-chain accept statement RenderNftables emits for
-// f. It keys on the post-DNAT destination (ClusterIP and target port), so a retarget
-// must move it in lockstep with the DNAT.
+// acceptRuleFor keys on the post-DNAT destination (ClusterIP and target port), so a
+// retarget must move the accept in lockstep with the DNAT.
 func acceptRuleFor(f link.ResolvedForward) string {
-	return fmt.Sprintf("iif \"wg0\" ip daddr %s %s dport %d accept", f.ClusterIP, f.Protocol, f.TargetPort)
+	return fmt.Sprintf("iif \"wg0\" ip daddr %s %s dport %d accept", f.Target, f.Protocol, f.TargetPort)
 }

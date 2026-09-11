@@ -2,8 +2,11 @@ package e2e_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,7 +14,9 @@ import (
 
 	"golang.org/x/sync/errgroup"
 	policyv1 "k8s.io/api/policy/v1"
+	utilexec "k8s.io/client-go/util/exec"
 
+	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	e2eharness "github.com/greg2010/wireguard-gateway-operator/test/harness/e2e"
 	hk8s "github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
@@ -31,9 +36,8 @@ const (
 	consentValue = "true"
 )
 
-// lifecycleConditionTimeout bounds a lifecycle subtest's wait for the operator to
-// re-stamp Ready after a forward/backend/consent change: a re-classification and
-// status write, not a GCP round trip.
+// lifecycleConditionTimeout bounds a wait for the operator to re-stamp Ready after a
+// forward, backend or consent change: a re-classification and status write, not a GCP trip.
 const lifecycleConditionTimeout = 90 * time.Second
 
 // lifecycleReadyTimeout bounds a lifecycle subtest's wait for the Gateway to return
@@ -44,9 +48,8 @@ const lifecycleReadyTimeout = editRollTimeout
 // Ready=False, decided on the first reconcile and so short.
 const deniedConditionTimeout = 90 * time.Second
 
-// editRollTimeout bounds the wait for the Gateway to return Ready after a live
-// forward edit (re-render, in-place nftables re-apply, fresh handshake), with no
-// pod replacement.
+// editRollTimeout bounds the wait for Ready after a live forward edit: re-render, in-place
+// nftables re-apply and a fresh handshake, with no pod replacement.
 const editRollTimeout = 3 * time.Minute
 
 // coexistWGListenPortA and coexistWGListenPortB are the distinct WireGuard listen
@@ -57,18 +60,16 @@ const (
 	coexistWGListenPortB = 51821
 )
 
-// TestGatewayCoexistence validates that two gateways sharing one GCP VPC are isolated
-// by per-gateway service-account scoping: each serves only its own forwards, the
-// other's port is dropped at its firewall, and one VPC backs both.
+// TestGatewayCoexistence covers two gateways sharing one GCP VPC, isolated by per-gateway
+// service-account scoping: each serves only its own forwards, and one VPC backs both.
 func TestGatewayCoexistence(t *testing.T) {
 	t.Parallel()
 
 	suite := getSuite(t)
 	ctx := context.Background()
 
-	// Distinct WG and exposed ports make the firewall isolation assertion below a
-	// real test of per-gateway targetServiceAccounts scoping, not port bookkeeping.
-	// Bring-up errors are re-raised on the test goroutine, where t.Fatal is legal.
+	// Distinct WG and exposed ports make the isolation assertion test targetServiceAccounts
+	// scoping, not port bookkeeping. Bring-up errors re-raise where t.Fatal is legal.
 	var stackA, stackB *e2eharness.Stack
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -183,9 +184,8 @@ func TestGatewayCoexistence(t *testing.T) {
 	}
 }
 
-// assertFirewallIsolation fails unless every firewall rule for stack's gateway
-// targets only ownSA, and the gateway's own WireGuard port appears in some rule's
-// allowed UDP ports while otherWG does not.
+// assertFirewallIsolation fails unless every firewall rule for stack's gateway targets only
+// ownSA and opens the gateway's own WireGuard port in some rule but never otherWG.
 func assertFirewallIsolation(ctx context.Context, t *testing.T, suite *e2eharness.Suite, stack *e2eharness.Stack, ownSA, otherSA string, otherWG int) {
 	t.Helper()
 
@@ -226,9 +226,8 @@ func assertFirewallIsolation(ctx context.Context, t *testing.T, suite *e2eharnes
 	}
 }
 
-// TestGatewayDataPath validates the data path against real GCP: forwarded TCP/UDP
-// echoes (ClusterIP, NodePort, cross-namespace) are reachable on the public IP while
-// non-forwarded ports and internet ICMP are not, proving firewall and DNAT closure.
+// TestGatewayDataPath covers the data path against real GCP: forwarded TCP and UDP echoes
+// are reachable on the public IP while non-forwarded ports and internet ICMP are not.
 func TestGatewayDataPath(t *testing.T) {
 	t.Parallel()
 
@@ -254,6 +253,52 @@ func TestGatewayDataPath(t *testing.T) {
 		// merely some pod.
 		assertBackendMarker(t, marker, stack.TCPBackendName)
 		t.Logf("tcp echo marker (echo pod name): %s", marker)
+	})
+
+	t.Run("clientip-cluster", func(t *testing.T) {
+		got, err := probeClientIPThroughGateway(ctx, stack)
+		if err != nil {
+			t.Fatalf("clientip data path: %v", err)
+		}
+		podIPs, err := suite.Client().LinkPodIPs(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("read link pod IPs: %v", err)
+		}
+		if !slices.Contains(podIPs, got) {
+			t.Errorf("Cluster-mode /clientip = %q, want one of the link pod IPs %v; the link's postrouting masquerade is what rewrites the source in this mode",
+				got, podIPs)
+		}
+	})
+
+	// link-status-cluster proves a Cluster Gateway consumes no link id and still
+	// reports which node runs the pod holding the Lease.
+	t.Run("link-status-cluster", func(t *testing.T) {
+		holder, err := suite.Client().GetLeaseHolder(ctx, stack.Namespace, linkLeaseName(stack.GatewayName))
+		if err != nil {
+			t.Fatalf("read lease holder: %v", err)
+		}
+		if holder == "" {
+			t.Fatal("link lease has no holder; no replica programs the data plane")
+		}
+		node, err := suite.Client().PodNode(ctx, stack.Namespace, holder)
+		if err != nil {
+			t.Fatalf("read node of holder %s: %v", holder, err)
+		}
+		if err := retryUntil(ctx, lifecycleConditionTimeout, func(ctx context.Context) error {
+			status, err := suite.Client().GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+			if err != nil {
+				return err
+			}
+			if status.LinkID != 0 {
+				return fmt.Errorf("status.link.id = %d, want 0; a Cluster gateway allocates no link id", status.LinkID)
+			}
+			if status.ActiveNode != node {
+				return fmt.Errorf("status.link.activeNode = %q, want the holder %s's node %q", status.ActiveNode, holder, node)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("cluster-mode link status: %v", err)
+		}
 	})
 
 	t.Run("udp", func(t *testing.T) {
@@ -306,9 +351,8 @@ func TestGatewayDataPath(t *testing.T) {
 		}
 	})
 
-	// forward-retarget proves the data path tracks a retarget: it points a dedicated
-	// forward at one backend then retargets to a second, leaving create-time forwards
-	// untouched.
+	// forward-retarget points a dedicated forward at one backend then retargets it to a
+	// second, leaving the create-time forwards untouched.
 	t.Run("forward-retarget", func(t *testing.T) {
 		client := suite.Client()
 
@@ -384,9 +428,8 @@ func TestGatewayDataPath(t *testing.T) {
 	})
 }
 
-// TestGatewayForwardEdit validates that live forward edits take effect over the
-// wire: adding a forward rolls the link onto new nftables rules without a pod roll,
-// and a forward to a missing Service is denied then admitted once it appears.
+// TestGatewayForwardEdit covers live forward edits over the wire: adding one rolls the link
+// onto new nftables rules with no pod roll, and a forward to a missing Service is denied.
 func TestGatewayForwardEdit(t *testing.T) {
 	t.Parallel()
 
@@ -436,9 +479,8 @@ func TestGatewayForwardEdit(t *testing.T) {
 		t.Logf("edited-forward echo marker (echo pod name): %s", marker)
 	})
 
-	// The live-classification subtests each attach and remove a dedicated forward,
-	// never touching the valid create-time forwards, so an invalid dedicated forward
-	// leaves the VM up with Ready=False rather than tearing it down.
+	// The live-classification subtests only add and remove dedicated forwards, so an invalid
+	// one leaves the VM up with Ready=False rather than tearing it down.
 
 	// service-created-after-gateway: a forward to a missing Service is denied
 	// (ServiceNotFound); creating the Service admits it and the port becomes reachable.
@@ -491,9 +533,8 @@ func TestGatewayForwardEdit(t *testing.T) {
 	})
 }
 
-// TestGatewayConsentLifecycle validates per-forward classification transitions on a
-// live gateway: deleting a backend Service closes only its forward, and toggling the
-// consent label denies, admits, then re-denies a cross-namespace forward.
+// TestGatewayConsentLifecycle covers per-forward classification on a live gateway: deleting
+// a backend Service closes only its forward, and the consent label gates a cross-ns one.
 func TestGatewayConsentLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -568,9 +609,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		assertBackendMarker(t, survivor, stack.TCPBackendName)
 	})
 
-	// consent-label-toggle: a cross-namespace forward into an unlabelled namespace is
-	// denied; the operator's Namespace watch observes the consent label toggling and
-	// re-classifies it admitted then denied again.
+	// consent-label-toggle: the operator's Namespace watch observes the label, so the forward
+	// is re-classified without a Gateway edit.
 	t.Run("consent-label-toggle", func(t *testing.T) {
 		client := suite.Client()
 
@@ -637,9 +677,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		}
 	})
 
-	// backend-rollout proves a forward's DNAT targets the Service's stable ClusterIP,
-	// not a specific pod: after rolling every backend pod the forward still carries
-	// traffic to a fresh one.
+	// backend-rollout proves a forward's DNAT targets the Service's stable ClusterIP, not a
+	// pod: after rolling every backend pod the forward still carries traffic.
 	t.Run("backend-rollout", func(t *testing.T) {
 		client := suite.Client()
 
@@ -678,9 +717,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 		}
 		assertBackendMarker(t, before, svcName)
 
-		// At replicas=1 the old pod can linger in endpoints across the roll, so a
-		// single post-roll probe can catch the old marker; poll until it changes under
-		// the lifecycle budget the roll plus old-endpoint drain can need.
+		// At replicas=1 the old pod can linger in endpoints across the roll, so poll until
+		// the marker changes under the budget the roll and endpoint drain can need.
 		if err := client.RestartDeployment(ctx, stack.Namespace, svcName); err != nil {
 			t.Fatalf("restart rollout backend: %v", err)
 		}
@@ -700,9 +738,8 @@ func TestGatewayConsentLifecycle(t *testing.T) {
 	})
 }
 
-// TestGatewayTargetPortLifecycle validates targetPort classification (a forward to a
-// non-published targetPort is denied and unreachable, then admitted once corrected)
-// and that a Gateway with only an unlabelled cross-namespace forward provisions no VM.
+// TestGatewayTargetPortLifecycle covers targetPort classification, and a Gateway whose only
+// forward is an unlabelled cross-namespace one, which must provision no VM at all.
 func TestGatewayTargetPortLifecycle(t *testing.T) {
 	t.Parallel()
 
@@ -768,9 +805,8 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 		assertBackendMarker(t, marker, stack.TCPBackendName)
 	})
 
-	// cross-namespace-denied applies a Gateway whose only forward targets an
-	// unlabelled namespace; with zero valid forwards the operator never creates a VM
-	// and reports the Ready=False denial reason.
+	// cross-namespace-denied: with zero valid forwards the operator never creates a VM and
+	// reports the denial reason on Ready=False.
 	t.Run("cross-namespace-denied", func(t *testing.T) {
 		client := suite.Client()
 		env := suite.Env()
@@ -822,9 +858,8 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 		}
 	})
 
-	// link-pod-restart proves the data path survives losing the active link pod: the
-	// new holder re-establishes the tunnel and DNAT before traffic flows. It keys on
-	// the lease holder moving, the failover signal at any replica count.
+	// link-pod-restart keys on the lease holder moving, the failover signal at any replica
+	// count; the new holder re-establishes the tunnel and DNAT before traffic flows.
 	t.Run("link-pod-restart", func(t *testing.T) {
 		client := suite.Client()
 
@@ -871,18 +906,24 @@ func TestGatewayTargetPortLifecycle(t *testing.T) {
 	// envtest, not duplicated here so each shard stays a single VM.
 }
 
-// haFailoverTimeout bounds the wait for the link lease holder to move to a survivor:
-// one lease-duration plus the new holder publishing itself, not the tunnel bring-up
-// the data-path probe owns.
+// haFailoverTimeout bounds the wait for the link lease holder to move: one lease duration
+// plus the new holder publishing itself, not the tunnel bring-up the probe owns.
 const haFailoverTimeout = 90 * time.Second
 
 // haReplicas is the link replica count TestGatewayLinkHA provisions: one active plus
 // one standby, the minimum exercising leader election, fencing, failover, and a PDB.
 const haReplicas = 2
 
-// TestGatewayLinkHA validates the link's active-passive HA at two replicas behind
-// leader election: exactly the lease holder runs wg0 and the inet gateway table, and
-// the data path survives failover, a rolling update, and a budgeted eviction.
+// clusterLinkIface is the WireGuard interface a Cluster-mode link programs. Local mode
+// derives its name from the link id instead.
+const clusterLinkIface = "wg0"
+
+// clusterNftTable is the inet nftables table a Cluster-mode link programs, the data-plane
+// half of the single-active invariant. Local mode derives its name from the link id.
+const clusterNftTable = "gateway"
+
+// TestGatewayLinkHA covers active-passive HA at two replicas: only the lease holder runs wg0
+// and the inet table, and the path survives failover, a roll and a budgeted eviction.
 func TestGatewayLinkHA(t *testing.T) {
 	t.Parallel()
 
@@ -912,11 +953,8 @@ func TestGatewayLinkHA(t *testing.T) {
 
 	// single-active proves exactly one replica owns wg0 and it is the lease holder.
 	t.Run("single-active", func(t *testing.T) {
-		holder, owners := assertSingleWG0Owner(ctx, t, client, stack.Namespace, selector, leaseName)
+		holder, _ := assertSingleIfaceOwner(ctx, t, client, stack.Namespace, selector, leaseName, clusterLinkIface, haFailoverTimeout)
 		t.Logf("active link replica: %s (lease holder, sole wg0 owner)", holder)
-		if len(owners) != 1 || owners[0] != holder {
-			t.Fatalf("wg0 owners %v do not match lease holder %q", owners, holder)
-		}
 	})
 
 	// standby-idle proves every non-holder replica carries no data plane (neither wg0
@@ -939,7 +977,7 @@ func TestGatewayLinkHA(t *testing.T) {
 				continue
 			}
 			standbys++
-			if podHasWG0(ctx, t, client, stack.Namespace, pod) {
+			if podHasIface(ctx, t, client, stack.Namespace, pod, clusterLinkIface) {
 				t.Errorf("standby %s has wg0; a demoted replica must not carry the interface", pod)
 			}
 			if podHasGatewayTable(ctx, t, client, stack.Namespace, pod) {
@@ -987,9 +1025,8 @@ func TestGatewayLinkHA(t *testing.T) {
 		assertBackendMarker(t, after, stack.TCPBackendName)
 	})
 
-	// rolling-update proves a link rollout keeps the data path serviceable: with
-	// maxUnavailable=0 and leader election the holder stays up until a replacement is
-	// Ready, so traffic tolerates at most a brief failover blip.
+	// rolling-update: with maxUnavailable=0 and leader election the holder stays up until a
+	// replacement is Ready, so traffic tolerates at most a brief failover blip.
 	t.Run("rolling-update", func(t *testing.T) {
 		if err := client.RestartDeployment(ctx, stack.Namespace, leaseName); err != nil {
 			t.Fatalf("restart link deployment: %v", err)
@@ -1008,15 +1045,11 @@ func TestGatewayLinkHA(t *testing.T) {
 		}
 
 		// The single-active invariant must survive the roll.
-		holder, owners := assertSingleWG0Owner(ctx, t, client, stack.Namespace, selector, leaseName)
-		if len(owners) != 1 || owners[0] != holder {
-			t.Fatalf("after rolling update, wg0 owners %v do not match lease holder %q", owners, holder)
-		}
+		assertSingleIfaceOwner(ctx, t, client, stack.Namespace, selector, leaseName, clusterLinkIface, haFailoverTimeout)
 	})
 
-	// pdb-protects proves the link PodDisruptionBudget targets the link pods: the
-	// controller reports one disruption allowed, then one eviction succeeds. The
-	// status assertion catches the real failure mode, a selector matching no pods.
+	// pdb-protects: the status assertion catches the real failure mode, a selector matching
+	// no pods, which a successful eviction alone would not surface.
 	t.Run("pdb-protects", func(t *testing.T) {
 		if err := client.SetLinkReplicas(ctx, stack.Namespace, stack.GatewayName, haReplicas); err != nil {
 			t.Fatalf("rescale link to %d replicas: %v", haReplicas, err)
@@ -1059,53 +1092,65 @@ func linkLeaseName(gatewayName string) string {
 	return gatewayName + "-link"
 }
 
-// assertSingleWG0Owner fails unless exactly one link replica owns wg0 and it is the
-// lease holder, returning the holder and the observed owners.
-func assertSingleWG0Owner(ctx context.Context, t *testing.T, client *hk8s.Client, ns, selector, leaseName string) (holder string, owners []string) {
+// assertSingleIfaceOwner polls until exactly one replica owns iface and holds the lease: a
+// replaced pod can briefly leave two owners, so the invariant is given until timeout.
+func assertSingleIfaceOwner(ctx context.Context, t *testing.T, client *hk8s.Client, ns, selector, leaseName, iface string, timeout time.Duration) (holder string, owners []string) {
 	t.Helper()
-	holder, err := client.GetLeaseHolder(ctx, ns, leaseName)
-	if err != nil {
-		t.Fatalf("read lease holder: %v", err)
-	}
-	if holder == "" {
-		t.Fatal("link lease has no holder; no active replica")
-	}
-	pods, err := client.PodNamesByLabel(ctx, ns, selector)
-	if err != nil {
-		t.Fatalf("list link pods: %v", err)
-	}
-	for _, pod := range pods {
-		if podHasWG0(ctx, t, client, ns, pod) {
-			owners = append(owners, pod)
+	var pods []string
+	if err := retryUntil(ctx, timeout, func(ctx context.Context) error {
+		var err error
+		holder, err = client.GetLeaseHolder(ctx, ns, leaseName)
+		if err != nil {
+			return err
 		}
-	}
-	if len(owners) != 1 {
-		t.Fatalf("wg0 owners = %v among link pods %v, want exactly one (the lease holder %q)", owners, pods, holder)
+		if holder == "" {
+			return errors.New("link lease has no holder; no active replica")
+		}
+		pods, err = client.PodNamesByLabel(ctx, ns, selector)
+		if err != nil {
+			return err
+		}
+		owners = nil
+		for _, pod := range pods {
+			if podHasIface(ctx, t, client, ns, pod, iface) {
+				owners = append(owners, pod)
+			}
+		}
+		if len(owners) != 1 || owners[0] != holder {
+			return fmt.Errorf("%s owners = %v among link pods %v, want exactly the lease holder %q", iface, owners, pods, holder)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("want exactly one %s owner, the lease holder, within %s (last holder %q, owners %v): %v", iface, timeout, holder, owners, err)
 	}
 	return holder, owners
 }
 
-// podHasWG0 reports whether the link pod has the wg0 interface, via `ip link show
-// wg0`. Only the active replica runs wg0, so this distinguishes the holder from a
-// fenced standby.
-func podHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string) bool {
+// podHasIface answers for the pod's node, since link pods run hostNetwork: only the active
+// replica carries the link's iface. An exec failure fails the test rather than reading false.
+func podHasIface(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod, iface string) bool {
 	t.Helper()
-	_, _, err := client.ExecInPod(ctx, ns, pod, []string{"ip", "link", "show", "wg0"})
-	return err == nil
+	_, stderr, err := client.ExecInPod(ctx, ns, pod, []string{"ip", "link", "show", iface})
+	if err == nil {
+		return true
+	}
+	if _, ok := errors.AsType[utilexec.CodeExitError](err); ok {
+		return false
+	}
+	t.Fatalf("ip link show %s in %s/%s: %v (stderr: %s)", iface, ns, pod, err, strings.TrimSpace(stderr))
+	return false
 }
 
-// podHasGatewayTable reports whether the link pod has the inet gateway nftables
-// table. Only the active replica programs it, so a standby carrying it is a stale
-// data plane.
+// podHasGatewayTable reports whether the inet gateway table is present. Only the active
+// replica programs it, so a standby carrying it is a stale data plane.
 func podHasGatewayTable(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string) bool {
 	t.Helper()
-	_, _, err := client.ExecInPod(ctx, ns, pod, []string{"nft", "list", "table", "inet", "gateway"})
+	_, _, err := client.ExecInPod(ctx, ns, pod, []string{"nft", "list", "table", "inet", clusterNftTable})
 	return err == nil
 }
 
-// waitPodHasWG0 polls until the link pod has wg0 or the timeout elapses. The new
-// holder brings wg0 up only after acquiring leadership, so the failover assertion
-// gives that a bounded window rather than racing it.
+// waitPodHasWG0 gives wg0 a bounded window: the new holder brings it up only after
+// acquiring leadership, so the failover assertion must not race it.
 func waitPodHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod string, timeout time.Duration) error {
 	t.Helper()
 	dctx, cancel := context.WithTimeout(ctx, timeout)
@@ -1113,7 +1158,7 @@ func waitPodHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, p
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
-		if podHasWG0(dctx, t, client, ns, pod) {
+		if podHasIface(dctx, t, client, ns, pod, clusterLinkIface) {
 			return nil
 		}
 		select {
@@ -1124,9 +1169,8 @@ func waitPodHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, p
 	}
 }
 
-// waitPDBProtects polls the named PodDisruptionBudget until the controller computes
-// full protection (Expected/CurrentHealthy==replicas, DesiredHealthy==replicas-1,
-// DisruptionsAllowed==1), proving the selector matches; a bad selector stalls at NoPods.
+// waitPDBProtects polls until the controller computes full protection, which proves the
+// selector matches the link pods; a bad selector stalls at NoPods.
 func waitPDBProtects(ctx context.Context, t *testing.T, client *hk8s.Client, ns, name string, replicas int32, timeout time.Duration) error {
 	t.Helper()
 	dctx, cancel := context.WithTimeout(ctx, timeout)
@@ -1151,9 +1195,8 @@ func waitPDBProtects(ctx context.Context, t *testing.T, client *hk8s.Client, ns,
 	}
 }
 
-// assertBackendMarker fails unless marker (an agnhost /hostname pod name) carries
-// backend as a prefix. The pod name is its Deployment's name plus a suffix, so the
-// prefix identifies which backend answered; a mismatch is a misrouted forward.
+// assertBackendMarker checks an agnhost /hostname reply: a pod name is its Deployment's name
+// plus a suffix, so the prefix names the backend that answered.
 func assertBackendMarker(t *testing.T, marker, backend string) {
 	t.Helper()
 	if marker == "" {
@@ -1164,9 +1207,8 @@ func assertBackendMarker(t *testing.T, marker, backend string) {
 	}
 }
 
-// appendForward appends f to the spec's forwards slice in the unstructured shape
-// the API server stores, mirroring hk8s.CreateGateway. namespace and targetPort are
-// included only when set; a zero targetPort would fail the CRD's minimum=1.
+// appendForward writes the unstructured shape the API server stores. A zero targetPort is
+// omitted rather than sent, since the CRD sets minimum=1.
 func appendForward(spec map[string]any, f hk8s.GatewayForward) error {
 	existing, _ := spec["forwards"].([]any)
 	entry := map[string]any{
@@ -1184,9 +1226,8 @@ func appendForward(spec map[string]any, f hk8s.GatewayForward) error {
 	return nil
 }
 
-// removeForward drops the forward on the given public port, the inverse of
-// appendForward. It is a no-op when no forward uses the port, so cleanup is
-// idempotent.
+// removeForward drops the forward on the given public port. It is a no-op when no forward
+// uses that port, so cleanup is idempotent.
 func removeForward(spec map[string]any, port int) error {
 	existing, _ := spec["forwards"].([]any)
 	kept := make([]any, 0, len(existing))
@@ -1222,9 +1263,8 @@ func setForwardTargetPort(spec map[string]any, port, targetPort int) error {
 	return fmt.Errorf("no forward on port %d to set targetPort", port)
 }
 
-// setForwardService retargets the forward on the given public port to a different
-// Service, erroring if none uses the port. A non-empty namespace sets a
-// cross-namespace target; an empty one clears it to default to the Gateway's namespace.
+// setForwardService retargets the forward on the given public port, erroring if none uses
+// it. An empty namespace clears the target, defaulting to the Gateway's namespace.
 func setForwardService(spec map[string]any, port int, service, namespace string) error {
 	existing, _ := spec["forwards"].([]any)
 	for _, raw := range existing {
@@ -1243,4 +1283,620 @@ func setForwardService(spec map[string]any, port int, service, namespace string)
 		}
 	}
 	return fmt.Errorf("no forward on port %d to set service", port)
+}
+
+// localHandoffTimeout: the old holder loses its only local endpoint and scores 0, which the
+// election releases at once rather than after the handoff hold, so twice the hold is ample.
+const localHandoffTimeout = 60 * time.Second
+
+// localBackendReadyTimeout bounds the wait for the re-pinned echo to be a ready endpoint on
+// the new worker, the precondition for the link election to move at all.
+const localBackendReadyTimeout = 3 * time.Minute
+
+// wgGatewayAddress mirrors the CRD default of spec.wireguard.gatewayAddress, the VM's
+// tunnel-side address. A Local-mode /clientip answering with it means the VM masqueraded.
+const wgGatewayAddress = "10.99.0.1"
+
+// TestGatewayTrafficPolicyLocal covers the Local data path against real GCP: the backend
+// observes the external client's source, and re-pinning it moves the Lease and the path.
+func TestGatewayTrafficPolicyLocal(t *testing.T) {
+	t.Parallel()
+
+	suite := getSuite(t)
+	client := suite.Client()
+	ctx := context.Background()
+
+	stack, err := suite.Start(ctx, t, e2eharness.WithTrafficPolicy(hk8s.TrafficPolicyLocal))
+	if err != nil {
+		t.Fatalf("start local stack: %v", err)
+	}
+	if stack.Address == "" {
+		t.Fatal("gateway reported no public IP")
+	}
+	t.Logf("gateway public IP: %s, backend pinned to %s", stack.Address, stack.BackendNode)
+
+	excluded := readInClusterAddresses(ctx, t, client, stack)
+
+	t.Run("clientip-preserves-external-source", func(t *testing.T) {
+		got, err := probeClientIPThroughGateway(ctx, stack)
+		if err != nil {
+			t.Fatalf("clientip data path: %v", err)
+		}
+		assertExternalClientIP(t, got, excluded)
+		t.Logf("local-mode /clientip: %s", got)
+	})
+
+	t.Run("udp-forward-serves", func(t *testing.T) {
+		const payload = "gateway-e2e-local-udp-probe"
+		got, err := probeUDPThroughGateway(ctx, stack, payload)
+		if err != nil {
+			t.Fatalf("local udp data path: %v", err)
+		}
+		if got != payload {
+			t.Fatalf("udp echo = %q, want %q", got, payload)
+		}
+	})
+
+	t.Run("cross-namespace-forward-serves", func(t *testing.T) {
+		marker, err := probeTCPThroughGatewayPort(ctx, stack, stack.CrossNSPublicPort)
+		if err != nil {
+			t.Fatalf("local cross-namespace data path: %v", err)
+		}
+		assertBackendMarker(t, marker, stack.CrossNSBackendName)
+
+		got, err := probeClientIPThroughGatewayPort(ctx, stack, stack.CrossNSPublicPort)
+		if err != nil {
+			t.Fatalf("local cross-namespace clientip data path: %v", err)
+		}
+		assertExternalClientIP(t, got, excluded)
+		t.Logf("local cross-namespace /clientip on port %d: %s", stack.CrossNSPublicPort, got)
+	})
+
+	// link-identity proves every node-global name the link programs derives from the
+	// id the Gateway reports, so an operator reading the status can find them.
+	t.Run("link-identity", func(t *testing.T) {
+		status, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("read gateway status: %v", err)
+		}
+		if status.LinkID < 1 || status.LinkID > link.MaxLinkID {
+			t.Fatalf("status.link.id = %d, want an allocated id in 1..%d", status.LinkID, link.MaxLinkID)
+		}
+		second, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("re-read gateway status: %v", err)
+		}
+		if second.LinkID != status.LinkID {
+			t.Fatalf("status.link.id changed between reads: %d then %d; an allocated id must never be rewritten", status.LinkID, second.LinkID)
+		}
+
+		holder, err := client.GetLeaseHolder(ctx, stack.Namespace, linkLeaseName(stack.GatewayName))
+		if err != nil {
+			t.Fatalf("read lease holder: %v", err)
+		}
+		if holder == "" {
+			t.Fatal("link lease has no holder; no link pod programs the data plane")
+		}
+		for _, cmd := range [][]string{
+			{"ip", "link", "show", link.NewIdentity(status.LinkID).Interface},
+			{"nft", "list", "table", "inet", link.NewIdentity(status.LinkID).NftTable},
+		} {
+			if _, stderr, err := client.ExecInPod(ctx, stack.Namespace, holder, cmd); err != nil {
+				t.Errorf("%v in holder %s: %v (stderr: %s); the id-derived name must exist on the holder", cmd, holder, err, strings.TrimSpace(stderr))
+			}
+		}
+	})
+
+	t.Run("active-node-follows-the-backend", func(t *testing.T) {
+		assertActiveNode(ctx, t, client, stack, stack.BackendNode, haFailoverTimeout)
+
+		other := otherWorker(t, stack.WorkerNodes, stack.BackendNode)
+		refs := stack.LocalBackendRefs()
+		for _, ref := range refs {
+			if err := client.RepinEchoToNode(ctx, ref.Namespace, ref.Name, other); err != nil {
+				t.Fatalf("re-pin echo backend %s/%s to %s: %v", ref.Namespace, ref.Name, other, err)
+			}
+		}
+		// Every forward must have a ready endpoint on the new node before the election
+		// can move: a partially re-pinned node is not fully eligible.
+		if err := client.WaitEndpointsReadyOnNode(ctx, refs, other, localBackendReadyTimeout); err != nil {
+			t.Fatalf("re-pinned echo backends did not become ready endpoints on %s: %v", other, err)
+		}
+
+		if err := retryUntil(ctx, localHandoffTimeout, func(ctx context.Context) error {
+			st, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+			if err != nil {
+				return err
+			}
+			if st.ActiveNode != other {
+				return fmt.Errorf("status.link.activeNode = %q, want %q", st.ActiveNode, other)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("link Lease did not hand off to the backend's new node: %v", err)
+		}
+
+		got, err := probeClientIPThroughGateway(ctx, stack)
+		if err != nil {
+			t.Fatalf("clientip data path after handoff: %v", err)
+		}
+		assertExternalClientIP(t, got, readInClusterAddresses(ctx, t, client, stack))
+		t.Logf("local-mode /clientip after handoff to %s: %s", other, got)
+	})
+
+	// The backend is pinned to the current Lease holder: a Local forward only serves while
+	// its endpoint is ready on the holder's node.
+	t.Run("forward-edit", func(t *testing.T) {
+		const editBackend = "gateway-echo-local-edit"
+
+		status, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("read gateway status: %v", err)
+		}
+		if status.ActiveNode == "" {
+			t.Fatal("status.link.activeNode is empty; the added forward needs a known holder node to pin its backend to")
+		}
+
+		t.Cleanup(func() {
+			cctx := context.Background()
+			if err := client.UpdateGateway(cctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
+				return removeForward(spec, stack.EditedPublicPort)
+			}); err != nil {
+				t.Logf("cleanup remove local forward-edit forward: %v", err)
+			}
+			if err := client.DeleteService(cctx, stack.Namespace, editBackend); err != nil {
+				t.Logf("cleanup delete service %s: %v", editBackend, err)
+			}
+			if err := client.DeleteDeployment(cctx, stack.Namespace, editBackend); err != nil {
+				t.Logf("cleanup delete deployment %s: %v", editBackend, err)
+			}
+		})
+
+		backend, err := client.DeployEchoOnNode(ctx, stack.Namespace, editBackend, status.ActiveNode)
+		if err != nil {
+			t.Fatalf("deploy forward-edit backend on %s: %v", status.ActiveNode, err)
+		}
+		if err := client.WaitEndpointsReady(ctx, stack.Namespace, editBackend, localBackendReadyTimeout); err != nil {
+			t.Fatalf("forward-edit backend did not become a ready endpoint on %s: %v", status.ActiveNode, err)
+		}
+
+		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
+			return appendForward(spec, hk8s.GatewayForward{
+				Port: stack.EditedPublicPort, Protocol: "TCP", Service: editBackend, TargetPort: backend.Port,
+			})
+		}); err != nil {
+			t.Fatalf("add forward to local gateway: %v", err)
+		}
+		if _, err := client.WaitGatewayReady(ctx, stack.Namespace, stack.GatewayName, editRollTimeout); err != nil {
+			t.Fatalf("gateway not ready after local forward edit: %v", err)
+		}
+
+		marker, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.EditedPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("local edited-forward data path: %v", err)
+		}
+		assertBackendMarker(t, marker, editBackend)
+
+		clientIP, err := probeClientIPThroughGatewayPort(ctx, stack, stack.EditedPublicPort)
+		if err != nil {
+			t.Fatalf("local edited-forward clientip data path: %v", err)
+		}
+		assertExternalClientIP(t, clientIP, readInClusterAddresses(ctx, t, client, stack))
+		t.Logf("local edited-forward /clientip on port %d: %s", stack.EditedPublicPort, clientIP)
+
+		if err := client.UpdateGateway(ctx, stack.Namespace, stack.GatewayName, func(spec map[string]any) error {
+			return removeForward(spec, stack.EditedPublicPort)
+		}); err != nil {
+			t.Fatalf("remove forward from local gateway: %v", err)
+		}
+		if _, err := client.WaitGatewayReady(ctx, stack.Namespace, stack.GatewayName, editRollTimeout); err != nil {
+			t.Fatalf("gateway not ready after local forward removal: %v", err)
+		}
+		if err := waitPortDenied(ctx, stack, stack.EditedPublicPort, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("removed local forward kept serving: %v", err)
+		}
+	})
+}
+
+// TestGatewayTrafficPolicyLocalDisruption covers losing the pod that programs the Local data
+// plane, or the endpoint it needs: a kill, a graceful delete, a missing endpoint, a roll.
+func TestGatewayTrafficPolicyLocalDisruption(t *testing.T) {
+	t.Parallel()
+
+	suite := getSuite(t)
+	client := suite.Client()
+	ctx := context.Background()
+
+	stack, err := suite.Start(ctx, t, e2eharness.WithTrafficPolicy(hk8s.TrafficPolicyLocal))
+	if err != nil {
+		t.Fatalf("start local disruption stack: %v", err)
+	}
+	if stack.Address == "" {
+		t.Fatal("gateway reported no public IP")
+	}
+	leaseName := linkLeaseName(stack.GatewayName)
+	t.Logf("gateway public IP: %s, backend pinned to %s", stack.Address, stack.BackendNode)
+
+	// The path must serve before the ifindex is read, or the comparison passes against a link
+	// about to be rebuilt; Lease continuity is what makes this adoption and not a rebuild.
+	t.Run("holder-crash-adopts-the-interface", func(t *testing.T) {
+		holder, node, iface := localHolderState(ctx, t, client, stack, leaseName)
+
+		before, err := client.NodeIfaceIndex(ctx, stack.Namespace, holder, iface)
+		if err != nil {
+			t.Fatalf("read %s ifindex before the crash: %v", iface, err)
+		}
+		leaseBefore, err := client.GetLease(ctx, stack.Namespace, leaseName)
+		if err != nil {
+			t.Fatalf("read link lease before the crash: %v", err)
+		}
+		transitionsBefore := leaseTransitions(leaseBefore.Spec.LeaseTransitions)
+		restartsBefore, err := client.PodRestartCount(ctx, stack.Namespace, holder)
+		if err != nil {
+			t.Fatalf("read holder restart count: %v", err)
+		}
+
+		killedAt := time.Now()
+		if err := suite.KillContainerOnNode(ctx, node, stack.Namespace, holder); err != nil {
+			t.Fatalf("sigkill the link container of %s on %s: %v", holder, node, err)
+		}
+
+		if err := retryUntil(ctx, haFailoverTimeout, func(ctx context.Context) error {
+			restarts, err := client.PodRestartCount(ctx, stack.Namespace, holder)
+			if err != nil {
+				return err
+			}
+			if restarts <= restartsBefore {
+				return fmt.Errorf("restart count still %d, want above %d", restarts, restartsBefore)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("holder %s did not restart in place after the kill: %v", holder, err)
+		}
+
+		ready, err := client.WaitLinkPodReadyOnNode(ctx, stack.Namespace, stack.GatewayName, node, haFailoverTimeout)
+		if err != nil {
+			t.Fatalf("no ready link pod on %s after the crash: %v", node, err)
+		}
+		if ready != holder {
+			t.Fatalf("link pod on %s is %q after the crash, want the restarted holder %q; the container must restart in place", node, ready, holder)
+		}
+
+		// The killed process cannot renew, so a renewal stamped after the kill proves the
+		// restarted process is the one leading and has re-applied under its own lease.
+		if err := retryUntil(ctx, haFailoverTimeout, func(ctx context.Context) error {
+			lease, err := client.GetLease(ctx, stack.Namespace, leaseName)
+			if err != nil {
+				return err
+			}
+			var current string
+			if lease.Spec.HolderIdentity != nil {
+				current = *lease.Spec.HolderIdentity
+			}
+			var renewed time.Time
+			if lease.Spec.RenewTime != nil {
+				renewed = lease.Spec.RenewTime.Time
+			}
+			if current != holder || !renewed.After(killedAt) {
+				return fmt.Errorf("lease holder = %q renewed at %s, want the restarted pod %q renewing after the kill at %s",
+					current, renewed, holder, killedAt)
+			}
+			return nil
+		}); err != nil {
+			t.Errorf("the restarted pod did not renew the Lease as its holder within %s: %v", haFailoverTimeout, err)
+		}
+		assertActiveNode(ctx, t, client, stack, node, haFailoverTimeout)
+
+		marker, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("tcp forward did not serve again after the link crash: %v", err)
+		}
+		assertBackendMarker(t, marker, stack.TCPBackendName)
+
+		after, err := client.NodeIfaceIndex(ctx, stack.Namespace, holder, iface)
+		if err != nil {
+			t.Fatalf("read %s ifindex after the crash: %v", iface, err)
+		}
+		leaseAfter, err := client.GetLease(ctx, stack.Namespace, leaseName)
+		if err != nil {
+			t.Fatalf("read link lease after the crash: %v", err)
+		}
+		if transitionsAfter := leaseTransitions(leaseAfter.Spec.LeaseTransitions); transitionsAfter != transitionsBefore {
+			t.Fatalf("link Lease transitions %d -> %d: leadership moved to the peer while %s restarted, so the restarted pod fenced its inherited interface and the adoption scenario was not exercised; the restart outran the peer's grace",
+				transitionsBefore, transitionsAfter, holder)
+		}
+		if after != before {
+			t.Errorf("%s ifindex changed %d -> %d across a crash; the restarted link must adopt the existing interface, not recreate it", iface, before, after)
+		}
+	})
+
+	// The graceful counterpart: the SIGTERM teardown removes the interface, so the
+	// replacement on the same node builds a fresh one instead of adopting it.
+	t.Run("holder-delete-replaces-the-link", func(t *testing.T) {
+		holder, node, iface := localHolderState(ctx, t, client, stack, leaseName)
+
+		before, err := client.NodeIfaceIndex(ctx, stack.Namespace, holder, iface)
+		if err != nil {
+			t.Fatalf("read %s ifindex before the delete: %v", iface, err)
+		}
+
+		if err := client.DeletePod(ctx, stack.Namespace, holder); err != nil {
+			t.Fatalf("delete holder %s: %v", holder, err)
+		}
+
+		replacement, err := client.WaitLinkPodReadyOnNode(ctx, stack.Namespace, stack.GatewayName, node, haFailoverTimeout)
+		if err != nil {
+			t.Fatalf("no ready link pod on %s after the delete: %v", node, err)
+		}
+		if replacement == holder {
+			t.Fatalf("link pod on %s is still %q; the graceful delete must be replaced by a new pod", node, replacement)
+		}
+		// The peer on the empty worker can hold the Lease while the replacement starts,
+		// and hands it back once the fully eligible node is ready again.
+		if err := retryUntil(ctx, haFailoverTimeout, func(ctx context.Context) error {
+			current, err := client.GetLeaseHolder(ctx, stack.Namespace, leaseName)
+			if err != nil {
+				return err
+			}
+			if current != replacement {
+				return fmt.Errorf("lease holder = %q, want the replacement %q on %s", current, replacement, node)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("the replacement on the backend's node did not take the Lease: %v", err)
+		}
+
+		var after int
+		if err := retryUntil(ctx, haFailoverTimeout, func(ctx context.Context) error {
+			index, err := client.NodeIfaceIndex(ctx, stack.Namespace, replacement, iface)
+			if err != nil {
+				return err
+			}
+			after = index
+			return nil
+		}); err != nil {
+			t.Fatalf("replacement %s did not bring up %s: %v", replacement, iface, err)
+		}
+		if after == before {
+			t.Errorf("%s ifindex is still %d after a graceful delete; the SIGTERM teardown must remove the interface and the replacement create a new one", iface, before)
+		}
+		assertActiveNode(ctx, t, client, stack, node, haFailoverTimeout)
+
+		marker, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("tcp forward did not serve again after the holder was replaced: %v", err)
+		}
+		assertBackendMarker(t, marker, stack.TCPBackendName)
+	})
+
+	// A forward with no ready endpoint on the holder node must be dropped rather than reset,
+	// leaving the holder's satisfied forwards serving.
+	t.Run("no-local-endpoint-blackholes-and-recovers", func(t *testing.T) {
+		// The Lease can still be settling from the previous subtest, so the baseline is
+		// the backend's node rather than whatever a single status read catches.
+		assertActiveNode(ctx, t, client, stack, stack.BackendNode, haFailoverTimeout)
+
+		t.Cleanup(func() {
+			if err := client.ScaleDeployment(context.Background(), stack.Namespace, stack.TCPBackendName, 1); err != nil {
+				t.Logf("cleanup scale %s back to one replica: %v", stack.TCPBackendName, err)
+			}
+		})
+		if err := client.ScaleDeployment(ctx, stack.Namespace, stack.TCPBackendName, 0); err != nil {
+			t.Fatalf("scale %s to zero: %v", stack.TCPBackendName, err)
+		}
+
+		wantForward := fmt.Sprintf("tcp-%d", stack.TCPPublicPort)
+		if err := client.WaitGatewayConditionMessage(ctx, stack.Namespace, stack.GatewayName,
+			"Ready", "False", link.FaultNoLocalEndpoint, wantForward, lifecycleConditionTimeout); err != nil {
+			t.Fatalf("gateway did not report Ready=False/%s naming the forward whose endpoint went away: %v", link.FaultNoLocalEndpoint, err)
+		}
+
+		// A refusal would mean the packet reached a closed socket; the input drop must
+		// make it time out instead.
+		if err := waitPortDenied(ctx, stack, stack.TCPPublicPort, lifecycleConditionTimeout); err != nil {
+			t.Errorf("tcp forward without a local endpoint: %v", err)
+		}
+
+		const payload = "gateway-e2e-local-udp-blackhole"
+		if got, err := probeUDPThroughGateway(ctx, stack, payload); err != nil {
+			t.Errorf("udp forward stopped serving while the TCP forward was unsatisfied: %v", err)
+		} else if got != payload {
+			t.Errorf("udp echo = %q, want %q", got, payload)
+		}
+		if marker, err := probeTCPThroughGatewayPort(ctx, stack, stack.CrossNSPublicPort); err != nil {
+			t.Errorf("cross-namespace forward stopped serving while the TCP forward was unsatisfied: %v", err)
+		} else {
+			assertBackendMarker(t, marker, stack.CrossNSBackendName)
+		}
+
+		during, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("read gateway status while unsatisfied: %v", err)
+		}
+		if during.ActiveNode != stack.BackendNode {
+			t.Errorf("status.link.activeNode moved to %q, want the backend's node %q; no peer scores higher, so the holder must keep the Lease", during.ActiveNode, stack.BackendNode)
+		}
+
+		if err := client.ScaleDeployment(ctx, stack.Namespace, stack.TCPBackendName, 1); err != nil {
+			t.Fatalf("scale %s back to one replica: %v", stack.TCPBackendName, err)
+		}
+		if err := client.WaitGatewayCondition(ctx, stack.Namespace, stack.GatewayName,
+			"Ready", "True", "", lifecycleReadyTimeout); err != nil {
+			t.Fatalf("gateway did not return Ready=True after the backend came back: %v", err)
+		}
+		marker, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("tcp forward did not serve again after the backend came back: %v", err)
+		}
+		assertBackendMarker(t, marker, stack.TCPBackendName)
+	})
+
+	// daemonset-rolling-update asserts the state a roll leaves, not the transient during it:
+	// one Lease holder, one interface owner, activeNode on the backend's worker.
+	t.Run("daemonset-rolling-update", func(t *testing.T) {
+		// The link DaemonSet and the Lease share the link component name.
+		daemonSetName := leaseName
+		selector := linkSelector(stack.GatewayName)
+		podsBefore, err := client.PodNamesByLabel(ctx, stack.Namespace, selector)
+		if err != nil {
+			t.Fatalf("list link pods before the roll: %v", err)
+		}
+		if err := client.RestartDaemonSet(ctx, stack.Namespace, daemonSetName); err != nil {
+			t.Fatalf("restart link daemonset: %v", err)
+		}
+		if err := client.WaitDaemonSetReady(ctx, stack.Namespace, daemonSetName, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("link daemonset did not converge after the roll: %v", err)
+		}
+		podsAfter, err := client.PodNamesByLabel(ctx, stack.Namespace, selector)
+		if err != nil {
+			t.Fatalf("list link pods after the roll: %v", err)
+		}
+		var survivors []string
+		for _, pod := range podsAfter {
+			if slices.Contains(podsBefore, pod) {
+				survivors = append(survivors, pod)
+			}
+		}
+		if len(survivors) > 0 {
+			t.Fatalf("link pods %v survived the roll (before %v, after %v); a converged rolling update must replace every pod", survivors, podsBefore, podsAfter)
+		}
+
+		marker, err := probeTCPThroughGatewayPortUntil(ctx, stack, stack.TCPPublicPort, editRollTimeout)
+		if err != nil {
+			t.Fatalf("tcp forward did not serve again after the daemonset roll: %v", err)
+		}
+		assertBackendMarker(t, marker, stack.TCPBackendName)
+
+		assertActiveNode(ctx, t, client, stack, stack.BackendNode, haFailoverTimeout)
+
+		status, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			t.Fatalf("read gateway status after the roll: %v", err)
+		}
+		iface := link.NewIdentity(status.LinkID).Interface
+		assertSingleIfaceOwner(ctx, t, client, stack.Namespace, selector, leaseName, iface, haFailoverTimeout)
+	})
+}
+
+// leaseTransitions is a Lease's leadership transition count, an unset count reading 0:
+// the API leaves it nil until leadership first moves.
+func leaseTransitions(count *int32) int32 {
+	if count == nil {
+		return 0
+	}
+	return *count
+}
+
+// localHolderState returns the current Lease holder, its node and the id-derived
+// interface name, the three facts every disruption assertion starts from.
+func localHolderState(ctx context.Context, t *testing.T, client *hk8s.Client, stack *e2eharness.Stack, leaseName string) (holder, node, iface string) {
+	t.Helper()
+	holder, err := client.GetLeaseHolder(ctx, stack.Namespace, leaseName)
+	if err != nil {
+		t.Fatalf("read lease holder: %v", err)
+	}
+	if holder == "" {
+		t.Fatal("link lease has no holder; no link pod programs the data plane")
+	}
+	node, err = client.PodNode(ctx, stack.Namespace, holder)
+	if err != nil {
+		t.Fatalf("read node of holder %s: %v", holder, err)
+	}
+	status, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+	if err != nil {
+		t.Fatalf("read gateway status: %v", err)
+	}
+	if status.LinkID < 1 {
+		t.Fatalf("status.link.id = %d, want an allocated id; the interface name derives from it", status.LinkID)
+	}
+	return holder, node, link.NewIdentity(status.LinkID).Interface
+}
+
+// assertActiveNode fails unless status.link.activeNode settles on want within timeout.
+func assertActiveNode(ctx context.Context, t *testing.T, client *hk8s.Client, stack *e2eharness.Stack, want string, timeout time.Duration) {
+	t.Helper()
+	if err := retryUntil(ctx, timeout, func(ctx context.Context) error {
+		status, err := client.GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			return err
+		}
+		if status.ActiveNode != want {
+			return fmt.Errorf("status.link.activeNode = %q, want %q", status.ActiveNode, want)
+		}
+		return nil
+	}); err != nil {
+		t.Errorf("gateway did not report the expected active node: %v", err)
+	}
+}
+
+// inClusterAddresses is the set a Local-mode /clientip answer must fall outside of: any of
+// them would mean something between the external client and the backend rewrote the source.
+type inClusterAddresses struct {
+	// addresses are exact addresses: the VM's tunnel address, the link pod IPs and
+	// every node address.
+	addresses []string
+	// podCIDRs are the per-node pod CIDRs, checked by containment because a pod IP the
+	// list missed still proves a rewrite.
+	podCIDRs []*net.IPNet
+}
+
+// readInClusterAddresses builds the excluded set from the live cluster, so it stays
+// correct as pods reschedule and no assertion depends on a hardcoded cluster layout.
+func readInClusterAddresses(ctx context.Context, t *testing.T, client *hk8s.Client, stack *e2eharness.Stack) inClusterAddresses {
+	t.Helper()
+	podIPs, err := client.LinkPodIPs(ctx, stack.Namespace, stack.GatewayName)
+	if err != nil {
+		t.Fatalf("read link pod IPs: %v", err)
+	}
+	nodeAddrs, rawCIDRs, err := client.NodeAddressesAndPodCIDRs(ctx)
+	if err != nil {
+		t.Fatalf("read node addresses and pod CIDRs: %v", err)
+	}
+	cidrs := make([]*net.IPNet, 0, len(rawCIDRs))
+	for _, raw := range rawCIDRs {
+		_, cidr, err := net.ParseCIDR(raw)
+		if err != nil {
+			t.Fatalf("parse node podCIDR %q: %v", raw, err)
+		}
+		cidrs = append(cidrs, cidr)
+	}
+	addresses := append([]string{wgGatewayAddress}, podIPs...)
+	addresses = append(addresses, nodeAddrs...)
+	return inClusterAddresses{addresses: addresses, podCIDRs: cidrs}
+}
+
+// assertExternalClientIP fails when the observed /clientip address is any in-cluster
+// or tunnel address, which is what a masquerade anywhere on the path would produce.
+func assertExternalClientIP(t *testing.T, got string, excluded inClusterAddresses) {
+	t.Helper()
+	if slices.Contains(excluded.addresses, got) {
+		t.Errorf("Local-mode /clientip = %q, want an address outside the in-cluster set %v; Local must preserve the external client's source end to end",
+			got, excluded.addresses)
+		return
+	}
+	ip := net.ParseIP(got)
+	if ip == nil {
+		t.Errorf("Local-mode /clientip = %q, want a parseable IP address", got)
+		return
+	}
+	for _, cidr := range excluded.podCIDRs {
+		if cidr.Contains(ip) {
+			t.Errorf("Local-mode /clientip = %q, want an address outside the pod CIDR %s; a pod-sourced address means something rewrote the client's",
+				got, cidr)
+			return
+		}
+	}
+}
+
+// otherWorker returns the worker that is not current, the re-pin target the handoff
+// assertion needs.
+func otherWorker(t *testing.T, workers []string, current string) string {
+	t.Helper()
+	for _, w := range workers {
+		if w != current {
+			return w
+		}
+	}
+	t.Fatalf("no worker other than %q in %v; the handoff assertion needs two", current, workers)
+	return ""
 }

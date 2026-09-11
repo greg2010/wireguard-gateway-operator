@@ -29,9 +29,8 @@ const (
 	// when started with --insecure.
 	functionPort = "9443/tcp"
 
-	// xrName is the composite resource name every case uses; the function keys
-	// observed resources by it via the crossplane.io/composite label, so observed
-	// fixtures must carry it too.
+	// xrName is the composite resource name every case uses; the function keys observed
+	// resources by it via the crossplane.io/composite label, so fixtures must carry it too.
 	xrName = "xgateway-smoke"
 
 	// testRegion is the region every fixture XR requests.
@@ -201,15 +200,13 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "user-data"); got != "#cloud-config\n" {
 					t.Errorf("instance metadata user-data = %q, want cloud-config", got)
 				}
-				// The instance metadata carries secret-id sourced from
-				// spec.secretId; the gateway VM's keyfetch reads it to pull the
-				// WireGuard key from Secret Manager.
+				// The instance metadata carries secret-id from spec.secretId; the VM's
+				// keyfetch reads it to pull the WireGuard key from Secret Manager.
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "secret-id"); got != gatewaySecretID {
 					t.Errorf("instance metadata secret-id = %q, want %q", got, gatewaySecretID)
 				}
-				// The per-Gateway WireGuard and project values flow onto the instance
-				// metadata; the VM's keyfetch reads them to render the netdev, nftables,
-				// wg0 address, and Secret Manager URL.
+				// The VM's keyfetch reads these per-Gateway values off the instance
+				// metadata to render the netdev, nftables, wg0 address and SM URL.
 				wantMeta := map[string]string{
 					"wg-listen-port":     "51820",
 					"wg-mtu":             "1380",
@@ -217,6 +214,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 					"wg-link-address":    "10.99.0.2",
 					"wg-subnet":          "10.99.0.0/29",
 					"project-id":         testProjectID,
+					"traffic-policy":     "cluster",
 				}
 				for key, want := range wantMeta {
 					if got := nestedString(t, inst, "spec", "forProvider", "metadata", key); got != want {
@@ -430,9 +428,8 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			},
 		},
 		{
-			// A non-default wgListenPort and distinct projectID flow verbatim onto the
-			// rendered instance metadata, so the per-Gateway value reaches the VM's
-			// keyfetch rather than a chart-baked one.
+			// A non-default wgListenPort and projectID must flow verbatim onto the instance
+			// metadata, so keyfetch reads the per-Gateway value, not a chart-baked one.
 			name: "non-default wgListenPort and projectID reach instance metadata",
 			spec: map[string]any{
 				"region":             testRegion,
@@ -492,6 +489,46 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				assertSameSet(t, "firewall udp ports", udpPorts, []string{"51999"})
 			},
 		},
+		{
+			// keyfetch.sh turns traffic-policy=local into the postrouting return verdict, so
+			// the VM stops masquerading tunnel egress and the client source survives.
+			name: "trafficPolicy local reaches instance metadata",
+			spec: map[string]any{
+				"region":             testRegion,
+				"zone":               testRegion + "-a",
+				"machineType":        "e2-small",
+				"sharedNetworkName":  sharedNetworkName,
+				"providerConfigName": providerConfigName,
+				"reservedIP":         false,
+				"wgListenPort":       51820,
+				"wgMTU":              1380,
+				"wgGatewayAddress":   "10.99.0.1",
+				"wgLinkAddress":      "10.99.0.2",
+				"wgSubnet":           "10.99.0.0/29",
+				"projectID":          testProjectID,
+				"trafficPolicy":      "local",
+				"serviceAccountId":   "gateway",
+				"secretId":           gatewaySecretID,
+				"wgKeySecretRef": map[string]any{
+					"name": "gateway-wg-key",
+					"key":  "private",
+				},
+			},
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedResource(t, "service-account", map[string]any{
+					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
+					"kind":       "ServiceAccount",
+					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
+				}),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				inst := desiredResource(t, resp, "instance")
+				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "traffic-policy"); got != "local" {
+					t.Errorf("instance metadata traffic-policy = %q, want local", got)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -514,9 +551,6 @@ func TestXGatewayGCPComposition(t *testing.T) {
 	}
 }
 
-// TestXGatewayNetworkComposition renders the shared-network composition and asserts
-// it emits exactly one Network MR named for the requested VPC with
-// autoCreateSubnetworks enabled.
 func TestXGatewayNetworkComposition(t *testing.T) {
 	if os.Getenv("GATEWAY_INTEGRATION") == "" {
 		t.Skip("set GATEWAY_INTEGRATION to run the composition integration test")
@@ -650,11 +684,8 @@ func startFunction(image string) (*grpc.ClientConn, func() error, error) {
 	return conn, stop, nil
 }
 
-// waitForReady blocks until the connection completes its HTTP/2 handshake. The
-// function image is distroless, so the wait strategy can only probe the mapped
-// port from outside: that proves the runtime's port forwarder accepts, not that
-// the server inside has called listen, and the first RPC then races the server's
-// startup and dies on a broken pipe.
+// waitForReady blocks on the HTTP/2 handshake: the image is distroless, so the wait
+// strategy probes only the mapped port and the first RPC would race the server's listen.
 func waitForReady(conn *grpc.ClientConn) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -671,10 +702,8 @@ func waitForReady(conn *grpc.ClientConn) error {
 	}
 }
 
-// buildRequestFor assembles a RunFunctionRequest for an arbitrary composition
-// template and XR kind in the infra.wgnet.dev group, with the XR named xrName so
-// the function's observed-resource keying lines up. One running container can
-// render either composition.
+// buildRequestFor names the XR xrName so the function's observed-resource keying lines up.
+// The template and kind are arguments, so one container renders either composition.
 func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec map[string]any, observed map[string]*fnv1.Resource) *fnv1.RunFunctionRequest {
 	t.Helper()
 
@@ -707,9 +736,8 @@ func (rf *runFunction) buildRequestFor(t *testing.T, template, kind string, spec
 	}
 }
 
-// observedResource wraps a composed-resource body in the metadata
-// function-go-templating keys .observed.resources by: the composition-resource-name
-// annotation names the slot and the composite label ties it to the XR.
+// observedResource adds the metadata function-go-templating keys .observed.resources by:
+// the composition-resource-name annotation names the slot, the composite label ties the XR.
 func observedResource(t *testing.T, name string, body map[string]any) *fnv1.Resource {
 	t.Helper()
 	meta, ok := body["metadata"].(map[string]any)
@@ -733,17 +761,15 @@ func loadTemplate(t *testing.T) string {
 	return readChartFile(t, filepath.Join("crossplane", "gcp", "composition.gotmpl"))
 }
 
-// loadNetworkTemplate reads the shipped shared-network composition template,
-// the separate composition that owns the VPC the per-gateway composition wires
-// each instance and firewall onto.
+// loadNetworkTemplate reads the shipped shared-network composition, the separate template
+// that owns the VPC each per-gateway instance and firewall is wired onto.
 func loadNetworkTemplate(t *testing.T) string {
 	t.Helper()
 	return readChartFile(t, filepath.Join("crossplane", "gcp", "network-composition.gotmpl"))
 }
 
-// goTemplatingImage returns the function-go-templating package the providers chart
-// pins, so that values file is the single source of truth for the digest the test
-// boots.
+// goTemplatingImage reads the digest out of the providers chart values, the single source
+// of truth for the function image the test boots.
 func goTemplatingImage(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(repoRoot(t),
@@ -791,9 +817,8 @@ func desiredResource(t *testing.T, resp *fnv1.RunFunctionResponse, name string) 
 	return res.GetResource().AsMap()
 }
 
-// assertWithheld fails unless the named resource is either absent from desired
-// or present but marked Ready=READY_FALSE. Both encode "not yet actionable" in
-// the function-go-templating + auto-ready contract.
+// assertWithheld fails unless the named resource is absent from desired or marked
+// Ready=READY_FALSE: both encode "not yet actionable" under the auto-ready contract.
 func assertWithheld(t *testing.T, resp *fnv1.RunFunctionResponse, name string) {
 	t.Helper()
 	res, ok := resp.GetDesired().GetResources()[name]
@@ -871,7 +896,6 @@ func allowPorts(t *testing.T, allow []any, protocol string) []string {
 	return nil
 }
 
-// hasProtocol reports whether the allow list carries a rule for the protocol.
 func hasProtocol(allow []any, protocol string) bool {
 	for _, raw := range allow {
 		rule, ok := raw.(map[string]any)
@@ -922,9 +946,8 @@ func assertSameSet(t *testing.T, label string, got, want []string) {
 	}
 }
 
-// nestedString walks the map by path and returns the string at the leaf,
-// failing the test if any segment is missing or not the expected type. Numeric
-// path segments index into slices.
+// nestedString returns the string at the leaf of path, failing the test on a missing or
+// mistyped segment. A numeric segment indexes a slice.
 func nestedString(t *testing.T, m map[string]any, path ...string) string {
 	t.Helper()
 	v := nested(t, m, path...)

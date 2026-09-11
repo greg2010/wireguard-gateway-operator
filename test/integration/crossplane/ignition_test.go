@@ -33,10 +33,8 @@ type ignitionConfig struct {
 	} `json:"storage"`
 }
 
-// TestIgnitionStorageFiles asserts the Ignition the chart renders carries every
-// file a booting gateway needs, with the contents the VM depends on. It renders
-// through helm rather than reading files/ directly, so a file dropped from the
-// template's list fails here even though its source still ships in the chart.
+// TestIgnitionStorageFiles renders through helm rather than reading files/ directly, so a
+// file dropped from the template's list fails here even though its source still ships.
 func TestIgnitionStorageFiles(t *testing.T) {
 	files := renderIgnition(t).Storage.Files
 
@@ -91,7 +89,6 @@ func TestIgnitionStorageFiles(t *testing.T) {
 	}
 }
 
-// storageFile returns the entry at path, if any.
 func storageFile(files []ignitionStorageFile, path string) (ignitionStorageFile, bool) {
 	for _, f := range files {
 		if f.Path == path {
@@ -101,7 +98,6 @@ func storageFile(files []ignitionStorageFile, path string) (ignitionStorageFile,
 	return ignitionStorageFile{}, false
 }
 
-// storagePaths returns the paths of every entry, for failure messages.
 func storagePaths(files []ignitionStorageFile) []string {
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
@@ -110,8 +106,6 @@ func storagePaths(files []ignitionStorageFile) []string {
 	return paths
 }
 
-// decodeStorageContents returns the plaintext behind a storage entry's inline
-// data URL.
 func decodeStorageContents(t *testing.T, file ignitionStorageFile) string {
 	t.Helper()
 
@@ -126,9 +120,8 @@ func decodeStorageContents(t *testing.T, file ignitionStorageFile) string {
 	return string(raw)
 }
 
-// renderIgnition renders the operator chart with helm and parses the Ignition
-// the operator stamps onto every gateway, read back from the ConfigMap the
-// operator Deployment sources it from.
+// renderIgnition reads the Ignition back from the ConfigMap the operator Deployment
+// sources it from, so the chart's own wiring is part of what the assertions cover.
 func renderIgnition(t *testing.T) ignitionConfig {
 	t.Helper()
 
@@ -139,11 +132,10 @@ func renderIgnition(t *testing.T) ignitionConfig {
 	return cfg
 }
 
-// renderUserData returns the userData value of the rendered ignition ConfigMap.
 func renderUserData(t *testing.T) string {
 	t.Helper()
 
-	for _, doc := range strings.Split(helmTemplate(t), "\n---\n") {
+	for doc := range strings.SplitSeq(helmTemplate(t), "\n---\n") {
 		var obj struct {
 			Kind string            `json:"kind"`
 			Data map[string]string `json:"data"`
@@ -162,10 +154,8 @@ func renderUserData(t *testing.T) string {
 	return ""
 }
 
-// helmTemplate renders the operator chart with its default values. A host
-// without helm skips, so the rest of the suite still runs there, but CI fails:
-// the workflow installs helm, and a silent skip there would leave the chart's
-// Ignition unasserted.
+// helmTemplate skips when helm is missing but fails under CI: the workflow installs helm,
+// so a silent skip there would leave the chart's Ignition unasserted.
 func helmTemplate(t *testing.T) string {
 	t.Helper()
 
@@ -187,8 +177,6 @@ func helmTemplate(t *testing.T) string {
 	return string(out)
 }
 
-// readChartFile reads a file at the given path relative to the operator chart
-// directory.
 func readChartFile(t *testing.T, relPath string) string {
 	t.Helper()
 	path := filepath.Join(chartDir(t), relPath)
@@ -199,7 +187,6 @@ func readChartFile(t *testing.T, relPath string) string {
 	return string(b)
 }
 
-// chartDir resolves the operator chart directory.
 func chartDir(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(repoRoot(t), "k8s", "charts", "wireguard-gateway-operator")
