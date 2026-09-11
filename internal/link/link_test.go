@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestReadKeyFile(t *testing.T) {
@@ -82,11 +84,10 @@ func TestReadKeyFile(t *testing.T) {
 	}
 }
 
-// newHealthHandler builds the readiness handler with an injected wgShow and a
-// fixed clock. It marks the readiness a leader so the handshake gate is exercised
-// rather than short-circuited.
+// newHealthHandler builds the readiness handler with an injected wgShow and a fixed clock, marked
+// leader so the handshake gate is exercised rather than short-circuited.
 func newHealthHandler(now time.Time, showOut string, showErr error) http.HandlerFunc {
-	rd := newReadiness(25, func() time.Time { return now }, func(_ context.Context) (string, error) {
+	rd := newReadiness("wg0", 25, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
 		return showOut, showErr
 	})
 	rd.setLeader(true)
@@ -141,12 +142,11 @@ func TestServeHealthHandler(t *testing.T) {
 	}
 }
 
-// TestServeHealthServesAndDrains boots serveHealth on a loopback address,
-// confirms /healthz answers over the wire, then cancels and asserts a graceful
-// nil return.
+// TestServeHealthServesAndDrains confirms /healthz answers over the wire, then cancels and asserts
+// a graceful nil return.
 func TestServeHealthServesAndDrains(t *testing.T) {
 	now := time.Unix(1700001000, 0)
-	rd := newReadiness(25, func() time.Time { return now }, func(_ context.Context) (string, error) {
+	rd := newReadiness("wg0", 25, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
 		return fmt.Sprintf("PK=\t%d", now.Unix()-30), nil
 	})
 	rd.setLeader(true)
@@ -154,7 +154,7 @@ func TestServeHealthServesAndDrains(t *testing.T) {
 	addr := freeLoopbackAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveHealth(ctx, addr, rd) }()
+	go func() { done <- serveHealth(ctx, rd, nil, Config{HealthAddr: addr}, testLogger(t)) }()
 
 	body := getHealthz(t, addr)
 	if body != "ok" {
@@ -240,9 +240,34 @@ func TestRunErrorPaths(t *testing.T) {
 	}
 }
 
-// freeLoopbackAddr reserves an ephemeral loopback port, releases it, and returns
-// the address so a server under test can bind it. The brief gap between release
-// and re-bind is acceptable for a single non-parallel loopback test.
+// TestRunRejectsLocalWithoutNodeName pins that Run fails fast, before touching the in-cluster
+// client, when a Local-mode RuntimeConfig is loaded and cfg.NodeName is empty.
+func TestRunRejectsLocalWithoutNodeName(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},` +
+		`"wireguard":{"address":"10.244.1.7/32","peer":{"endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}},` +
+		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
+
+	cfg := Config{
+		ConfigPath:     filepath.Join(dir, "config.json"),
+		WGKeyPath:      filepath.Join(dir, "priv"),
+		PeerPubKeyPath: filepath.Join(dir, "peer"),
+	}
+	writeConfig(t, cfg.ConfigPath, body)
+	writeConfig(t, cfg.WGKeyPath, "priv-key-material=")
+	writeConfig(t, cfg.PeerPubKeyPath, "peer-key-material=")
+
+	err := Run(context.Background(), cfg, testLogger(t))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "NODE_NAME") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "NODE_NAME")
+	}
+}
+
+// freeLoopbackAddr reserves an ephemeral loopback port and releases it. The brief gap before the
+// server under test re-binds is acceptable for a single non-parallel loopback test.
 func freeLoopbackAddr(t testing.TB) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -275,4 +300,82 @@ func getHealthz(t testing.TB, addr string) string {
 	}
 	t.Fatalf("GET %s never succeeded before deadline", url)
 	return ""
+}
+
+// TestNewLocalEndpointWatcherMode pins the mode split of the watches: Local builds them, Cluster
+// builds none and issues no discovery.k8s.io call, which it has no RBAC for.
+func TestNewLocalEndpointWatcherMode(t *testing.T) {
+	forwards := []Forward{{
+		Name:        "web",
+		PublicPort:  443,
+		Protocol:    "tcp",
+		Namespace:   "gw-ns",
+		ServiceName: "web",
+	}}
+	podSelector := map[string]string{"app": "gateway-link"}
+
+	tcs := []struct {
+		name              string
+		rc                RuntimeConfig
+		wantWatcher       bool
+		wantSliceRequests bool
+		wantPodRequests   bool
+	}{
+		{
+			name: "local_watches_endpointslices_and_pods",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      &Identity{ID: 1, Interface: "wg-gw1"},
+				PodSelector:   podSelector,
+				Forwards:      forwards,
+			},
+			wantWatcher:       true,
+			wantSliceRequests: true,
+			wantPodRequests:   true,
+		},
+		{
+			name: "cluster_watches_nothing",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyCluster,
+				PodSelector:   podSelector,
+				Forwards:      forwards,
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewClientset()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			cfg := Config{NodeName: "node-a", PodNamespace: "gw-ns"}
+			ew, err := newLocalEndpointWatcher(ctx, cs, cfg, tc.rc, testLogger(t))
+			if err != nil {
+				t.Fatalf("newLocalEndpointWatcher: %v", err)
+			}
+			if (ew != nil) != tc.wantWatcher {
+				t.Fatalf("watcher non-nil = %v, want %v", ew != nil, tc.wantWatcher)
+			}
+
+			requested := func(resource string) bool {
+				for _, action := range cs.Actions() {
+					if action.GetResource().Resource == resource {
+						return true
+					}
+				}
+				return false
+			}
+			// The EndpointSlice informers start without being waited on, so their
+			// first list is reached rather than observed at once.
+			if tc.wantSliceRequests {
+				eventually(t, func() bool { return requested("endpointslices") }, "endpointslice request from the started informer")
+			} else if requested("endpointslices") {
+				t.Errorf("endpointslices requested in Cluster mode (actions: %v)", cs.Actions())
+			}
+			if got := requested("pods"); got != tc.wantPodRequests {
+				t.Errorf("pods requests = %v, want %v (actions: %v)", got, tc.wantPodRequests, cs.Actions())
+			}
+		})
+	}
 }

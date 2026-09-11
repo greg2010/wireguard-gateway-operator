@@ -1,0 +1,33 @@
+add table inet {{ .Table }}
+flush table inet {{ .Table }}
+table inet {{ .Table }} {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "{{ .Interface }}" ct state new counter ct mark set ct mark and {{ .KeepMask }} or {{ .Mark }}
+		ct direction reply ct mark and {{ .MarkMask }} == {{ .Mark }} counter meta mark set meta mark and {{ .KeepMask }} or {{ .Mark }}
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+{{- range $f := .Forwards }}
+		iifname "{{ $.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
+{{- end }}
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "{{ .Interface }}" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "{{ .Interface }}" ct state established,related counter accept
+{{- range $f := .Forwards }}
+		iifname "{{ $.Interface }}" ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} ct state new counter accept
+{{- end }}
+		iifname "{{ .Interface }}" counter drop
+		oifname "{{ .Interface }}" ct state established,related counter accept
+		oifname "{{ .Interface }}" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "{{ .Interface }}" counter drop
+	}
+}

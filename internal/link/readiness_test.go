@@ -3,6 +3,8 @@ package link
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -59,11 +61,14 @@ func TestFreshestHandshake(t *testing.T) {
 func TestReadinessReady(t *testing.T) {
 	const nowEpoch = int64(1700001000)
 	now := func() time.Time { return time.Unix(nowEpoch, 0) }
+	const iface = "wg-gw3"
 
 	tcs := []struct {
 		name      string
 		leader    bool
 		keepalive int
+		nodeFault string
+		fault     string
 		showOut   string
 		showErr   error
 		want      bool
@@ -138,15 +143,61 @@ func TestReadinessReady(t *testing.T) {
 			showErr:   fmt.Errorf("wg0 does not exist"),
 			want:      true,
 		},
+		{
+			name:   "standby_ready_with_empty_fault",
+			leader: false,
+			fault:  "",
+			want:   true,
+		},
+		{
+			name:   "standby_not_ready_with_rp_filter_strict_fault",
+			leader: false,
+			fault:  FaultRPFilterStrict,
+			want:   false,
+		},
+		{
+			name:   "standby_not_ready_with_apply_failed_fault",
+			leader: false,
+			fault:  FaultApplyFailed,
+			want:   false,
+		},
+		{
+			name:      "leader_not_ready_with_node_fault",
+			leader:    true,
+			keepalive: 25,
+			nodeFault: FaultRPFilterStrict,
+			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-30),
+			want:      false,
+		},
+		{
+			name:      "leader_not_ready_with_reload_loop_fault",
+			leader:    true,
+			keepalive: 25,
+			fault:     FaultApplyFailed,
+			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-30),
+			want:      false,
+		},
+		{
+			name:      "leader_ready_with_fresh_handshake_and_no_fault",
+			leader:    true,
+			keepalive: 25,
+			showOut:   fmt.Sprintf("PK=\t%d", nowEpoch-30),
+			want:      true,
+		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			wgShow := func(_ context.Context) (string, error) {
+			wgShow := func(_ context.Context, gotIface string) (string, error) {
+				if gotIface != iface {
+					t.Errorf("wgShow iface = %q, want %q", gotIface, iface)
+				}
 				return tc.showOut, tc.showErr
 			}
-			rd := newReadiness(tc.keepalive, now, wgShow)
+			rd := newReadiness(iface, tc.keepalive, now, wgShow)
 			rd.setLeader(tc.leader)
+			rd.setNodeFault(tc.nodeFault)
+			rd.setFault(tc.fault)
 			if got := rd.ready(context.Background()); got != tc.want {
 				t.Errorf("ready = %v, want %v (leader=%v, staleness=%s)", got, tc.want, tc.leader, rd.staleness())
 			}
@@ -158,7 +209,7 @@ func TestReadinessReady(t *testing.T) {
 // handshake state: ready() must short-circuit to true before calling wgShow.
 func TestReadinessStandbyIgnoresWGShow(t *testing.T) {
 	called := false
-	rd := newReadiness(25, time.Now, func(_ context.Context) (string, error) {
+	rd := newReadiness("wg-gw3", 25, time.Now, func(_ context.Context, _ string) (string, error) {
 		called = true
 		return "", fmt.Errorf("wgShow must not be called for a standby")
 	})
@@ -168,5 +219,104 @@ func TestReadinessStandbyIgnoresWGShow(t *testing.T) {
 	}
 	if called {
 		t.Error("wgShow was called for a non-leader; ready() must short-circuit first")
+	}
+}
+
+// TestReadinessNotReadyMessage pins that a standby held down by a node fault says so rather than
+// blaming a handshake it never makes, and that the leader keeps its stale-tunnel wording.
+func TestReadinessNotReadyMessage(t *testing.T) {
+	const nowEpoch = int64(1700001000)
+	now := func() time.Time { return time.Unix(nowEpoch, 0) }
+
+	tcs := []struct {
+		name   string
+		leader bool
+		fault  string
+		want   string
+	}{
+		{
+			name:  "standby_rp_filter_strict_names_the_fault",
+			fault: FaultRPFilterStrict,
+			want:  "node fault: RPFilterStrict",
+		},
+		{
+			name:  "standby_apply_failed_names_the_fault",
+			fault: FaultApplyFailed,
+			want:  "node fault: ApplyFailed",
+		},
+		{
+			name:   "leader_stale_handshake_keeps_handshake_message",
+			leader: true,
+			want:   "no recent handshake",
+		},
+		{
+			name:   "leader_with_fault_names_the_fault",
+			leader: true,
+			fault:  FaultRPFilterStrict,
+			want:   "node fault: RPFilterStrict",
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rd := newReadiness("wg-gw3", 25, now, func(context.Context, string) (string, error) {
+				return "PK=\t0", nil
+			})
+			rd.setLeader(tc.leader)
+			rd.setFault(tc.fault)
+
+			rec := httptest.NewRecorder()
+			rd.handler(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+			if got := rec.Body.String(); got != tc.want {
+				t.Errorf("body = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadinessFaultSlotsStepDown pins the two fault slots: the loop's fault clears on step down,
+// so one failed apply does not bar the pod for life, and the node fault outranks and survives it.
+func TestReadinessFaultSlotsStepDown(t *testing.T) {
+	tcs := []struct {
+		name            string
+		nodeFault       string
+		loopFault       string
+		wantWhileLeader string
+		wantAfterStep   string
+	}{
+		{
+			name:            "loop_fault_clears_on_step_down",
+			loopFault:       FaultApplyFailed,
+			wantWhileLeader: FaultApplyFailed,
+		},
+		{
+			name:            "pre_check_fault_outranks_and_survives",
+			nodeFault:       FaultRPFilterStrict,
+			loopFault:       FaultApplyFailed,
+			wantWhileLeader: FaultRPFilterStrict,
+			wantAfterStep:   FaultRPFilterStrict,
+		},
+		{
+			name: "no_fault_stays_ready",
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rd := newReadiness("wg-gw1", 25, time.Now, nil)
+			rd.setNodeFault(tc.nodeFault)
+			rd.setFault(tc.loopFault)
+			if got := rd.gatingFault(); got != tc.wantWhileLeader {
+				t.Errorf("gating fault before step down = %q, want %q", got, tc.wantWhileLeader)
+			}
+
+			rd.setFault("")
+			if got := rd.gatingFault(); got != tc.wantAfterStep {
+				t.Errorf("gating fault after step down = %q, want %q", got, tc.wantAfterStep)
+			}
+		})
 	}
 }
