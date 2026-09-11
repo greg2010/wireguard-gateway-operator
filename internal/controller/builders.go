@@ -42,53 +42,78 @@ const (
 	componentLink = "link"
 
 	// xgatewayGCPAPIVersion and xgatewayGCPKind identify the Crossplane composite the
-	// operator builds; it is handled unstructured because the typed view models
-	// only the spec/status, not the full Kubernetes object.
+	// operator builds; it is unstructured because the typed view models only spec/status.
 	xgatewayGCPAPIVersion = "infra.wgnet.dev/v1alpha1"
 	xgatewayGCPKind       = "XGatewayGCP"
 
-	// xgatewayNetworkKind is the singleton composite that provisions the shared
-	// VPC. It shares xgatewayGCPAPIVersion: both composites live in the same
-	// infra.wgnet.dev group/version.
+	// xgatewayNetworkKind is the singleton composite that provisions the shared VPC. It
+	// shares xgatewayGCPAPIVersion: both composites live in the same group/version.
 	xgatewayNetworkKind = "XGatewayNetwork"
 
 	// providerLabelKey is the matchLabels key under spec.crossplane.compositionSelector
-	// that pins the provider-specific Composition, so a second provider's Composition
-	// can coexist without collision.
+	// pinning the provider-specific Composition, so two providers can coexist.
 	providerLabelKey = "provider"
 
-	// dnsEndpointAPIVersion and dnsEndpointKind identify the external-dns
-	// DNSEndpoint the operator publishes; handled unstructured because its CRD is
-	// an optional install prerequisite, not a compiled-in type.
+	// dnsEndpointAPIVersion and dnsEndpointKind identify the published external-dns
+	// DNSEndpoint; unstructured because its CRD is an optional install prerequisite.
 	dnsEndpointAPIVersion = "externaldns.k8s.io/v1alpha1"
 	dnsEndpointKind       = "DNSEndpoint"
 	// cloudflareProxiedAnnotation keeps published records DNS-only: gateway
 	// traffic is raw WireGuard/TCP and must never sit behind a proxy.
 	cloudflareProxiedAnnotation = "external-dns.alpha.kubernetes.io/cloudflare-proxied"
+
+	// linkEndpointSliceClusterRole is the chart-shipped ClusterRole granting EndpointSlice
+	// reads; a fixed cluster-scoped name, the resourceName of the operator's bind grant.
+	linkEndpointSliceClusterRole = "gateway-link-endpointslice-reader"
+
+	// linkClusterRoleBindingPrefix leads every per-Gateway ClusterRoleBinding name so
+	// the objects are identifiable in a cluster-wide listing.
+	linkClusterRoleBindingPrefix = "gateway-link-"
+	// linkClusterRoleBindingMaxLen caps the hashed ClusterRoleBinding name, leaving 27
+	// base32 digest characters, far more than collision resistance needs here.
+	linkClusterRoleBindingMaxLen = len(linkClusterRoleBindingPrefix) + 27
+
+	// ownerNamespaceLabel and ownerNameLabel name the owning Gateway on a cluster-scoped
+	// child, which cannot carry an ownerReference to a namespaced owner.
+	ownerNamespaceLabel = "wgnet.dev/gateway-namespace"
+	ownerNameLabel      = "wgnet.dev/gateway-name"
+
+	// clusterHealthPort is the Cluster-mode readiness port; it must match the
+	// GATEWAY_HEALTH_ADDR default in internal/link/config.go. Local mode binds loopback.
+	clusterHealthPort = 8080
 )
 
-// gcpID derives a project-unique, GCP-valid service-account/secret ID as
-// gw-<lowercase-base32(sha256)> truncated to 30 chars. The input is namespace-qualified
-// so the same name in two namespaces does not collide.
-func gcpID(namespace, name string) string {
+// hashedName derives prefix + lowercase base32 of SHA-256 over "<namespace>/<name>",
+// truncated to maxLen. The input is namespace-qualified so equal names do not collide.
+func hashedName(prefix, namespace, name string, maxLen int) string {
 	sum := sha256.Sum256([]byte(namespace + "/" + name))
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
-	id := gcpIDPrefix + strings.ToLower(enc)
-	if len(id) > gcpIDMaxLen {
-		id = id[:gcpIDMaxLen]
+	id := prefix + strings.ToLower(enc)
+	if len(id) > maxLen {
+		id = id[:maxLen]
 	}
 	return id
 }
 
-// bundleSecretName and linkSecretName name the two WireGuard key Secrets a
-// Gateway owns. They are per-Gateway so two Gateways in a namespace do not share
-// key material.
+// gcpID derives a project-unique, GCP-valid service-account/secret ID.
+func gcpID(namespace, name string) string {
+	return hashedName(gcpIDPrefix, namespace, name, gcpIDMaxLen)
+}
+
+// bundleSecretName and linkSecretName name the two WireGuard key Secrets a Gateway
+// owns, per-Gateway so two Gateways in a namespace do not share key material.
 func bundleSecretName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + "-bundle" }
 func linkSecretName(gw *wgnetv1alpha1.Gateway) string   { return gw.Name + "-link" }
 
-// linkComponentName names the link Deployment, ConfigMap, and NetworkPolicy for a
-// Gateway.
+// linkComponentName names every namespaced link object of a Gateway: the workload,
+// ConfigMap, NetworkPolicy, PDB, ServiceAccount, Role, RoleBinding and Lease.
 func linkComponentName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + "-link" }
+
+// linkClusterRoleBindingName hashes namespace and name into the cluster-scoped binding
+// name; "<namespace>-<name>" is ambiguous when either contains a dash.
+func linkClusterRoleBindingName(gw *wgnetv1alpha1.Gateway) string {
+	return hashedName(linkClusterRoleBindingPrefix, gw.Namespace, gw.Name, linkClusterRoleBindingMaxLen)
+}
 
 // commonLabels are the identifying labels stamped on every child object.
 func commonLabels(gw *wgnetv1alpha1.Gateway, component string) map[string]string {
@@ -100,9 +125,8 @@ func commonLabels(gw *wgnetv1alpha1.Gateway, component string) map[string]string
 	}
 }
 
-// buildXGatewayGCP builds the Crossplane composite that provisions the gateway VM from
-// gw.Spec, pointing wgKeySecretRef at the bundle Secret. forwards is the validated
-// subset to expose; an empty slice opens the firewall to the WireGuard underlay only.
+// buildXGatewayGCP builds the Crossplane composite provisioning the gateway VM.
+// forwards is the validated subset to expose; empty opens the underlay port only.
 func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1alpha1.Forward) (*unstructured.Unstructured, error) {
 	id := gcpID(gw.Namespace, gw.Name)
 	image := effectiveGCPImage(gw)
@@ -128,6 +152,7 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 		WgLinkAddress:      &wgLinkAddress,
 		WgSubnet:           &wgSubnet,
 		ProjectID:          &projectID,
+		TrafficPolicy:      new(strings.ToLower(string(effectiveTrafficPolicy(gw)))),
 		ReservedIP:         &reservedIP,
 		Spot:               &spot,
 		EnableOsLogin:      new(cfg.EnableOSLogin),
@@ -178,9 +203,8 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 	return u, nil
 }
 
-// buildXGatewayNetwork builds the singleton shared-VPC composite in cfg.PodNamespace,
-// carrying no ownerReference because its lifecycle is refcount-managed across every
-// attached Gateway. The provider label is fixed to gcp.
+// buildXGatewayNetwork builds the singleton shared-VPC composite in cfg.PodNamespace.
+// It carries no ownerReference: its lifecycle is refcount-managed across Gateways.
 func buildXGatewayNetwork(cfg Config) *unstructured.Unstructured {
 	spec := map[string]any{
 		"name":               cfg.SharedNetworkName,
@@ -207,9 +231,8 @@ func buildXGatewayNetwork(cfg Config) *unstructured.Unstructured {
 	return u
 }
 
-// gatewayProvider returns the Gateway's provider, defaulting an empty value to
-// gcp. The CRD default normally populates it, so this guards only objects that
-// bypassed defaulting (e.g. a directly-constructed in-memory Gateway).
+// gatewayProvider defaults an empty provider to gcp, guarding in-memory Gateways
+// that bypassed CRD defaulting.
 func gatewayProvider(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.CloudProvider {
 	if gw.Spec.Provider == "" {
 		return wgnetv1alpha1.ProviderGCP
@@ -217,9 +240,8 @@ func gatewayProvider(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.CloudProvider {
 	return gw.Spec.Provider
 }
 
-// The default consts mirror the CRD defaults on GatewayGCPSpec and
-// GatewayWireguardSpec, applied by the effective* accessors only for in-memory
-// Gateways that bypassed CRD defaulting; the API server populates any applied one.
+// The default consts mirror the CRD defaults; the effective* accessors apply them only
+// to in-memory Gateways that bypassed CRD defaulting.
 const (
 	gcpDefaultImage            = "projects/kinvolk-public/global/images/family/flatcar-stable"
 	gcpDefaultDiskSizeGB int32 = 20
@@ -261,7 +283,6 @@ func effectiveGCPReservedIP(gw *wgnetv1alpha1.Gateway) bool {
 	return *gw.Spec.GCP.ReservedIP
 }
 
-// effectiveGCPSpot returns whether the gateway VM runs as a spot instance.
 func effectiveGCPSpot(gw *wgnetv1alpha1.Gateway) bool {
 	return gw.Spec.GCP.Spot
 }
@@ -336,6 +357,29 @@ func effectiveLinkReplicas(gw *wgnetv1alpha1.Gateway) int32 {
 	return gw.Spec.Link.Replicas
 }
 
+// effectiveTrafficPolicy defaults an empty data-path mode to Cluster, guarding
+// in-memory Gateways that bypassed CRD defaulting.
+func effectiveTrafficPolicy(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.TrafficPolicy {
+	if gw.Spec.TrafficPolicy == "" {
+		return wgnetv1alpha1.TrafficPolicyCluster
+	}
+	return gw.Spec.TrafficPolicy
+}
+
+func isLocal(gw *wgnetv1alpha1.Gateway) bool {
+	return effectiveTrafficPolicy(gw) == wgnetv1alpha1.TrafficPolicyLocal
+}
+
+// linkIdentityOf returns the identity derived from the allocated id, nil in Cluster mode
+// and before allocation. Local workload builders require a non-nil result.
+func linkIdentityOf(gw *wgnetv1alpha1.Gateway) *link.Identity {
+	if !isLocal(gw) || gw.Status.Link.ID <= 0 {
+		return nil
+	}
+	ident := link.NewIdentity(int(gw.Status.Link.ID))
+	return &ident
+}
+
 // XGatewayGCPGVK is the composite's GroupVersionKind, exported so the manager can
 // register an unstructured Owns watch on it.
 var XGatewayGCPGVK = schema.GroupVersionKind{Group: "infra.wgnet.dev", Version: "v1alpha1", Kind: "XGatewayGCP"}
@@ -360,9 +404,8 @@ func newXGatewayNetwork() *unstructured.Unstructured {
 	return u
 }
 
-// buildBundleSecret builds the gateway-bundle Secret read by the XGatewayGCP's
-// SecretVersion. Its single data key holds "<gatewayPriv>\n<linkPub>\n", the payload
-// the VM boot script splits.
+// buildBundleSecret builds the Secret read by the XGatewayGCP's SecretVersion; its
+// single key holds "<gatewayPriv>\n<linkPub>\n", the payload the VM boot script splits.
 func buildBundleSecret(gw *wgnetv1alpha1.Gateway, gatewayPriv, linkPub string) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -394,26 +437,34 @@ func buildLinkSecret(gw *wgnetv1alpha1.Gateway, linkPriv, gatewayPub string) *co
 	}
 }
 
-// buildLinkConfigMap builds the link's RuntimeConfig ConfigMap (the private key is
-// mounted separately). The peer endpoint is address:wireguardPort once the gateway IP
-// is observed and empty before, so the link reloads in place when it appears.
-func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, forwards []wgnetv1alpha1.Forward) (*corev1.ConfigMap, error) {
+// buildLinkConfigMap builds the link's RuntimeConfig ConfigMap; the private key is
+// mounted separately. The peer endpoint stays empty until the gateway IP is observed.
+func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.Identity) (*corev1.ConfigMap, error) {
 	wgSubnet := effectiveWGSubnet(gw)
 	suffix := wgSubnet
 	if i := strings.LastIndex(suffix, "/"); i >= 0 {
 		suffix = suffix[i+1:]
 	}
 
-	linkForwards := make([]link.Forward, 0, len(forwards))
-	for _, f := range forwards {
+	local := isLocal(gw)
+	linkForwards := make([]link.Forward, 0, len(backends))
+	for _, b := range backends {
+		f := b.Forward
 		proto := strings.ToLower(string(f.Protocol))
-		linkForwards = append(linkForwards, link.Forward{
+		lf := link.Forward{
 			Name:       fmt.Sprintf("%s-%d", proto, f.Port),
 			PublicPort: int(f.Port),
 			Protocol:   proto,
-			Service:    forwardServiceFQDN(f, gw),
-			TargetPort: int(effectiveServicePort(f)),
-		})
+		}
+		if local {
+			lf.Namespace = effectiveForwardNamespace(f, gw)
+			lf.ServiceName = f.Service
+			lf.ServicePortName = b.ServicePortName
+		} else {
+			lf.Service = forwardServiceFQDN(f, gw)
+			lf.TargetPort = int(effectiveServicePort(f))
+		}
+		linkForwards = append(linkForwards, lf)
 	}
 
 	var endpoint string
@@ -421,18 +472,30 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, forwards []wg
 		endpoint = net.JoinHostPort(address, strconv.Itoa(int(effectiveWireguardPort(gw))))
 	}
 
+	allowedIPs := []string{wgSubnet}
+	if local {
+		// Outbound cryptokey routing must select the peer for an arbitrary client
+		// destination, and inbound validation must admit an arbitrary client source.
+		allowedIPs = []string{"0.0.0.0/0"}
+	}
+
 	rc := link.RuntimeConfig{
+		TrafficPolicy: string(effectiveTrafficPolicy(gw)),
+		Identity:      ident,
 		WireGuard: link.WireGuard{
 			Address:    fmt.Sprintf("%s/%s", effectiveWGLinkAddress(gw), suffix),
 			ListenPort: 0,
 			MTU:        int(effectiveWGMTU(gw)),
 			Peer: link.Peer{
 				Endpoint:            endpoint,
-				AllowedIPs:          []string{wgSubnet},
+				AllowedIPs:          allowedIPs,
 				PersistentKeepalive: int(effectiveWGKeepalive(gw)),
 			},
 		},
 		Forwards: linkForwards,
+	}
+	if local {
+		rc.PodSelector = linkSelectorLabels(gw)
 	}
 
 	data, err := json.Marshal(rc)
@@ -450,9 +513,8 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, forwards []wg
 	}, nil
 }
 
-// buildLinkNetworkPolicy builds the link pod's egress allowlist: cluster DNS, the
-// apiserver (Lease leader election), the WireGuard underlay, and each forward's backend
-// ports. The link's own nftables default-DROP is the inner containment layer.
+// buildLinkNetworkPolicy allows egress to cluster DNS, the apiserver, the WireGuard
+// underlay and each forward's backend ports; nftables default-DROP contains the rest.
 func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend) *networkingv1.NetworkPolicy {
 	dnsPort53UDP := corev1.ProtocolUDP
 	dnsPort53TCP := corev1.ProtocolTCP
@@ -486,9 +548,8 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend
 				{Protocol: &wgProto, Port: &wgPort},
 			},
 		},
-		// The apiserver (Lease leader election) is reached by a peer-less, port-scoped
-		// rule because its in-cluster endpoint addressing varies by environment:
-		// 443 covers the in-cluster Service, 6443 the direct apiserver port.
+		// The apiserver's in-cluster addressing varies by environment, so the rule is
+		// peer-less: 443 covers the Service, 6443 the direct apiserver port.
 		{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &apiserverProto, Port: &port443},
@@ -497,11 +558,8 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend
 		},
 	}
 
-	// The backend peer is 0.0.0.0/0, not the Service CIDR: egress is evaluated against
-	// the ClusterIP on some CNIs and the pod IP on others, and the nftables default-DROP
-	// is the real containment. Both the Service port and the pod-side port it DNATs to
-	// are allowed for the same reason: a CNI enforcing egress after kube-proxy DNAT
-	// (k3s kube-router) sees the pod port, one enforcing before it sees the Service port.
+	// The peer is 0.0.0.0/0 and both ports are allowed because a CNI may evaluate egress
+	// against the ClusterIP and Service port or against the pod IP and DNAT'd port.
 	for _, b := range backends {
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			To: []networkingv1.NetworkPolicyPeer{{
@@ -525,17 +583,8 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend
 	}
 }
 
-// backendEgressPorts is the port allowlist of a forward's egress rule: the Service
-// port it DNATs to, plus the pod-side port kube-proxy rewrites that to when the Service
-// remaps it.
-//
-// An unresolved (named) backend port cannot be enumerated without reading the backing
-// EndpointSlices, so the rule is left port-less. The peer is already 0.0.0.0/0, so that
-// leaves the link pod's IPv4 egress on the forward's protocol unrestricted: the link's
-// nftables ruleset is forward-only and has no output chain, so it does not contain
-// traffic the pod itself originates. This is a deliberate tradeoff, taken so a named
-// targetPort keeps working rather than blackholing the forward, and classifyForwards
-// warns when it applies; EndpointSlice-based resolution would remove it.
+// backendEgressPorts allows the Service port and the pod-side port it is remapped to. A named
+// backend port cannot be enumerated, so the rule goes port-less and classifyForwards warns.
 func backendEgressPorts(b forwardBackend) []networkingv1.NetworkPolicyPort {
 	proto := corev1ProtocolOf(b.Forward.Protocol)
 	if b.BackendPort == 0 {
@@ -549,9 +598,8 @@ func backendEgressPorts(b forwardBackend) []networkingv1.NetworkPolicyPort {
 	return ports
 }
 
-// corev1ProtocolOf maps a Gateway L4 protocol to its corev1 equivalent for
-// NetworkPolicy ports, falling back to TCP rather than emitting an empty protocol the
-// API would reject.
+// corev1ProtocolOf maps a Gateway L4 protocol to its corev1 equivalent, falling back to
+// TCP rather than the empty protocol the API would reject.
 func corev1ProtocolOf(p wgnetv1alpha1.Protocol) corev1.Protocol {
 	if p == wgnetv1alpha1.ProtocolUDP {
 		return corev1.ProtocolUDP
@@ -568,16 +616,14 @@ func effectiveForwardNamespace(f wgnetv1alpha1.Forward, gw *wgnetv1alpha1.Gatewa
 	return gw.Namespace
 }
 
-// forwardServiceFQDN is the fully-qualified cluster DNS name the link resolves for a
-// forward's backend. Building it here keeps resolution explicit and uniform for
-// same- and cross-namespace targets, independent of the pod's resolv.conf ndots.
+// forwardServiceFQDN is the fully-qualified cluster DNS name of a forward's backend,
+// built here so resolution does not depend on the pod's resolv.conf ndots.
 func forwardServiceFQDN(f wgnetv1alpha1.Forward, gw *wgnetv1alpha1.Gateway) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", f.Service, effectiveForwardNamespace(f, gw))
 }
 
-// effectiveServicePort is the backend Service port a forward DNATs to: its TargetPort,
-// or its public Port when TargetPort is unset. This is the Service's published port,
-// not the pod-side port that Service may remap it to.
+// effectiveServicePort is the forward's TargetPort, or its public Port when unset. It is
+// the Service's published port, not the pod-side port the Service may remap it to.
 func effectiveServicePort(f wgnetv1alpha1.Forward) int32 {
 	if f.TargetPort == 0 {
 		return f.Port
@@ -595,34 +641,179 @@ func linkSelectorLabels(gw *wgnetv1alpha1.Gateway) map[string]string {
 	}
 }
 
-// buildLinkDeployment builds the link Deployment: root with NET_ADMIN to own wg0 and
-// nftables, leader-elected active-passive so RollingUpdate is safe at any replica count.
-// A privileged init container enables net.ipv4.ip_forward in the shared pod netns, so
-// nodes need no unsafe-sysctl allowlist.
-func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployment {
-	replicas := effectiveLinkReplicas(gw)
+// linkPodSpec builds the pod spec both link workloads share. A nil ident selects Cluster
+// mode (own netns, init container enables ip_forward); non-nil selects host-netns Local.
+func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.Identity) corev1.PodSpec {
 	var runAsUser int64
 	allowPrivilegeEscalation := false
-	privileged := true
-	selector := linkSelectorLabels(gw)
-
-	// maxUnavailable=0 keeps a programmed pod alive throughout a roll; maxSurge=1
-	// brings the replacement up first, where it stays a standby until it acquires.
-	maxSurge := intstr.FromInt32(1)
-	maxUnavailable := intstr.FromInt32(0)
 	terminationGracePeriod := int64(30)
 
 	const (
-		// configMountDir is a whole-volume mount (no subPath) so the kubelet keeps it
-		// live via the "..data" symlink swap, letting the link's fsnotify watch observe
-		// the endpoint update and reload in place; a subPath mount never refreshes.
-		configMountDir  = "/etc/gateway/config"
-		configFilePath  = configMountDir + "/" + linkConfigKey
-		wgKeysMountPath = "/etc/gateway/wg"
-		wgKeyPath       = "/etc/gateway/wg/" + wg.LinkPrivateKey
-		wgPeerPubPath   = "/etc/gateway/wg/" + wg.LinkPeerPublicKey
-		healthAddr      = ":8080"
+		// Whole-volume mount (no subPath) so the kubelet's "..data" symlink swap keeps it
+		// live and the link's fsnotify watch reloads; a subPath mount never refreshes.
+		configMountDir       = "/etc/gateway/config"
+		configFilePath       = configMountDir + "/" + linkConfigKey
+		wgKeysMountPath      = "/etc/gateway/wg"
+		wgKeyPath            = "/etc/gateway/wg/" + wg.LinkPrivateKey
+		wgPeerPubPath        = "/etc/gateway/wg/" + wg.LinkPeerPublicKey
+		hostProcSysNetVolume = "host-proc-sys-net"
 	)
+
+	healthAddr := ":" + strconv.Itoa(clusterHealthPort)
+	if ident != nil {
+		healthAddr = "127.0.0.1:" + strconv.Itoa(ident.HealthPort)
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "GATEWAY_CONFIG_PATH", Value: configFilePath},
+		{Name: "GATEWAY_WG_KEY_PATH", Value: wgKeyPath},
+		{Name: "GATEWAY_WG_PEER_PUBKEY_PATH", Value: wgPeerPubPath},
+		{Name: "GATEWAY_HEALTH_ADDR", Value: healthAddr},
+		{Name: "GATEWAY_RECONCILE_INTERVAL", Value: effectiveWGReconcileInterval(gw)},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
+		{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		{Name: "GATEWAY_LEASE_NAME", Value: linkComponentName(gw)},
+	}
+
+	mounts := []corev1.VolumeMount{
+		{Name: "config", MountPath: configMountDir, ReadOnly: true},
+		{Name: "wg-keys", MountPath: wgKeysMountPath, ReadOnly: true},
+	}
+	volumes := []corev1.Volume{
+		{
+			Name: "config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: linkComponentName(gw)},
+				},
+			},
+		},
+		{
+			Name: "wg-keys",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: linkSecretName(gw)},
+			},
+		},
+	}
+
+	var (
+		hostNetwork    bool
+		dnsPolicy      corev1.DNSPolicy
+		initContainers []corev1.Container
+		affinity       *corev1.Affinity
+		ports          []corev1.ContainerPort
+		probeHandler   corev1.HTTPGetAction
+	)
+
+	if ident != nil {
+		hostNetwork = true
+		dnsPolicy = corev1.DNSClusterFirstWithHostNet
+		probeHandler = corev1.HTTPGetAction{
+			Path: "/healthz",
+			Host: "127.0.0.1",
+			Port: intstr.FromInt32(int32(ident.HealthPort)),
+		}
+		env = append(env, corev1.EnvVar{
+			Name: "NODE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
+			},
+		})
+		hostPathDir := corev1.HostPathDirectory
+		volumes = append(volumes, corev1.Volume{
+			Name: hostProcSysNetVolume,
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: "/proc/sys/net", Type: &hostPathDir},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      hostProcSysNetVolume,
+			MountPath: link.HostProcSysNetPath,
+			ReadOnly:  false,
+		})
+	} else {
+		privileged := true
+		initContainers = []corev1.Container{{
+			Name:            "enable-ip-forward",
+			Image:           cfg.LinkImage,
+			ImagePullPolicy: corev1.PullPolicy(cfg.LinkImagePullPolicy),
+			Command:         []string{"sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:  &runAsUser,
+				Privileged: &privileged,
+			},
+		}}
+		affinity = &corev1.Affinity{
+			PodAntiAffinity: &corev1.PodAntiAffinity{
+				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+					Weight: 100,
+					PodAffinityTerm: corev1.PodAffinityTerm{
+						TopologyKey:   "kubernetes.io/hostname",
+						LabelSelector: &metav1.LabelSelector{MatchLabels: linkSelectorLabels(gw)},
+					},
+				}},
+			},
+		}
+		ports = []corev1.ContainerPort{{
+			Name:          "health",
+			ContainerPort: clusterHealthPort,
+			Protocol:      corev1.ProtocolTCP,
+		}}
+		probeHandler = corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("health")}
+	}
+
+	return corev1.PodSpec{
+		ServiceAccountName:            linkComponentName(gw),
+		AutomountServiceAccountToken:  new(true),
+		TerminationGracePeriodSeconds: &terminationGracePeriod,
+		NodeSelector:                  gw.Spec.Link.NodeSelector,
+		HostNetwork:                   hostNetwork,
+		DNSPolicy:                     dnsPolicy,
+		Affinity:                      affinity,
+		InitContainers:                initContainers,
+		Containers: []corev1.Container{{
+			Name:            componentLink,
+			Image:           cfg.LinkImage,
+			ImagePullPolicy: corev1.PullPolicy(cfg.LinkImagePullPolicy),
+			Command:         []string{"gateway-link"},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                &runAsUser,
+				AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+				Capabilities:             &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN"}},
+			},
+			Env:   env,
+			Ports: ports,
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{HTTPGet: &probeHandler},
+				// Readiness only: the link reports healthy once a fresh handshake
+				// exists, and a liveness restart mid-converge would just reset progress.
+				InitialDelaySeconds: 3,
+				PeriodSeconds:       5,
+				TimeoutSeconds:      2,
+			},
+			VolumeMounts: mounts,
+		}},
+		Volumes: volumes,
+	}
+}
+
+// buildLinkDeployment builds the Cluster-mode link Deployment, leader-elected
+// active-passive. maxUnavailable=0 with maxSurge=1 keeps a programmed pod through a roll.
+func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployment {
+	replicas := effectiveLinkReplicas(gw)
+	selector := linkSelectorLabels(gw)
+	maxSurge := intstr.FromInt32(1)
+	maxUnavailable := intstr.FromInt32(0)
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -641,113 +832,36 @@ func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployme
 				},
 			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: selector,
-				},
-				Spec: corev1.PodSpec{
-					ServiceAccountName:            linkComponentName(gw),
-					AutomountServiceAccountToken:  new(true),
-					TerminationGracePeriodSeconds: &terminationGracePeriod,
-					Affinity: &corev1.Affinity{
-						PodAntiAffinity: &corev1.PodAntiAffinity{
-							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
-								Weight: 100,
-								PodAffinityTerm: corev1.PodAffinityTerm{
-									TopologyKey:   "kubernetes.io/hostname",
-									LabelSelector: &metav1.LabelSelector{MatchLabels: selector},
-								},
-							}},
-						},
-					},
-					InitContainers: []corev1.Container{{
-						Name:            "enable-ip-forward",
-						Image:           cfg.LinkImage,
-						ImagePullPolicy: corev1.PullPolicy(cfg.LinkImagePullPolicy),
-						Command:         []string{"sh", "-c", "echo 1 > /proc/sys/net/ipv4/ip_forward"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:  &runAsUser,
-							Privileged: &privileged,
-						},
-					}},
-					Containers: []corev1.Container{{
-						Name:            componentLink,
-						Image:           cfg.LinkImage,
-						ImagePullPolicy: corev1.PullPolicy(cfg.LinkImagePullPolicy),
-						Command:         []string{"gateway-link"},
-						SecurityContext: &corev1.SecurityContext{
-							RunAsUser:                &runAsUser,
-							AllowPrivilegeEscalation: &allowPrivilegeEscalation,
-							Capabilities:             &corev1.Capabilities{Add: []corev1.Capability{"NET_ADMIN"}},
-						},
-						Env: []corev1.EnvVar{
-							{Name: "GATEWAY_CONFIG_PATH", Value: configFilePath},
-							{Name: "GATEWAY_WG_KEY_PATH", Value: wgKeyPath},
-							{Name: "GATEWAY_WG_PEER_PUBKEY_PATH", Value: wgPeerPubPath},
-							{Name: "GATEWAY_HEALTH_ADDR", Value: healthAddr},
-							{Name: "GATEWAY_RECONCILE_INTERVAL", Value: effectiveWGReconcileInterval(gw)},
-							{
-								Name: "POD_NAMESPACE",
-								ValueFrom: &corev1.EnvVarSource{
-									FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-								},
-							},
-							{
-								Name: "POD_NAME",
-								ValueFrom: &corev1.EnvVarSource{
-									FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-								},
-							},
-							{Name: "GATEWAY_LEASE_NAME", Value: linkComponentName(gw)},
-						},
-						Ports: []corev1.ContainerPort{{
-							Name:          "health",
-							ContainerPort: 8080,
-							Protocol:      corev1.ProtocolTCP,
-						}},
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromString("health"),
-								},
-							},
-							// Readiness only: the link reports healthy once a fresh
-							// handshake exists, and a liveness restart mid-converge would
-							// just reset progress.
-							InitialDelaySeconds: 3,
-							PeriodSeconds:       5,
-							TimeoutSeconds:      2,
-						},
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "config", MountPath: configMountDir, ReadOnly: true},
-							{Name: "wg-keys", MountPath: wgKeysMountPath, ReadOnly: true},
-						},
-					}},
-					Volumes: []corev1.Volume{
-						{
-							Name: "config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{Name: linkComponentName(gw)},
-								},
-							},
-						},
-						{
-							Name: "wg-keys",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{SecretName: linkSecretName(gw)},
-							},
-						},
-					},
-				},
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				Spec:       linkPodSpec(gw, cfg, nil),
 			},
 		},
 	}
 }
 
-// buildLinkServiceAccount builds the ServiceAccount the link pods run under. Its
-// token is the credential the link presents to the apiserver for Lease leader
-// election; the link mounts no other cluster credential.
+// buildLinkDaemonSet builds the Local-mode link DaemonSet, one host-network pod per node.
+// ident must be non-nil: every name, mark, route table and health port derives from it.
+func buildLinkDaemonSet(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.Identity) *appsv1.DaemonSet {
+	selector := linkSelectorLabels(gw)
+
+	return &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      linkComponentName(gw),
+			Namespace: gw.Namespace,
+			Labels:    commonLabels(gw, componentLink),
+		},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				Spec:       linkPodSpec(gw, cfg, ident),
+			},
+		},
+	}
+}
+
+// buildLinkServiceAccount builds the ServiceAccount the link pods run under; its token
+// is the only cluster credential they mount.
 func buildLinkServiceAccount(gw *wgnetv1alpha1.Gateway) *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
@@ -758,20 +872,30 @@ func buildLinkServiceAccount(gw *wgnetv1alpha1.Gateway) *corev1.ServiceAccount {
 	}
 }
 
-// buildLinkRole builds the namespaced Role granting the link exactly the Lease verbs
-// leader election needs, scoped to the coordination.k8s.io leases resource only.
+// buildLinkRole grants the Lease verbs leader election needs, plus in Local mode the
+// pod reads the election's liveness input needs.
 func buildLinkRole(gw *wgnetv1alpha1.Gateway) *rbacv1.Role {
+	rules := []rbacv1.PolicyRule{{
+		APIGroups: []string{"coordination.k8s.io"},
+		Resources: []string{"leases"},
+		Verbs:     []string{"get", "list", "watch", "create", "update"},
+	}}
+	if isLocal(gw) {
+		// Only a Local link watches pods: it reads this Gateway's link pods to learn
+		// which nodes carry a ready peer, the election's liveness input.
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups: []string{""},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get", "list", "watch"},
+		})
+	}
 	return &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      linkComponentName(gw),
 			Namespace: gw.Namespace,
 			Labels:    commonLabels(gw, componentLink),
 		},
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{"coordination.k8s.io"},
-			Resources: []string{"leases"},
-			Verbs:     []string{"get", "list", "watch", "create", "update"},
-		}},
+		Rules: rules,
 	}
 }
 
@@ -797,14 +921,37 @@ func buildLinkRoleBinding(gw *wgnetv1alpha1.Gateway) *rbacv1.RoleBinding {
 	}
 }
 
-// buildLinkPodDisruptionBudget builds the link PDB holding one pod available through a
-// voluntary disruption, so a drain cannot take the active and the standby at once. It
-// is meaningful only at replicas>1, where the caller applies it.
+// buildLinkClusterRoleBinding lets a Local Gateway's link resolve backend pods. Being
+// cluster-scoped it has no ownerReference, so the delete path reaps it explicitly.
+func buildLinkClusterRoleBinding(gw *wgnetv1alpha1.Gateway) *rbacv1.ClusterRoleBinding {
+	labels := commonLabels(gw, componentLink)
+	labels[ownerNamespaceLabel] = gw.Namespace
+	labels[ownerNameLabel] = gw.Name
+
+	return &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   linkClusterRoleBindingName(gw),
+			Labels: labels,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     linkEndpointSliceClusterRole,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      rbacv1.ServiceAccountKind,
+			Name:      linkComponentName(gw),
+			Namespace: gw.Namespace,
+		}},
+	}
+}
+
+// buildLinkPodDisruptionBudget keeps one pod available through a voluntary disruption,
+// so a drain cannot take the active and the standby at once. Meaningful only at replicas>1.
 func buildLinkPodDisruptionBudget(gw *wgnetv1alpha1.Gateway) *policyv1.PodDisruptionBudget {
 	minAvailable := intstr.FromInt32(1)
-	// AlwaysAllow lets a wedged or unhealthy link pod be evicted even when the
-	// budget is already at its limit, so an unready replica cannot block a node
-	// drain (HA best practice).
+	// AlwaysAllow evicts an unhealthy pod even at the budget limit, so an unready
+	// replica cannot block a node drain.
 	unhealthyPolicy := policyv1.AlwaysAllow
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
@@ -820,9 +967,8 @@ func buildLinkPodDisruptionBudget(gw *wgnetv1alpha1.Gateway) *policyv1.PodDisrup
 	}
 }
 
-// buildDNSEndpoint builds the external-dns DNSEndpoint mapping each hostname to
-// the gateway address as an A record. It returns nil when there are no hostnames
-// or the address is not yet known; the caller skips creation in that case.
+// buildDNSEndpoint maps each hostname to the gateway address as an A record, returning
+// nil when there are no hostnames or the address is not yet known.
 func buildDNSEndpoint(gw *wgnetv1alpha1.Gateway, address string) *unstructured.Unstructured {
 	if len(gw.Spec.DNSHostnames) == 0 || address == "" {
 		return nil
@@ -849,9 +995,8 @@ func buildDNSEndpoint(gw *wgnetv1alpha1.Gateway, address string) *unstructured.U
 	return u
 }
 
-// toUnstructuredMap converts a typed value into unstructured map form via the runtime
-// converter, so integers become int64 rather than the float64 a plain JSON round-trip
-// would yield (which NestedInt64 and the API server reject).
+// toUnstructuredMap converts via the runtime converter, so integers become int64 rather
+// than the float64 a JSON round-trip yields (which NestedInt64 and the API server reject).
 func toUnstructuredMap(v any) (map[string]any, error) {
 	return runtime.DefaultUnstructuredConverter.ToUnstructured(v)
 }

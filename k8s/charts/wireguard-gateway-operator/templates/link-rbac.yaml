@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  # Cluster-scoped names are global, so this fixed name matches the operator's own
+  # ClusterRole (role.yaml, operator-rbac.yaml) and assumes one operator install per
+  # cluster. The operator names it verbatim in its bind grant and in every
+  # per-Gateway ClusterRoleBinding it creates for a Local-mode link.
+  name: gateway-link-endpointslice-reader
+  labels:
+    {{- include "wireguard-gateway-operator.labels" (dict "ctx" . "component" "link") | nindent 4 }}
+rules:
+  - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+      - watch

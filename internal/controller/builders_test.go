@@ -6,9 +6,12 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -17,10 +20,12 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
+	hk8s "github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
 
 // testConfig is the operator-level config the builder tests fold into Gateways.
@@ -37,9 +42,8 @@ func testConfig() Config {
 	}
 }
 
-// newGateway builds a Gateway fixture with the given forwards and hostnames. It
-// sets the required spec.gcp.ProjectID and leaves every defaulted spec.gcp and
-// spec.wireguard field unset so the builders exercise their defaulting accessors.
+// newGateway leaves every defaulted spec.gcp and spec.wireguard field unset, so the
+// builders exercise their defaulting accessors.
 func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostnames []string) *wgnetv1alpha1.Gateway {
 	return &wgnetv1alpha1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -56,8 +60,16 @@ func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostna
 	}
 }
 
-// assertNestedString fails unless the unstructured object's value at path equals
-// want.
+// clusterBackends is the shape classifyForwards produces for a Cluster-mode Gateway whose
+// Services publish numeric targetPorts: a resolved backend port and an unnamed Service port.
+func clusterBackends(forwards []wgnetv1alpha1.Forward) []forwardBackend {
+	backends := make([]forwardBackend, 0, len(forwards))
+	for _, f := range forwards {
+		backends = append(backends, forwardBackend{Forward: f, BackendPort: effectiveServicePort(f)})
+	}
+	return backends
+}
+
 func assertNestedString(t *testing.T, u *unstructured.Unstructured, want string, path ...string) {
 	t.Helper()
 	got, found, err := unstructured.NestedString(u.Object, path...)
@@ -72,7 +84,6 @@ func assertNestedString(t *testing.T, u *unstructured.Unstructured, want string,
 	}
 }
 
-// decodeJSON unmarshals raw into v, failing the test on error.
 func decodeJSON(t *testing.T, raw string, v any) {
 	t.Helper()
 	if err := json.Unmarshal([]byte(raw), v); err != nil {
@@ -126,6 +137,31 @@ func TestGCPID(t *testing.T) {
 			t.Fatalf("gcpID collides across namespaces: %q", a)
 		}
 	})
+}
+
+// TestHashedNamesArePinned fixes the exact bytes both hashedName callers produce, so a
+// prefix, digest, encoding or truncation change cannot silently rename live objects.
+func TestHashedNamesArePinned(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"gcp id", gcpID("default", "gw1"), "gw-aggomndtxrzb5qrg4d7sunz5muq"},
+		{
+			"clusterrolebinding",
+			linkClusterRoleBindingName(newGateway("edge", "wg-system", nil, nil)),
+			"gateway-link-cnvcej5geqr66udgtvezbh73rsj",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("name = %q, want %q", tt.got, tt.want)
+			}
+		})
+	}
 }
 
 func TestBuildXGatewayGCP(t *testing.T) {
@@ -228,8 +264,7 @@ func TestBuildXGatewayGCP(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPOptionalFields pins the fields the builder omits when
-// unconfigured (userData with an empty config, allowedPorts with no forwards)
+// TestBuildXGatewayGCPOptionalFields pins the fields the builder omits when unconfigured
 // against image and diskSizeGB, which carry CRD defaults and are always set.
 func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
 	cfg := testConfig()
@@ -263,9 +298,8 @@ func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPWireguardListenPort pins that a non-default
-// spec.wireguard.listenPort flows verbatim onto the composite's wgListenPort, so the
-// gateway VM boots on the port the link dials.
+// TestBuildXGatewayGCPWireguardListenPort pins that a non-default listen port flows
+// verbatim onto wgListenPort, so the gateway VM boots on the port the link dials.
 func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
 	cfg := testConfig()
 	gw := newGateway("edge", "wg-system", nil, nil)
@@ -281,9 +315,8 @@ func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPWireguardMTU pins that a non-default spec.wireguard.mtu
-// flows verbatim onto the composite's wgMTU, so the gateway VM sets wg0 to the
-// same MTU the in-cluster link uses rather than leaving it at the kernel default.
+// TestBuildXGatewayGCPWireguardMTU pins that a non-default mtu flows verbatim onto wgMTU, so
+// the VM sets wg0 to the same MTU the link uses rather than leaving it at the kernel default.
 func TestBuildXGatewayGCPWireguardMTU(t *testing.T) {
 	cfg := testConfig()
 	gw := newGateway("edge", "wg-system", nil, nil)
@@ -344,7 +377,7 @@ func TestBuildLinkConfigMap(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -388,9 +421,8 @@ func TestBuildLinkConfigMap(t *testing.T) {
 	}
 }
 
-// TestBuildLinkConfigMapEndpoint pins the operator-supplied peer endpoint: a known
-// address renders as address:wireguardPort, and an empty address leaves the endpoint
-// unset so the link waits and reloads in place once the IP appears.
+// TestBuildLinkConfigMapEndpoint pins that an empty address leaves the peer endpoint unset,
+// so the link waits and reloads in place once the gateway IP appears.
 func TestBuildLinkConfigMapEndpoint(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -406,7 +438,7 @@ func TestBuildLinkConfigMapEndpoint(t *testing.T) {
 			gw := newGateway("edge", "wg-system",
 				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
 
-			cm, err := buildLinkConfigMap(gw, tt.address, gw.Spec.Forwards)
+			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -439,7 +471,7 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 					{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: tt.targetPort},
 				}, nil)
 
-			cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -456,9 +488,8 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 	}
 }
 
-// TestBuildLinkConfigMapRoundTrip guards that the ConfigMap the operator writes is one
-// the link daemon accepts: it loads the emitted JSON through link.LoadRuntimeConfig
-// (the real parse-and-validate path) and confirms the forwards survive.
+// TestBuildLinkConfigMapRoundTrip guards that the ConfigMap the operator writes is one the
+// link daemon accepts, by loading the emitted JSON through the real parse-and-validate path.
 func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 	gw := newGateway("edge", "wg-system",
 		[]wgnetv1alpha1.Forward{
@@ -466,7 +497,7 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -490,9 +521,8 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEffectiveForwardNamespace pins the namespace-defaulting rule the FQDN
-// builder and the cross-namespace gate both depend on: an unset Forward.Namespace
-// resolves to the Gateway's namespace, while an explicit one is honored verbatim.
+// TestEffectiveForwardNamespace pins the namespace-defaulting rule the FQDN builder and the
+// cross-namespace gate both depend on.
 func TestEffectiveForwardNamespace(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	tests := []struct {
@@ -512,9 +542,8 @@ func TestEffectiveForwardNamespace(t *testing.T) {
 	}
 }
 
-// TestBuildLinkConfigMapServiceFQDN pins that the link's runtime config carries a
-// fully-qualified Service name, defaulting to the Gateway namespace and honoring an
-// explicit cross-namespace target.
+// TestBuildLinkConfigMapServiceFQDN pins that the runtime config carries a fully-qualified
+// Service name, so resolution does not depend on the pod's resolv.conf ndots.
 func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -535,7 +564,7 @@ func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system", []wgnetv1alpha1.Forward{tt.forward}, nil)
-			cm, err := buildLinkConfigMap(gw, "", gw.Spec.Forwards)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -551,9 +580,8 @@ func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 	}
 }
 
-// hasOpenEgressPort reports whether any egress rule permits proto/port to a 0.0.0.0/0
-// peer, the open CIDR the link's forward and WireGuard rules use so the policy holds
-// regardless of whether the CNI matches on ClusterIP or pod IP.
+// hasOpenEgressPort matches the 0.0.0.0/0 peer the link's forward and WireGuard rules use,
+// so the policy holds whether the CNI matches on ClusterIP or on pod IP.
 func hasOpenEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
 	for _, r := range rules {
 		open := false
@@ -598,9 +626,8 @@ func hasProtocolOnlyEgress(rules []networkingv1.NetworkPolicyEgressRule, proto c
 	return false
 }
 
-// hasNoPeerEgressPort reports whether any egress rule permits proto/port with no `to`
-// peer (all destinations), as the apiserver rule is, since in-cluster apiserver
-// addressing varies by environment.
+// hasNoPeerEgressPort matches a rule with no `to` peer, as the apiserver rule is, since
+// in-cluster apiserver addressing varies by environment.
 func hasNoPeerEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
 	for _, r := range rules {
 		if len(r.To) != 0 {
@@ -615,8 +642,6 @@ func hasNoPeerEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto cor
 	return false
 }
 
-// hasDNSEgress reports whether any egress rule targets the kube-dns pods in
-// kube-system on the given protocol at port 53.
 func hasDNSEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol) bool {
 	for _, r := range rules {
 		dns := false
@@ -646,10 +671,8 @@ func hasDNSEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Pro
 // per-forward ones: kube-dns, the WireGuard underlay, and the apiserver.
 const fixedEgressRules = 3
 
-// TestBuildLinkNetworkPolicy pins the egress allowlist: DNS, the apiserver (TCP 443 and
-// 6443), the WireGuard underlay, and one rule per forward carrying exactly the Service
-// port plus the pod-side port that Service DNATs to, since egress is evaluated after
-// kube-proxy rewrites the destination on some CNIs and before it on others.
+// TestBuildLinkNetworkPolicy pins each forward's rule to the Service port plus the pod-side
+// port it DNATs to, since CNIs evaluate egress before or after kube-proxy rewrites it.
 func TestBuildLinkNetworkPolicy(t *testing.T) {
 	// port 0 means the entry must carry no port at all, allowing the whole protocol.
 	type wantPort struct {
@@ -687,9 +710,8 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 			},
 		},
 		{
-			// A named Service targetPort resolves to 0: the pod port is unknown, so the
-			// rule drops its ports entirely rather than emit one the pod never listens
-			// on. nftables inside the link is then the only port restriction.
+			// A named Service targetPort resolves to 0: the pod port is unknown, so the rule
+			// drops its ports rather than name one the pod never listens on; nftables remains.
 			name: "unresolved backend port allows the whole protocol",
 			backends: []forwardBackend{
 				{Forward: wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}},
@@ -857,9 +879,8 @@ func TestBuildLinkDeployment(t *testing.T) {
 		}
 	}
 
-	// The config ConfigMap must mount as a live directory, never a subPath: a subPath
-	// mount is copied once at start and never refreshed, defeating the link's in-place
-	// reload. GATEWAY_CONFIG_PATH must point at the file inside that directory.
+	// The config ConfigMap must mount as a live directory, never a subPath: a subPath mount
+	// is copied once at start and never refreshed, defeating the link's in-place reload.
 	mounts := map[string]corev1.VolumeMount{}
 	for _, m := range c.VolumeMounts {
 		mounts[m.Name] = m
@@ -921,8 +942,6 @@ func TestBuildLinkDeployment(t *testing.T) {
 	}
 }
 
-// assertFieldRefEnv fails unless env carries a var named name sourced from the
-// downward-API field path, with no literal Value.
 func assertFieldRefEnv(t *testing.T, env []corev1.EnvVar, name, fieldPath string) {
 	t.Helper()
 	for _, e := range env {
@@ -943,9 +962,8 @@ func assertFieldRefEnv(t *testing.T, env []corev1.EnvVar, name, fieldPath string
 	t.Errorf("env missing %q (valueFrom fieldRef %q)", name, fieldPath)
 }
 
-// assertHostnameAntiAffinity fails unless affinity carries a preferred (soft)
-// pod-anti-affinity term keyed on the node hostname and selecting the link pods,
-// so replicas spread across nodes.
+// assertHostnameAntiAffinity checks the soft anti-affinity term keyed on node hostname,
+// which is what spreads the link replicas across nodes.
 func assertHostnameAntiAffinity(t *testing.T, affinity *corev1.Affinity, wantSelector map[string]string) {
 	t.Helper()
 	if affinity == nil || affinity.PodAntiAffinity == nil {
@@ -971,9 +989,8 @@ func assertHostnameAntiAffinity(t *testing.T, affinity *corev1.Affinity, wantSel
 	}
 }
 
-// TestBuildLinkDeploymentReplicas pins the replica count: it defaults to 1 when
-// spec.link.replicas is unset and honors an explicit value, which is what enables
-// a hot-standby Gateway.
+// TestBuildLinkDeploymentReplicas pins that replicas default to 1 and honor an explicit
+// value, which is what enables a hot-standby Gateway.
 func TestBuildLinkDeploymentReplicas(t *testing.T) {
 	cfg := testConfig()
 	tests := []struct {
@@ -1037,9 +1054,8 @@ func TestBuildLinkServiceAccount(t *testing.T) {
 	}
 }
 
-// TestBuildLinkRole pins the link Role's single rule: exactly the Lease verbs
-// leader election needs on the coordination.k8s.io leases resource, scoped
-// namespaced.
+// TestBuildLinkRole pins the Cluster-mode Role to exactly the verbs leader election needs
+// on leases and nothing else, because a Cluster link never watches pods.
 func TestBuildLinkRole(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	role := buildLinkRole(gw)
@@ -1066,9 +1082,8 @@ func TestBuildLinkRole(t *testing.T) {
 	}
 }
 
-// TestBuildLinkRoleBinding pins that the link RoleBinding binds the link Role to
-// the link ServiceAccount in the Gateway's namespace, the grant that lets the link
-// pods elect.
+// TestBuildLinkRoleBinding pins the binding of the link Role to the link ServiceAccount,
+// the grant that lets the link pods elect.
 func TestBuildLinkRoleBinding(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	rb := buildLinkRoleBinding(gw)
@@ -1091,9 +1106,8 @@ func TestBuildLinkRoleBinding(t *testing.T) {
 	}
 }
 
-// TestBuildLinkPodDisruptionBudget pins the link PDB: minAvailable 1 with the link
-// selector so a drain cannot take the active and standby at once, and AlwaysAllow so an
-// unhealthy pod can still be evicted at the budget limit.
+// TestBuildLinkPodDisruptionBudget pins minAvailable 1 so a drain cannot take the active and
+// the standby at once, and AlwaysAllow so an unhealthy pod is still evictable at the limit.
 func TestBuildLinkPodDisruptionBudget(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	pdb := buildLinkPodDisruptionBudget(gw)
@@ -1115,9 +1129,8 @@ func TestBuildLinkPodDisruptionBudget(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPProviderSelector pins the multi-cloud scoping contract: the
-// composite's spec.crossplane.compositionSelector matchLabels provider defaults to gcp
-// and honors an explicit provider, so a second provider's Composition cannot collide.
+// TestBuildXGatewayGCPProviderSelector pins the compositionSelector provider label, so a
+// second provider's Composition cannot collide with the gcp one.
 func TestBuildXGatewayGCPProviderSelector(t *testing.T) {
 	cfg := testConfig()
 	tests := []struct {
@@ -1143,9 +1156,8 @@ func TestBuildXGatewayGCPProviderSelector(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayNetwork pins the singleton shared-VPC composite: named and spec'd
-// from cfg.SharedNetworkName in cfg.PodNamespace, pinning the gcp Composition, and
-// carrying no ownerReference so deleting a Gateway never GCs the shared network.
+// TestBuildXGatewayNetwork pins the singleton shared-VPC composite, which carries no
+// ownerReference so deleting a Gateway never GCs the shared network.
 func TestBuildXGatewayNetwork(t *testing.T) {
 	cfg := testConfig()
 
@@ -1243,12 +1255,541 @@ func TestBuildDNSEndpoint(t *testing.T) {
 	}
 }
 
-// TestGCPIDBase32Length documents the encoding bound the truncation relies on:
-// sha256 (32 bytes) base32-encodes to 52 chars, so the prefix+hash always
-// exceeds the 30-char cap and truncation is exercised.
+// TestGCPIDBase32Length documents the bound truncation relies on: sha256 base32-encodes to
+// 52 chars, so prefix+hash always exceeds the 30-char cap.
 func TestGCPIDBase32Length(t *testing.T) {
 	full := base32.StdEncoding.WithPadding(base32.NoPadding).EncodedLen(32)
 	if full+len(gcpIDPrefix) <= gcpIDMaxLen {
 		t.Fatalf("base32 length %d + prefix does not exceed cap %d; truncation untested", full, gcpIDMaxLen)
+	}
+}
+
+// TestEffectiveTrafficPolicy pins that an empty value reads as Cluster, so a Gateway that
+// bypassed CRD defaulting still builds a Cluster data path.
+func TestEffectiveTrafficPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy wgnetv1alpha1.TrafficPolicy
+		want   wgnetv1alpha1.TrafficPolicy
+	}{
+		{"unset defaults to Cluster", "", wgnetv1alpha1.TrafficPolicyCluster},
+		{"explicit Cluster", wgnetv1alpha1.TrafficPolicyCluster, wgnetv1alpha1.TrafficPolicyCluster},
+		{"explicit Local", wgnetv1alpha1.TrafficPolicyLocal, wgnetv1alpha1.TrafficPolicyLocal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			if got := effectiveTrafficPolicy(gw); got != tt.want {
+				t.Errorf("effectiveTrafficPolicy = %q, want %q", got, tt.want)
+			}
+			if got, want := isLocal(gw), tt.want == wgnetv1alpha1.TrafficPolicyLocal; got != want {
+				t.Errorf("isLocal = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestLinkIdentityOf pins that an identity exists only once a Local Gateway's id is
+// allocated, so no Local workload is built before that id is persisted.
+func TestLinkIdentityOf(t *testing.T) {
+	ident3 := link.NewIdentity(3)
+	tests := []struct {
+		name   string
+		policy wgnetv1alpha1.TrafficPolicy
+		id     int32
+		want   *link.Identity
+	}{
+		{"cluster has no identity", wgnetv1alpha1.TrafficPolicyCluster, 0, nil},
+		{"cluster ignores a stale id", wgnetv1alpha1.TrafficPolicyCluster, 3, nil},
+		{"local without an id yet", wgnetv1alpha1.TrafficPolicyLocal, 0, nil},
+		{"local with an allocated id", wgnetv1alpha1.TrafficPolicyLocal, 3, &ident3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			gw.Status.Link.ID = tt.id
+
+			got := linkIdentityOf(gw)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Fatalf("linkIdentityOf = %+v, want nil", got)
+			case tt.want != nil && got == nil:
+				t.Fatalf("linkIdentityOf = nil, want %+v", *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Errorf("linkIdentityOf = %+v, want %+v", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildXGatewayGCPTrafficPolicy pins that the composite carries the mode lowercased,
+// which is the form the composition renders into the VM's traffic-policy metadata key.
+func TestBuildXGatewayGCPTrafficPolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy wgnetv1alpha1.TrafficPolicy
+		want   string
+	}{
+		{"unset renders cluster", "", "cluster"},
+		{"Cluster renders cluster", wgnetv1alpha1.TrafficPolicyCluster, "cluster"},
+		{"Local renders local", wgnetv1alpha1.TrafficPolicyLocal, "local"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+
+			u, err := buildXGatewayGCP(gw, testConfig(), nil)
+			if err != nil {
+				t.Fatalf("buildXGatewayGCP: %v", err)
+			}
+			assertNestedString(t, u, tt.want, "spec", "trafficPolicy")
+		})
+	}
+}
+
+// TestBuildLinkConfigMapLocal pins the Local-mode RuntimeConfig: the derived identity, the
+// widened allowed IPs and EndpointSlice-resolvable forwards instead of Service FQDNs.
+func TestBuildLinkConfigMapLocal(t *testing.T) {
+	gw := newGateway("edge", "wg-system",
+		[]wgnetv1alpha1.Forward{
+			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			{Port: 5432, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "db", Namespace: "prod"},
+		}, nil)
+	gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	gw.Status.Link.ID = 3
+
+	backends := []forwardBackend{
+		{Forward: gw.Spec.Forwards[0], BackendPort: 8443},
+		{Forward: gw.Spec.Forwards[1], BackendPort: 5432, ServicePortName: "postgres"},
+	}
+
+	cm, err := buildLinkConfigMap(gw, "203.0.113.5", backends, linkIdentityOf(gw))
+	if err != nil {
+		t.Fatalf("buildLinkConfigMap: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), linkConfigKey)
+	if err := os.WriteFile(path, []byte(cm.Data[linkConfigKey]), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	rc, err := link.LoadRuntimeConfig(path)
+	if err != nil {
+		t.Fatalf("link.LoadRuntimeConfig: %v", err)
+	}
+
+	if rc.TrafficPolicy != link.TrafficPolicyLocal {
+		t.Errorf("trafficPolicy = %q, want %q", rc.TrafficPolicy, link.TrafficPolicyLocal)
+	}
+	if rc.Identity == nil {
+		t.Fatal("identity = nil, want the identity derived from id 3")
+	}
+	if want := link.NewIdentity(3); *rc.Identity != want {
+		t.Errorf("identity = %+v, want %+v", *rc.Identity, want)
+	}
+	if !slices.Equal(rc.WireGuard.Peer.AllowedIPs, []string{"0.0.0.0/0"}) {
+		t.Errorf("peer.allowedIPs = %v, want [0.0.0.0/0]", rc.WireGuard.Peer.AllowedIPs)
+	}
+	if !maps.Equal(rc.PodSelector, linkSelectorLabels(gw)) {
+		t.Errorf("podSelector = %v, want %v", rc.PodSelector, linkSelectorLabels(gw))
+	}
+
+	wantForwards := []link.Forward{
+		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Namespace: "wg-system", ServiceName: "web"},
+		{Name: "tcp-5432", PublicPort: 5432, Protocol: "tcp", Namespace: "prod", ServiceName: "db", ServicePortName: "postgres"},
+	}
+	if !slices.Equal(rc.Forwards, wantForwards) {
+		t.Errorf("forwards = %+v, want %+v", rc.Forwards, wantForwards)
+	}
+}
+
+// TestBuildLinkConfigMapPodSelector pins that the pod selector is Local-only: the
+// Cluster-mode link runs no pod watch, so the rendered config omits the key.
+func TestBuildLinkConfigMapPodSelector(t *testing.T) {
+	tests := []struct {
+		name   string
+		local  bool
+		want   map[string]string
+		wantID bool
+	}{
+		{name: "cluster"},
+		{name: "local", local: true, wantID: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system",
+				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
+			endpoint := ""
+			if tt.local {
+				gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+				gw.Status.Link.ID = 3
+				endpoint = "203.0.113.5"
+			}
+
+			cm, err := buildLinkConfigMap(gw, endpoint, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw))
+			if err != nil {
+				t.Fatalf("buildLinkConfigMap: %v", err)
+			}
+
+			var rc link.RuntimeConfig
+			decodeJSON(t, cm.Data[linkConfigKey], &rc)
+			want := map[string]string(nil)
+			if tt.local {
+				want = linkSelectorLabels(gw)
+			}
+			if !maps.Equal(rc.PodSelector, want) {
+				t.Errorf("podSelector = %v, want %v", rc.PodSelector, want)
+			}
+			if (rc.Identity != nil) != tt.wantID {
+				t.Errorf("identity = %+v, want non-nil %t", rc.Identity, tt.wantID)
+			}
+
+			var raw map[string]any
+			decodeJSON(t, cm.Data[linkConfigKey], &raw)
+			if _, ok := raw["podSelector"]; ok != tt.local {
+				t.Errorf("rendered podSelector key present = %t, want %t", ok, tt.local)
+			}
+		})
+	}
+}
+
+// TestBuildLinkDaemonSet pins the Local-mode host-network shape: no init container or
+// anti-affinity, a loopback probe on the id-derived port, a writable host /proc/sys/net.
+func TestBuildLinkDaemonSet(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	gw.Status.Link.ID = 3
+
+	ds := buildLinkDaemonSet(gw, testConfig(), linkIdentityOf(gw))
+	if ds.Name != "edge-link" || ds.Namespace != "wg-system" {
+		t.Errorf("daemonset = %s/%s, want wg-system/edge-link", ds.Namespace, ds.Name)
+	}
+
+	podSpec := ds.Spec.Template.Spec
+	c := podSpec.Containers[0]
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	mounts := map[string]corev1.VolumeMount{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m
+	}
+	volumes := map[string]corev1.Volume{}
+	for _, v := range podSpec.Volumes {
+		volumes[v.Name] = v
+	}
+
+	tests := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"hostNetwork", podSpec.HostNetwork, true},
+		{"dnsPolicy", podSpec.DNSPolicy, corev1.DNSClusterFirstWithHostNet},
+		{"init containers", len(podSpec.InitContainers), 0},
+		{"container ports", len(c.Ports), 0},
+		{"probe host", c.ReadinessProbe.HTTPGet.Host, "127.0.0.1"},
+		{"probe port", c.ReadinessProbe.HTTPGet.Port, intstr.FromInt32(27003)},
+		{"health addr", env["GATEWAY_HEALTH_ADDR"], "127.0.0.1:27003"},
+		{"host proc mount path", mounts["host-proc-sys-net"].MountPath, link.HostProcSysNetPath},
+		{"host proc mount writable", mounts["host-proc-sys-net"].ReadOnly, false},
+		{"host proc hostPath", volumes["host-proc-sys-net"].HostPath.Path, "/proc/sys/net"},
+		{"termination grace period", *podSpec.TerminationGracePeriodSeconds, int64(30)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("%s = %v, want %v", tt.name, tt.got, tt.want)
+			}
+		})
+	}
+
+	if podSpec.Affinity != nil {
+		t.Errorf("affinity = %+v, want nil (a DaemonSet is already one pod per node)", podSpec.Affinity)
+	}
+	if hp := volumes["host-proc-sys-net"].HostPath; hp == nil || hp.Type == nil || *hp.Type != corev1.HostPathDirectory {
+		t.Errorf("host-proc-sys-net hostPath = %+v, want type Directory", hp)
+	}
+	assertFieldRefEnv(t, c.Env, "NODE_NAME", "spec.nodeName")
+
+	sc := c.SecurityContext
+	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 0 {
+		t.Errorf("securityContext.runAsUser = %+v, want 0", sc)
+	}
+	if sc == nil || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+		t.Errorf("securityContext.allowPrivilegeEscalation = %+v, want false", sc)
+	}
+	if sc == nil || !slices.Equal(sc.Capabilities.Add, []corev1.Capability{"NET_ADMIN"}) {
+		t.Errorf("capabilities = %+v, want add NET_ADMIN", sc)
+	}
+}
+
+// TestBuildLinkDeploymentUnchangedInClusterMode guards that sharing a pod spec with the
+// DaemonSet did not leak any Local-mode shape into the Cluster workload.
+func TestBuildLinkDeploymentUnchangedInClusterMode(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	dep := buildLinkDeployment(gw, testConfig())
+
+	podSpec := dep.Spec.Template.Spec
+	c := podSpec.Containers[0]
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+
+	if podSpec.HostNetwork {
+		t.Error("hostNetwork = true, want false in Cluster mode")
+	}
+	if podSpec.DNSPolicy != "" {
+		t.Errorf("dnsPolicy = %q, want unset in Cluster mode", podSpec.DNSPolicy)
+	}
+	if len(podSpec.InitContainers) != 1 {
+		t.Errorf("init containers = %d, want 1", len(podSpec.InitContainers))
+	}
+	assertHostnameAntiAffinity(t, podSpec.Affinity, linkSelectorLabels(gw))
+	if len(c.Ports) != 1 || c.Ports[0].Name != "health" || c.Ports[0].ContainerPort != 8080 {
+		t.Errorf("container ports = %+v, want a single health port 8080", c.Ports)
+	}
+	if got := c.ReadinessProbe.HTTPGet; got.Host != "" || got.Port != intstr.FromString("health") {
+		t.Errorf("readiness probe = %+v, want the named health port with no host", got)
+	}
+	if env["GATEWAY_HEALTH_ADDR"] != ":8080" {
+		t.Errorf("GATEWAY_HEALTH_ADDR = %q, want :8080", env["GATEWAY_HEALTH_ADDR"])
+	}
+	if _, present := env["NODE_NAME"]; present {
+		t.Error("NODE_NAME present, want it only in Local mode")
+	}
+	for _, v := range podSpec.Volumes {
+		if v.Name == "host-proc-sys-net" {
+			t.Error("host-proc-sys-net volume present, want it only in Local mode")
+		}
+	}
+}
+
+// TestLinkPodSpecNodeSelector pins that spec.link.nodeSelector reaches both workloads'
+// pod templates, which is how an operator confines the link to a node pool.
+func TestLinkPodSpecNodeSelector(t *testing.T) {
+	selector := map[string]string{"wgnet.dev/pool": "edge"}
+
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.Link.NodeSelector = selector
+	dep := buildLinkDeployment(gw, testConfig())
+
+	local := newGateway("edge", "wg-system", nil, nil)
+	local.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	local.Spec.Link.NodeSelector = selector
+	local.Status.Link.ID = 3
+	ds := buildLinkDaemonSet(local, testConfig(), linkIdentityOf(local))
+
+	tests := []struct {
+		name string
+		got  map[string]string
+	}{
+		{"deployment", dep.Spec.Template.Spec.NodeSelector},
+		{"daemonset", ds.Spec.Template.Spec.NodeSelector},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !maps.Equal(tt.got, selector) {
+				t.Errorf("nodeSelector = %v, want %v", tt.got, selector)
+			}
+		})
+	}
+}
+
+// TestBuildLinkRolePods pins the Local-mode link Role's pod rule, the liveness input of
+// the election, on top of the Lease rule both modes get.
+func TestBuildLinkRolePods(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	role := buildLinkRole(gw)
+	if len(role.Rules) != 2 {
+		t.Fatalf("role rules = %d, want 2", len(role.Rules))
+	}
+	if got := role.Rules[0].Resources; !slices.Equal(got, []string{"leases"}) {
+		t.Errorf("first rule resources = %v, want [leases]", got)
+	}
+	rule := role.Rules[1]
+	if !slices.Equal(rule.APIGroups, []string{""}) {
+		t.Errorf("rule apiGroups = %v, want [\"\"]", rule.APIGroups)
+	}
+	if !slices.Equal(rule.Resources, []string{"pods"}) {
+		t.Errorf("rule resources = %v, want [pods]", rule.Resources)
+	}
+	if want := []string{"get", "list", "watch"}; !slices.Equal(rule.Verbs, want) {
+		t.Errorf("rule verbs = %v, want %v", rule.Verbs, want)
+	}
+}
+
+// TestBuildLinkClusterRoleBinding pins the EndpointSlice grant a Local link needs, with the
+// owner labels the delete path has to find it by, having no ownerReference.
+func TestBuildLinkClusterRoleBinding(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	crb := buildLinkClusterRoleBinding(gw)
+
+	if want := linkClusterRoleBindingName(gw); crb.Name != want {
+		t.Errorf("clusterrolebinding name = %q, want %q", crb.Name, want)
+	}
+	if crb.Namespace != "" {
+		t.Errorf("clusterrolebinding namespace = %q, want cluster-scoped", crb.Namespace)
+	}
+	if crb.RoleRef.APIGroup != rbacv1.GroupName || crb.RoleRef.Kind != "ClusterRole" || crb.RoleRef.Name != linkEndpointSliceClusterRole {
+		t.Errorf("roleRef = %+v, want ClusterRole/%s", crb.RoleRef, linkEndpointSliceClusterRole)
+	}
+	if len(crb.Subjects) != 1 {
+		t.Fatalf("subjects = %d, want 1", len(crb.Subjects))
+	}
+	sub := crb.Subjects[0]
+	if sub.Kind != rbacv1.ServiceAccountKind || sub.Name != "edge-link" || sub.Namespace != "wg-system" {
+		t.Errorf("subject = %+v, want ServiceAccount edge-link in wg-system", sub)
+	}
+
+	want := commonLabels(gw, componentLink)
+	want[ownerNamespaceLabel] = "wg-system"
+	want[ownerNameLabel] = "edge"
+	if !maps.Equal(crb.Labels, want) {
+		t.Errorf("labels = %v, want %v", crb.Labels, want)
+	}
+}
+
+// TestLinkClusterRoleBindingNameDistinctAcrossNamespaces pins that the hash separates a pair
+// "<namespace>-<name>" would collide, and is stable so the apply targets one object.
+func TestLinkClusterRoleBindingNameDistinctAcrossNamespaces(t *testing.T) {
+	a := newGateway("c", "a-b", nil, nil)
+	b := newGateway("b-c", "a", nil, nil)
+
+	nameA := linkClusterRoleBindingName(a)
+	nameB := linkClusterRoleBindingName(b)
+
+	if nameA == nameB {
+		t.Errorf("clusterrolebinding names collide: both %q", nameA)
+	}
+	if got := linkClusterRoleBindingName(a); got != nameA {
+		t.Errorf("clusterrolebinding name = %q on the second call, want the stable %q", got, nameA)
+	}
+	for _, name := range []string{nameA, nameB} {
+		if !strings.HasPrefix(name, linkClusterRoleBindingPrefix) {
+			t.Errorf("clusterrolebinding name = %q, want the %q prefix", name, linkClusterRoleBindingPrefix)
+		}
+	}
+}
+
+// TestLinkPodSpecHealthAddr pins GATEWAY_HEALTH_ADDR per mode, looked up by env name so
+// a reordered env slice cannot silently move the override onto another variable.
+func TestLinkPodSpecHealthAddr(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy wgnetv1alpha1.TrafficPolicy
+		id     int32
+		want   string
+	}{
+		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, ":8080"},
+		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, "127.0.0.1:27001"},
+		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, "127.0.0.1:27007"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			gw.Status.Link.ID = tt.id
+
+			spec := linkPodSpec(gw, testConfig(), linkIdentityOf(gw))
+			var got string
+			var found bool
+			for _, e := range spec.Containers[0].Env {
+				if e.Name == "GATEWAY_HEALTH_ADDR" {
+					got, found = e.Value, true
+				}
+			}
+			if !found {
+				t.Fatal("GATEWAY_HEALTH_ADDR absent from container env")
+			}
+			if got != tt.want {
+				t.Errorf("GATEWAY_HEALTH_ADDR = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMaxLinkIDMatchesCRDBound pins link.MaxLinkID to the kubebuilder Maximum marker on
+// GatewayLinkStatus.ID, which the CRD bound comes from and cannot reference the constant.
+func TestMaxLinkIDMatchesCRDBound(t *testing.T) {
+	const crdMaximum = 250
+	if link.MaxLinkID != crdMaximum {
+		t.Errorf("link.MaxLinkID = %d, want %d to match the CRD Maximum marker", link.MaxLinkID, crdMaximum)
+	}
+}
+
+// TestLinkShutdownBudgetFitsGracePeriod guards two independent exit deadlines: a grace
+// period at or below link.ShutdownBudget kills the link mid-release, stranding the Lease.
+func TestLinkShutdownBudgetFitsGracePeriod(t *testing.T) {
+	cluster := newGateway("edge", "wg-system", nil, nil)
+
+	local := newGateway("edge", "wg-system", nil, nil)
+	local.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	local.Status.Link.ID = 3
+
+	tests := []struct {
+		name  string
+		grace *int64
+	}{
+		{"deployment", buildLinkDeployment(cluster, testConfig()).Spec.Template.Spec.TerminationGracePeriodSeconds},
+		{"daemonset", buildLinkDaemonSet(local, testConfig(), linkIdentityOf(local)).Spec.Template.Spec.TerminationGracePeriodSeconds},
+	}
+	budget := int64(link.ShutdownBudget / time.Second)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.grace == nil {
+				t.Fatalf("terminationGracePeriodSeconds unset, want more than the %ds shutdown budget", budget)
+			}
+			if *tt.grace <= budget {
+				t.Errorf("terminationGracePeriodSeconds = %ds, want more than link.ShutdownBudget (%ds)", *tt.grace, budget)
+			}
+		})
+	}
+}
+
+// TestTrafficPolicyConstantsMatch guards three independent declarations of the policy
+// values: operator, link RuntimeConfig, e2e harness. Drift breaks the data path or the suite.
+func TestTrafficPolicyConstantsMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		api     wgnetv1alpha1.TrafficPolicy
+		link    string
+		harness string
+	}{
+		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, link.TrafficPolicyCluster, hk8s.TrafficPolicyCluster},
+		{"local", wgnetv1alpha1.TrafficPolicyLocal, link.TrafficPolicyLocal, hk8s.TrafficPolicyLocal},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if string(tt.api) != tt.link {
+				t.Errorf("api value %q != link value %q", tt.api, tt.link)
+			}
+			if string(tt.api) != tt.harness {
+				t.Errorf("api value %q != harness value %q", tt.api, tt.harness)
+			}
+		})
+	}
+}
+
+// TestClusterHealthPortMatchesLinkDefault guards clusterHealthPort against the link's own
+// envconfig default, which applies when GATEWAY_HEALTH_ADDR is absent; drift breaks the probe.
+func TestClusterHealthPortMatchesLinkDefault(t *testing.T) {
+	field, ok := reflect.TypeFor[link.Config]().FieldByName("HealthAddr")
+	if !ok {
+		t.Fatal("link.Config has no HealthAddr field")
+	}
+	def := field.Tag.Get("default")
+	wantPort, err := strconv.Atoi(strings.TrimPrefix(def, ":"))
+	if err != nil {
+		t.Fatalf("parse link HealthAddr default %q: %v", def, err)
+	}
+	if clusterHealthPort != wantPort {
+		t.Errorf("clusterHealthPort = %d, want %d from link.Config's HealthAddr default", clusterHealthPort, wantPort)
 	}
 }

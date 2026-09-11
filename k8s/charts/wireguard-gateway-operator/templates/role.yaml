@@ -28,17 +28,12 @@ rules:
   - ""
   resources:
   - namespaces
+  - pods
   - services
   verbs:
   - get
   - list
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  verbs:
-  - get
 - apiGroups:
   - ""
   resources:
@@ -53,6 +48,7 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - daemonsets
   - deployments
   verbs:
   - create
@@ -68,6 +64,7 @@ rules:
   - leases
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
@@ -129,6 +126,7 @@ rules:
 - apiGroups:
   - rbac.authorization.k8s.io
   resources:
+  - clusterrolebindings
   - rolebindings
   - roles
   verbs:
@@ -139,6 +137,14 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resourceNames:
+  - gateway-link-endpointslice-reader
+  resources:
+  - clusterroles
+  verbs:
+  - bind
 - apiGroups:
   - wgnet.dev
   resources:

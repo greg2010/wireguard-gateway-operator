@@ -42,8 +42,7 @@ func gatewayCRDPath() string {
 }
 
 // setupEnvtest starts a control plane with the Gateway CRD plus minimal XGatewayGCP and
-// DNSEndpoint CRDs and returns a client on the operator scheme. It skips when
-// KUBEBUILDER_ASSETS is unset.
+// DNSEndpoint CRDs. It skips the test when KUBEBUILDER_ASSETS is unset.
 func setupEnvtest(t *testing.T) *testEnv {
 	t.Helper()
 
@@ -82,11 +81,8 @@ func setupEnvtest(t *testing.T) *testEnv {
 	return &testEnv{env: env, cfg: cfg, client: c, scheme: scheme}
 }
 
-// setupEnvtestRBAC starts an envtest control plane (via setupEnvtest) and binds the
-// operator's generated ClusterRole to a real client-certificate identity, exposing
-// te.operatorClient / te.operatorCfg authenticated as it. Reconciler tests use the operator
-// client so the reconcile is authorized exactly as the deployed operator is; harness writes
-// keep te.client (system:masters).
+// setupEnvtestRBAC binds the operator's generated ClusterRole to a real client-certificate
+// identity, so a reconcile is authorized exactly as the deployed operator is.
 func setupEnvtestRBAC(t *testing.T) *testEnv {
 	t.Helper()
 	te := setupEnvtest(t)
@@ -95,6 +91,20 @@ func setupEnvtestRBAC(t *testing.T) *testEnv {
 	role := loadOperatorClusterRole(t)
 	if err := te.client.Create(ctx, role); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("create operator ClusterRole: %v", err)
+	}
+
+	// The operator binds this ClusterRole per Local Gateway under a bind grant scoped to its
+	// name. Built in Go because the shipped chart template is Helm-templated.
+	linkRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "gateway-link-endpointslice-reader"},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"discovery.k8s.io"},
+			Resources: []string{"endpointslices"},
+			Verbs:     []string{"get", "list", "watch"},
+		}},
+	}
+	if err := te.client.Create(ctx, linkRole); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create link endpointslice-reader ClusterRole: %v", err)
 	}
 
 	const operatorUser = "wireguard-gateway-operator-test"
@@ -149,9 +159,8 @@ func loadOperatorClusterRole(t *testing.T) *rbacv1.ClusterRole {
 
 const rbacPropagationTimeout = 15 * time.Second
 
-// waitOperatorRBAC blocks until the apiserver authorizer reflects the binding so the first
-// reconcile does not race RBAC propagation. It probes a verb the operator always holds; since
-// the role and binding are single objects, one authorized verb means the whole binding is live.
+// waitOperatorRBAC blocks until the authorizer reflects the binding, so the first reconcile does
+// not race propagation. Role and binding are single objects, so one authorized verb suffices.
 func waitOperatorRBAC(ctx context.Context, t *testing.T, opClient client.Client) {
 	t.Helper()
 	pollUntil(ctx, t, rbacPropagationTimeout, "operator RBAC propagation (gateways/list allowed)", func() bool {
@@ -167,9 +176,8 @@ func waitOperatorRBAC(ctx context.Context, t *testing.T, opClient client.Client)
 	})
 }
 
-// newOperatorReconciler wires r's Client and APIReader to the RBAC-scoped operator client
-// so reconcile actions run under the operator's real permissions. Centralized so no call
-// site can accidentally keep the admin client.
+// newOperatorReconciler wires r's Client and APIReader to the RBAC-scoped operator client, so
+// no call site can accidentally keep the admin client.
 func newOperatorReconciler(te *testEnv, r *GatewayReconciler) *GatewayReconciler {
 	r.Client = te.operatorClient
 	r.APIReader = te.operatorClient
@@ -189,9 +197,8 @@ func preserveUnknownProps() *apiextensionsv1.JSONSchemaProps {
 	}
 }
 
-// minimalXGatewayGCPCRD is a namespaced CRD matching the composite's GVK with an
-// open schema and a status subresource, enough for the reconciler to create the
-// composite and read a patched status.
+// minimalXGatewayGCPCRD is a namespaced CRD matching the composite's GVK, enough for the
+// reconciler to create the composite and read a patched status.
 func minimalXGatewayGCPCRD() *apiextensionsv1.CustomResourceDefinition {
 	return &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "xgatewaygcps.infra.wgnet.dev"},
@@ -219,9 +226,8 @@ func minimalXGatewayGCPCRD() *apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
-// minimalXGatewayNetworkCRD is a namespaced CRD matching the shared-network composite's
-// GVK with an open schema and a status subresource, enough for the reconciler to apply
-// the singleton network and for the refcount teardown to read and delete it.
+// minimalXGatewayNetworkCRD is a namespaced CRD matching the shared-network composite's GVK,
+// enough to apply the singleton network and for the refcount teardown to delete it.
 func minimalXGatewayNetworkCRD() *apiextensionsv1.CustomResourceDefinition {
 	return &apiextensionsv1.CustomResourceDefinition{
 		ObjectMeta: metav1.ObjectMeta{Name: "xgatewaynetworks.infra.wgnet.dev"},
@@ -282,9 +288,8 @@ func minimalDNSEndpointCRD() *apiextensionsv1.CustomResourceDefinition {
 	}
 }
 
-// eventually polls cond until it returns true or the deadline elapses, failing
-// the test with msg on timeout. envtest has no informer cache here, so a poll
-// loop is the simplest way to await asynchronous reconcile effects.
+// eventually polls cond until true or the deadline elapses, failing with msg. envtest has no
+// informer cache here, so a poll loop is the way to await asynchronous reconcile effects.
 func eventually(ctx context.Context, t *testing.T, msg string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)

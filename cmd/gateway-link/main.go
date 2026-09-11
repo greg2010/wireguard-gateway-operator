@@ -1,6 +1,7 @@
 // Command gateway-link is the in-cluster link daemon. It brings up the WireGuard
-// tunnel to the gateway VM and programs nftables to forward configured ports to
-// in-cluster Services.
+// tunnel to the gateway VM and programs nftables to forward configured ports either to
+// in-cluster Services (Cluster mode) or, in Local mode, to ready backend pods on its
+// own node.
 package main
 
 import (
