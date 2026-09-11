@@ -50,7 +50,7 @@ test: test-unit test-integration test-e2e
 # Per-suite targets mirror the CI split. The unit timeout accommodates the
 # controller package's envtest tests, each of which boots a control plane.
 test-unit:
-	go test -race -timeout=180s -coverprofile=coverage.out $$(go list ./... | grep -vE '/test/(integration|e2e)(/|$$)')
+	go test -race -timeout=600s -coverprofile=coverage.out $$(go list ./... | grep -vE '/test/(integration|e2e)(/|$$)')
 
 test-integration:
 	GATEWAY_INTEGRATION=1 go test -timeout 10m -count=1 ./test/integration/...
