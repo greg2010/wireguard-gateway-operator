@@ -21,6 +21,7 @@ type XGatewayGCPSpec struct {
 	ServiceAccountId   *string `json:"serviceAccountId,omitempty"`
 	SharedNetworkName  string  `json:"sharedNetworkName"`
 	Spot               *bool   `json:"spot,omitempty"`
+	TrafficPolicy      *string `json:"trafficPolicy,omitempty"`
 	UserData           *string `json:"userData,omitempty"`
 	WgGatewayAddress   *string `json:"wgGatewayAddress,omitempty"`
 	WgKeySecretRef     *struct {

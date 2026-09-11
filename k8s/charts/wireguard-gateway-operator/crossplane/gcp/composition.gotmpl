@@ -192,6 +192,7 @@ spec:
       {{- if ne (dig "wgSubnet" "" $spec) "" }}
       wg-subnet: {{ $spec.wgSubnet | quote }}
       {{- end }}
+      traffic-policy: {{ dig "trafficPolicy" "cluster" $spec | quote }}
       {{- if ne (dig "projectID" "" $spec) "" }}
       project-id: {{ $spec.projectID | quote }}
       {{- end }}

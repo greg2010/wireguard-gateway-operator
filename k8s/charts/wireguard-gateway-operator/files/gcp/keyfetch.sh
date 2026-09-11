@@ -91,11 +91,24 @@ EOF
 	mv "$NETWORK_PATH.tmp" "$NETWORK_PATH"
 }
 
+postrouting_verdict() {
+	# Local preserves the client's source address end to end, so tunnel egress must
+	# not be masqueraded; "return" falls through to the chain policy and keeps the
+	# rendered ruleset syntactically complete. An unrecognised value falls back to
+	# masquerade, which forwards traffic without preserving the source rather than
+	# rendering a ruleset the VM cannot serve from.
+	case "$1" in
+		local) printf '%s' "return" ;;
+		*) printf '%s' "masquerade" ;;
+	esac
+}
+
 render_nft() {
 	# The sed delimiter is '|' so a value containing '/' (a CIDR) does not
 	# terminate the s command and brick boot under set -eu.
 	sed -e "s|__WG_LISTEN_PORT__|$wg_listen_port|g" \
 		-e "s|__WG_LINK_ADDRESS__|$wg_link_address|g" \
+		-e "s|__WG_POSTROUTING_VERDICT__|$wg_postrouting_verdict|g" \
 		"$NFT_PATH" > "$NFT_PATH.tmp"
 	chmod 0644 "$NFT_PATH.tmp"
 	mv "$NFT_PATH.tmp" "$NFT_PATH"
@@ -106,8 +119,11 @@ wg_mtu="$(fetch_metadata_attr wg-mtu)"
 wg_gateway_address="$(fetch_metadata_attr wg-gateway-address)"
 wg_link_address="$(fetch_metadata_attr wg-link-address)"
 wg_subnet="$(fetch_metadata_attr wg-subnet)"
+traffic_policy="$(fetch_metadata_attr traffic-policy)"
 project_id="$(fetch_metadata_attr project-id)"
 secret_id="$(fetch_metadata_attr secret-id)"
+
+wg_postrouting_verdict="$(postrouting_verdict "$traffic_policy")"
 
 write_network
 render_nft

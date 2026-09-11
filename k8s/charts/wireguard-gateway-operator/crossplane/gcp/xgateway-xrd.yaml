@@ -36,6 +36,7 @@ spec:
                 wgGatewayAddress: { type: string }
                 wgLinkAddress: { type: string }
                 wgSubnet: { type: string }
+                trafficPolicy: { type: string }
                 allowedPorts:
                   type: array
                   items:

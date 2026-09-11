@@ -7,7 +7,7 @@ table inet gateway {
 
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
-		oifname "wg0" masquerade
+		oifname "wg0" __WG_POSTROUTING_VERDICT__
 	}
 
 	chain mangle {
