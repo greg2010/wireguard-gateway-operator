@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,9 +20,8 @@ const (
 	providersRelease    = "crossplane-providers"
 	configRelease       = "crossplane-config"
 
-	// operatorNamespace and operatorRelease name the single operator install. The
-	// chart renders cluster-singletons (the Gateway CRD, the XRDs/Compositions, a
-	// fixed-name ClusterRole), so it must be installed exactly once per cluster.
+	// The chart renders cluster-singletons (Gateway CRD, XRDs, a fixed-name
+	// ClusterRole), so it must be installed exactly once per cluster.
 	operatorNamespace = "gateway-operator"
 	operatorRelease   = "gateway-operator"
 	// operatorNameOverride pins the chart name for a deterministic Deployment name.
@@ -37,9 +37,8 @@ const (
 	crossplaneChartRepo    = "https://charts.crossplane.io/stable"
 	crossplaneChartName    = "crossplane"
 
-	// The install timeouts are kept under the go-test deadline so a stuck install
-	// fails fast instead of hanging until the binary is SIGKILLed. providerInstall
-	// covers package download plus CRD establishment, which the gate Job blocks on.
+	// Kept under the go-test deadline so a stuck install fails fast instead of hanging
+	// until the binary is SIGKILLed. providerInstall covers download plus CRD establishment.
 	coreInstallTimeout     = "5m"
 	providerInstallTimeout = "5m"
 	configInstallTimeout   = "3m"
@@ -52,19 +51,16 @@ const (
 	crdEstablishedTimeout = 2 * time.Minute
 	xrdPresentTimeout     = 2 * time.Minute
 
-	// gatewayReadyTimeout bounds the wait for the Gateway to report an address and
-	// Ready=True: the operator reconciles it into the XGatewayGCP, every composed
-	// GCP resource reconciles, and the operator mirrors the IP back up.
+	// gatewayReadyTimeout covers the whole chain: XGatewayGCP reconcile, every composed
+	// GCP resource, and the operator mirroring the address back up.
 	gatewayReadyTimeout = 6 * time.Minute
-	// orphanDrainTimeout bounds the in-namespace GCP drain before the namespace is
-	// deleted: every composed resource (each gated by the 15s composite poll) must
-	// finalize and release its GCP resource.
+	// orphanDrainTimeout bounds the in-namespace GCP drain: every composed resource,
+	// each gated by the 15s composite poll, must finalize and release its GCP resource.
 	orphanDrainTimeout = 4 * time.Minute
 )
 
-// Suite holds state created once per `go test` invocation: the kind cluster,
-// the helm driver, the API client, the built operator and link images, and the
-// GCP env. Tests call Start to get a per-test Stack.
+// Suite holds the state created once per `go test` invocation: cluster, helm driver,
+// client, images and GCP env. Tests call Start to get a per-test Stack.
 type Suite struct {
 	env           Env
 	cluster       *hk8s.KindCluster
@@ -85,9 +81,52 @@ func (s *Suite) Client() *hk8s.Client { return s.client }
 // outside Start.
 func (s *Suite) Env() Env { return s.env }
 
-// Setup provisions the cluster, builds and loads the images, and installs the
-// Crossplane stack, creds Secret, and operator chart. It returns a non-nil *Suite
-// once the cluster handle exists so Teardown can run; only a pre-cluster failure is nil.
+// KillContainerOnNode SIGKILLs the pod's containers on a kind node through crictl, the
+// ungraceful loss a pod delete cannot produce: kubelet grants a SIGTERM window even at
+// grace period 0, which is enough for the link to tear down. It is scoped to one pod
+// because every parallel stack has a link pod on the same node.
+func (s *Suite) KillContainerOnNode(ctx context.Context, node, namespace, pod string) error {
+	// crictl's --name is a regular expression, so anchor it: an unanchored pod name is a
+	// prefix match, and every parallel stack has a similarly named link pod on this node.
+	sandboxes, err := s.crictlIDs(ctx, node, "pods", "--namespace", namespace, "--name", "^"+pod+"$", "-q")
+	if err != nil {
+		return err
+	}
+	if len(sandboxes) == 0 {
+		return fmt.Errorf("no pod sandbox for %s/%s on kind node %s", namespace, pod, node)
+	}
+	killed := 0
+	for _, sandbox := range sandboxes {
+		containers, err := s.crictlIDs(ctx, node, "ps", "--pod", sandbox, "-q")
+		if err != nil {
+			return err
+		}
+		for _, container := range containers {
+			// A zero timeout skips SIGTERM, so the link never runs its teardown.
+			if out, err := hk8s.NodeExec(ctx, node, "crictl", "stop", "--timeout", "0", container); err != nil {
+				return fmt.Errorf("crictl stop %s of %s/%s on kind node %s: %w\n%s", container, namespace, pod, node, err, out)
+			}
+			killed++
+		}
+	}
+	if killed == 0 {
+		return fmt.Errorf("no running container for %s/%s on kind node %s", namespace, pod, node)
+	}
+	return nil
+}
+
+// crictlIDs runs a crictl query on a kind node and returns the ids it printed. It parses
+// stdout alone because crictl writes WARN lines to stderr, which would parse as ids.
+func (s *Suite) crictlIDs(ctx context.Context, node string, args ...string) ([]string, error) {
+	out, err := hk8s.NodeExecStdout(ctx, node, append([]string{"crictl"}, args...)...)
+	if err != nil {
+		return nil, fmt.Errorf("crictl %v on kind node %s: %w\n%s", args, node, err, out)
+	}
+	return strings.Fields(out), nil
+}
+
+// Setup provisions the cluster, images, Crossplane stack, creds Secret and operator
+// chart. It returns a non-nil *Suite once the cluster handle exists, so Teardown can run.
 func Setup(ctx context.Context) (*Suite, error) {
 	log, err := zap.NewDevelopment()
 	if err != nil {
@@ -120,12 +159,22 @@ func Setup(ctx context.Context) (*Suite, error) {
 		if err := cluster.Ensure(ctx); err != nil {
 			return suite, fmt.Errorf("kind ensure: %w", err)
 		}
-		// kind nodes share the host kernel; the link's kernel-mode WireGuard
-		// interface needs the wireguard module loaded on the node.
-		node := cluster.Name() + "-control-plane"
-		log.Info("loading wireguard kernel module on kind node", zap.String("node", node))
-		if out, err := shared.RunCmd(ctx, nil, "docker", "exec", node, "modprobe", "wireguard"); err != nil {
-			return suite, fmt.Errorf("load wireguard module on kind node: %w\n%s", err, out)
+		// kind nodes share the host kernel, and the link's kernel-mode WireGuard interface
+		// needs the module loaded on whichever node the link pod lands on.
+		nodes, err := cluster.Nodes()
+		if err != nil {
+			return suite, err
+		}
+		for _, node := range nodes {
+			log.Info("preparing kind node for the link", zap.String("node", node))
+			if out, err := hk8s.NodeExec(ctx, node, "modprobe", "wireguard"); err != nil {
+				return suite, fmt.Errorf("load wireguard module on kind node %s: %w\n%s", node, err, out)
+			}
+			// The link lowers only conf.<iface>.rp_filter and reports RPFilterStrict when
+			// conf.all.rp_filter is 1, so the node's administrator must lower conf.all.
+			if out, err := hk8s.NodeExec(ctx, node, "sysctl", "-w", "net.ipv4.conf.all.rp_filter=0"); err != nil {
+				return suite, fmt.Errorf("set net.ipv4.conf.all.rp_filter=0 on kind node %s: %w\n%s", node, err, out)
+			}
 		}
 	}
 
@@ -188,9 +237,8 @@ func Setup(ctx context.Context) (*Suite, error) {
 	return suite, nil
 }
 
-// installOperator installs the operator chart once per cluster, then asserts the
-// Deployment is Available, the Gateway CRD is Established, and the XRD is present,
-// the readiness signals helm --wait does not cover.
+// installOperator installs the chart once per cluster, then waits on the Deployment,
+// CRD and XRD readiness signals helm --wait does not cover.
 func (s *Suite) installOperator(ctx context.Context) error {
 	valuesPath, err := writeValues(os.TempDir(), valuesParams{
 		nameOverride:  operatorNameOverride,
@@ -223,9 +271,8 @@ func (s *Suite) installOperator(ctx context.Context) error {
 	return nil
 }
 
-// Teardown deletes the kind cluster the suite provisioned. Invoked from TestMain
-// after m.Run so it never races a Stack still draining GCP; code gates the
-// preserve-on-failure path. No-op on an existing cluster or a nil handle.
+// Teardown deletes the kind cluster the suite provisioned. Call it from TestMain after
+// m.Run so it never races a Stack still draining GCP; code gates the preserve path.
 func (s *Suite) Teardown(ctx context.Context, code int) {
 	if useExisting() || s.cluster == nil {
 		return
@@ -270,9 +317,8 @@ func installCrossplaneStack(ctx context.Context, helm *hk8s.Helm, env Env) error
 		Version:         crossplaneChartVersion,
 		Wait:            true,
 		Timeout:         coreInstallTimeout,
-		// Realtime compositions trips a per-composite watch circuit-breaker on
-		// create-time status churn that throttles reconciles past the gateway
-		// readiness deadline; poll-driven reconciles are deterministic.
+		// Realtime compositions trip a per-composite watch circuit-breaker on create-time
+		// status churn, throttling reconciles past the gateway readiness deadline.
 		SetStringValues: []string{
 			"args[0]=--enable-realtime-compositions=false",
 			"args[1]=--poll-interval=15s",
@@ -305,9 +351,8 @@ func installCrossplaneStack(ctx context.Context, helm *hk8s.Helm, env Env) error
 	})
 }
 
-// resolveKubeconfig returns the kubeconfig path for the client and helm. For a kind
-// cluster it exports a temp kubeconfig and points KUBECONFIG at it so --kube-context
-// resolves; for an existing cluster it returns the operator's KUBECONFIG or default.
+// resolveKubeconfig returns the kubeconfig path for the client and helm. For kind it
+// exports a temp kubeconfig and points KUBECONFIG at it so --kube-context resolves.
 func resolveKubeconfig(cluster *hk8s.KindCluster) (string, error) {
 	if useExisting() {
 		if v := os.Getenv("KUBECONFIG"); v != "" {

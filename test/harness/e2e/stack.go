@@ -46,20 +46,32 @@ type Stack struct {
 	// the GCP firewall. Start asserts it is disjoint from the forwarded and WG ports.
 	NegativePort int
 	// WireguardListenPort is this stack's WireGuard UDP listen port, opened in the
-	// gateway's firewall rule; WithWireguardListenPort gives coexisting gateways
-	// distinct ports.
+	// gateway's firewall rule. WithWireguardListenPort keeps coexisting stacks distinct.
 	WireguardListenPort int
 	// LinkReplicas is the link Deployment's effective replica count (override, or 1).
-	// Teardown reads it to decide whether the link PDB should exist, applied only at
-	// replicas>1.
+	// Teardown reads it: the link PDB is applied only at replicas>1.
 	LinkReplicas int32
+	// TrafficPolicy is the Gateway's effective data-path mode, "Cluster" or "Local".
+	TrafficPolicy string
+	// LinkClusterRoleBindingName is the binding a Local Gateway owns, which teardown
+	// asserts is reaped. Empty in Cluster mode.
+	LinkClusterRoleBindingName string
+	// BackendNode is the worker every Local-mode echo backend is pinned to, and so the
+	// node the link Lease holder must be on. Empty in Cluster mode.
+	BackendNode string
+	// WorkerNodes are the cluster's schedulable workers, sorted, so a Local test can
+	// re-pin the backend to a node other than BackendNode. Empty in Cluster mode.
+	WorkerNodes []string
 
-	// TCPBackendName, NodePortBackendName, and CrossNSBackendName are the echo
-	// Deployment names behind the create-time forwards. agnhost /hostname returns the
-	// serving pod's name, prefixed by its Deployment's, so a probe matches by prefix.
+	// Echo Deployment names behind the create-time forwards. agnhost /hostname returns
+	// the serving pod's name, prefixed by its Deployment's, so a probe matches by prefix.
 	TCPBackendName      string
+	UDPBackendName      string
 	NodePortBackendName string
 	CrossNSBackendName  string
+	// CrossNSNamespace is the namespace holding the cross-namespace backend, which a
+	// re-pin needs alongside the Deployment name.
+	CrossNSNamespace string
 	// TCPBackendPort is the published port of the TCP echo Service. The targetPort
 	// subtest forwards to it, first with a wrong targetPort then this one.
 	TCPBackendPort int
@@ -70,6 +82,16 @@ type Stack struct {
 
 	suite *Suite
 	log   *zap.Logger
+}
+
+// LocalBackendRefs are the Local shard's three backends, the set every forward needs a
+// ready endpoint from on the holder node.
+func (s *Stack) LocalBackendRefs() []hk8s.ServiceRef {
+	return []hk8s.ServiceRef{
+		{Namespace: s.Namespace, Name: s.TCPBackendName},
+		{Namespace: s.Namespace, Name: s.UDPBackendName},
+		{Namespace: s.CrossNSNamespace, Name: s.CrossNSBackendName},
+	}
 }
 
 // StartOption configures a per-stack override applied before provisioning.
@@ -83,11 +105,13 @@ type startConfig struct {
 	wgListenPort int
 	// linkReplicas overrides the link replica count. Zero uses the CRD default (1).
 	linkReplicas int32
+	// trafficPolicy overrides the data-path mode. Empty uses the CRD default
+	// (Cluster).
+	trafficPolicy string
 }
 
-// WithWireguardListenPort overrides the stack's WireGuard UDP listen port, so
-// coexisting gateways can run distinct WG ports. It is folded into the negative-port
-// disjointness precondition.
+// WithWireguardListenPort overrides the stack's WireGuard UDP listen port so coexisting
+// gateways run distinct ports. It is folded into the negative-port disjointness check.
 func WithWireguardListenPort(port int) StartOption {
 	return func(c *startConfig) { c.wgListenPort = port }
 }
@@ -98,9 +122,14 @@ func WithLinkReplicas(n int32) StartOption {
 	return func(c *startConfig) { c.linkReplicas = n }
 }
 
+// WithTrafficPolicy brings the gateway up in the named data-path mode, "Cluster" or
+// "Local". Local preserves the client's source address end to end.
+func WithTrafficPolicy(policy string) StartOption {
+	return func(c *startConfig) { c.trafficPolicy = policy }
+}
+
 // Start wraps StartE for the common single-gateway shard, failing the test on error.
-// Tests bringing up several stacks concurrently call StartE directly to collect the
-// error off the test goroutine, where t.Fatal is illegal.
+// Concurrent stack setup must call StartE instead: t.Fatal off the test goroutine is illegal.
 func (s *Suite) Start(ctx context.Context, t *testing.T, opts ...StartOption) (*Stack, error) {
 	t.Helper()
 	stack, err := s.StartE(ctx, t, opts...)
@@ -110,9 +139,8 @@ func (s *Suite) Start(ctx context.Context, t *testing.T, opts ...StartOption) (*
 	return stack, nil
 }
 
-// StartE brings up a full per-test stack (namespace, echo fixtures, a Gateway CR
-// provisioning a real GCP gateway) and registers teardown via t.Cleanup. It returns
-// every failure as an error rather than t.Fatal, so it is errgroup-safe.
+// StartE brings up a full per-test stack and registers teardown via t.Cleanup. It returns
+// failures as errors rather than calling t.Fatal, so it is errgroup-safe.
 func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (*Stack, error) {
 	t.Helper()
 
@@ -131,9 +159,8 @@ func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (
 		return nil, err
 	}
 
-	// prefix bases the namespace, Gateway CR, and GCP resources. Kept short and
-	// label-safe so the operator-derived service-account ID fits GCP's 30-char limit;
-	// the test-name slug is logged, not folded in, to preserve it.
+	// Kept short and label-safe so the operator-derived service-account ID fits GCP's
+	// 30-char limit; the test-name slug is logged rather than folded in.
 	prefix := "gw" + shared.ShortID()
 	ns := prefix
 	log := s.log.With(
@@ -146,24 +173,72 @@ func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (
 		return nil, fmt.Errorf("ensure namespace: %w", err)
 	}
 
-	echo, err := s.client.DeployEchoFixtures(ctx, ns)
-	if err != nil {
-		return nil, fmt.Errorf("deploy echo fixtures: %w", err)
-	}
+	local := effectiveTrafficPolicy(cfg.trafficPolicy) == hk8s.TrafficPolicyLocal
 
-	nodePortEcho, err := s.client.DeployNodePortEcho(ctx, ns)
-	if err != nil {
-		return nil, fmt.Errorf("deploy nodeport echo: %w", err)
-	}
+	var (
+		echo            hk8s.EchoFixtures
+		nodePortEcho    hk8s.EchoBackend
+		crossNSEcho     hk8s.EchoBackend
+		extraNamespaces []string
+		workers         []string
+		backendNode     string
+		err             error
+	)
 
-	// The cross-namespace echo lives in a second namespace carrying the consent
-	// label, so the operator permits the Gateway in ns to forward into it.
-	xnsNamespace := prefix + "-xns"
-	crossNSEcho, err := s.client.DeployEchoInNamespace(ctx, xnsNamespace, map[string]string{
-		crossNamespaceIngressLabel: crossNamespaceIngressValue,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("deploy cross-namespace echo: %w", err)
+	if local {
+		// Local mode needs a ready endpoint on the holder node for every forward, so all
+		// three of the shard's backends are pinned to one chosen worker.
+		workers, err = s.client.WorkerNodes(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list worker nodes: %w", err)
+		}
+		if len(workers) < 2 {
+			return nil, fmt.Errorf("local stack needs at least two worker nodes to observe a handoff, found %d", len(workers))
+		}
+		backendNode = workers[0]
+		tcpBackend, err := s.client.DeployEchoOnNode(ctx, ns, localEchoName, backendNode)
+		if err != nil {
+			return nil, fmt.Errorf("deploy node-pinned echo: %w", err)
+		}
+		udpBackend, err := s.client.DeployUDPEchoOnNode(ctx, ns, localUDPEchoName, backendNode)
+		if err != nil {
+			return nil, fmt.Errorf("deploy node-pinned udp echo: %w", err)
+		}
+		xnsNamespace := prefix + "-xns"
+		crossNSEcho, err = s.client.DeployEchoInNamespaceOnNode(ctx, xnsNamespace, map[string]string{
+			crossNamespaceIngressLabel: crossNamespaceIngressValue,
+		}, backendNode)
+		if err != nil {
+			return nil, fmt.Errorf("deploy node-pinned cross-namespace echo: %w", err)
+		}
+		extraNamespaces = []string{xnsNamespace}
+		echo = hk8s.EchoFixtures{
+			TCPService: tcpBackend.Service,
+			TCPPort:    tcpBackend.Port,
+			UDPService: udpBackend.Service,
+			UDPPort:    udpBackend.Port,
+		}
+	} else {
+		echo, err = s.client.DeployEchoFixtures(ctx, ns)
+		if err != nil {
+			return nil, fmt.Errorf("deploy echo fixtures: %w", err)
+		}
+
+		nodePortEcho, err = s.client.DeployNodePortEcho(ctx, ns)
+		if err != nil {
+			return nil, fmt.Errorf("deploy nodeport echo: %w", err)
+		}
+
+		// The cross-namespace echo lives in a second namespace carrying the consent
+		// label, so the operator permits the Gateway in ns to forward into it.
+		xnsNamespace := prefix + "-xns"
+		crossNSEcho, err = s.client.DeployEchoInNamespaceOnNode(ctx, xnsNamespace, map[string]string{
+			crossNamespaceIngressLabel: crossNamespaceIngressValue,
+		}, "")
+		if err != nil {
+			return nil, fmt.Errorf("deploy cross-namespace echo: %w", err)
+		}
+		extraNamespaces = []string{xnsNamespace}
 	}
 
 	stack := &Stack{
@@ -184,17 +259,22 @@ func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (
 		NegativePort:           negativePort,
 		WireguardListenPort:    wgPort,
 		LinkReplicas:           effectiveLinkReplicas(cfg.linkReplicas),
+		TrafficPolicy:          effectiveTrafficPolicy(cfg.trafficPolicy),
+		BackendNode:            backendNode,
+		WorkerNodes:            workers,
 		TCPBackendName:         echo.TCPService,
+		UDPBackendName:         echo.UDPService,
 		NodePortBackendName:    nodePortEcho.Service,
 		CrossNSBackendName:     crossNSEcho.Service,
+		CrossNSNamespace:       crossNSEcho.Namespace,
 		TCPBackendPort:         echo.TCPPort,
-		extraNamespaces:        []string{xnsNamespace},
+		extraNamespaces:        extraNamespaces,
 		suite:                  s,
 		log:                    log,
 	}
 	s.registerTeardown(t, stack)
 
-	if err := s.client.CreateGateway(ctx, ns, stack.GatewayName, gatewaySpec(s.env, echo, nodePortEcho, crossNSEcho, wgPort, cfg.linkReplicas)); err != nil {
+	if err := s.client.CreateGateway(ctx, ns, stack.GatewayName, gatewaySpec(s.env, echo, nodePortEcho, crossNSEcho, wgPort, cfg.linkReplicas, cfg.trafficPolicy)); err != nil {
 		return nil, fmt.Errorf("create gateway: %w", err)
 	}
 
@@ -205,21 +285,40 @@ func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (
 	stack.Address = status.Address
 	log.Info("gateway ready", zap.String("address", status.Address))
 
+	// Read the name from the live cluster rather than recomputing the operator's hash, so
+	// teardown's reap assertion cannot drift from what the operator created.
+	crbName, err := s.client.LinkClusterRoleBindingName(ctx, ns, stack.GatewayName)
+	if err != nil {
+		return nil, fmt.Errorf("read link clusterrolebinding name: %w", err)
+	}
+	// A Local gateway must own one, and teardown skips the reap assertion for an empty
+	// name, so an unnamed binding here would make teardown pass without checking it.
+	if local && crbName == "" {
+		return nil, fmt.Errorf("local gateway %s/%s has no link clusterrolebinding", ns, stack.GatewayName)
+	}
+	stack.LinkClusterRoleBindingName = crbName
+
 	return stack, nil
 }
 
-// crossNamespaceIngressLabel and crossNamespaceIngressValue mirror the operator's
-// unexported consent gate: a namespace must carry this label before a Gateway in
-// another namespace may forward into it.
+// Mirrors the operator's unexported consent gate: a namespace must carry this label
+// before a Gateway in another namespace may forward into it.
 const (
 	crossNamespaceIngressLabel = "wgnet.dev/allow-gateway-ingress"
 	crossNamespaceIngressValue = "true"
 )
 
-// gatewaySpec builds the Gateway CR spec: GCP placement plus the create-time forwards
-// (TCP/UDP ClusterIP, NodePort, cross-namespace echoes). wgPort and linkReplicas are
-// pinned only when non-default, else the CR relies on the CRD default.
-func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBackend, wgPort int, linkReplicas int32) hk8s.GatewaySpec {
+// localEchoName and localUDPEchoName are the Deployment and Service names of the Local
+// shard's TCP and UDP echo backends, both pinned to BackendNode and both re-pinned by a
+// handoff assertion. The shard's third backend keeps the cross-namespace fixture's name.
+const (
+	localEchoName    = "gateway-echo-local"
+	localUDPEchoName = "gateway-echo-local-udp"
+)
+
+// gatewaySpec builds the Gateway CR spec. Local mode drops the NodePort forward, whose acceptance
+// path the policy does not change, and keeps the forwards whose backends sit on one worker.
+func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBackend, wgPort int, linkReplicas int32, trafficPolicy string) hk8s.GatewaySpec {
 	spec := hk8s.GatewaySpec{
 		ProjectID:   env.ProjectID,
 		Region:      env.Region,
@@ -232,17 +331,18 @@ func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBac
 				Service:    echo.TCPService,
 				TargetPort: echo.TCPPort,
 			},
+		},
+	}
+	if trafficPolicy != "" {
+		spec.TrafficPolicy = trafficPolicy
+	}
+	spec.Forwards = append(spec.Forwards,
+		[]hk8s.GatewayForward{
 			{
 				Port:       udpPublicPort,
 				Protocol:   "UDP",
 				Service:    echo.UDPService,
 				TargetPort: echo.UDPPort,
-			},
-			{
-				Port:       nodePortPublicPort,
-				Protocol:   "TCP",
-				Service:    nodePort.Service,
-				TargetPort: nodePort.Port,
 			},
 			{
 				Port:       crossNSPublicPort,
@@ -251,7 +351,14 @@ func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBac
 				Namespace:  crossNS.Namespace,
 				TargetPort: crossNS.Port,
 			},
-		},
+		}...)
+	if effectiveTrafficPolicy(trafficPolicy) != hk8s.TrafficPolicyLocal {
+		spec.Forwards = append(spec.Forwards, hk8s.GatewayForward{
+			Port:       nodePortPublicPort,
+			Protocol:   "TCP",
+			Service:    nodePort.Service,
+			TargetPort: nodePort.Port,
+		})
 	}
 	if wgPort != wgListenPort {
 		spec.WireguardListenPort = wgPort
@@ -262,9 +369,8 @@ func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBac
 	return spec
 }
 
-// effectiveLinkReplicas resolves the configured link replica count to what the
-// operator runs with: the override, or 1 when unset. It mirrors the operator's
-// unexported effectiveLinkReplicas so teardown can tell whether the link PDB exists.
+// effectiveLinkReplicas mirrors the operator's unexported default of 1, so teardown can
+// tell whether the link PDB exists.
 func effectiveLinkReplicas(configured int32) int32 {
 	if configured == 0 {
 		return 1
@@ -272,9 +378,17 @@ func effectiveLinkReplicas(configured int32) int32 {
 	return configured
 }
 
-// registerTeardown registers the ordered GCP drain: delete the Gateway (whose
-// finalizer drains the XGatewayGCP and VM), wait for the orphan check to reach zero
-// with the namespace alive, then delete the namespace. GATEWAY_E2E_PRESERVE keeps a failure.
+// effectiveTrafficPolicy resolves the configured mode to what the CRD stores, so
+// teardown and the assertions can branch on it without repeating the default.
+func effectiveTrafficPolicy(configured string) string {
+	if configured == "" {
+		return hk8s.TrafficPolicyCluster
+	}
+	return configured
+}
+
+// registerTeardown orders the GCP drain: delete the Gateway, wait for the orphan check
+// to reach zero with the namespace alive, then delete the namespace.
 func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 	t.Cleanup(func() {
 		if t.Failed() && os.Getenv("GATEWAY_E2E_PRESERVE") != "" {
@@ -282,8 +396,7 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 			return
 		}
 		// Bounded under the whole-binary `go test -timeout 10m` so a slow drain is not
-		// SIGKILLed mid-flight and left leaking the VM: one drain window plus headroom
-		// for the post-drain orphan check and namespace deletes.
+		// SIGKILLed mid-flight and left leaking the VM.
 		cctx, cancel := context.WithTimeout(context.Background(), orphanDrainTimeout+3*time.Minute)
 		defer cancel()
 
@@ -314,15 +427,13 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 			return
 		}
 
-		// Delete the Gateway first; its finalizer drives the GCP drain. A namespace
-		// force-delete would bypass it and orphan the resources, so the namespace must
-		// outlive the drain.
+		// The Gateway's finalizer drives the GCP drain, so it goes first and the namespace
+		// must outlive it; a namespace delete would bypass the drain and orphan resources.
 		if err := s.client.DeleteGateway(cctx, stack.Namespace, stack.GatewayName); err != nil {
 			s.log.Error("delete gateway", zap.Error(err))
 		}
-		// The Gateway disappearing signals the drain reached the cloud (its finalizer
-		// requeues until the XGatewayGCP is gone); the orphan check below is the
-		// authoritative zero.
+		// The Gateway disappearing signals the drain reached the cloud; the orphan check
+		// below is the authoritative zero.
 		if err := s.client.WaitGatewayGone(cctx, stack.Namespace, stack.GatewayName, orphanDrainTimeout); err != nil {
 			s.log.Error("wait gateway gone", zap.Error(err))
 		}
@@ -330,18 +441,23 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 		if err := s.client.WaitXGatewayGCPGone(cctx, stack.Namespace, stack.GatewayName, orphanDrainTimeout); err != nil {
 			s.log.Error("wait xgatewaygcp gone", zap.Error(err))
 		}
-		// Keep the namespace alive so the provider can write the per-namespace
-		// ProviderConfigUsage each MR needs to release its resource. assertNoOrphans
-		// covers every family, including the hash-derived SA and Secret.
+		// The namespace stays alive so the provider can write the per-namespace
+		// ProviderConfigUsage each MR needs to release its resource.
 		s.log.Info("asserting no orphaned GCP resources after gateway deletion",
 			zap.String("prefix", stack.NamePrefix))
 		if err := assertNoOrphans(cctx, auth, stack.Namespace, stack.GatewayName, stack.NamePrefix, orphanDrainTimeout, s.log); err != nil {
 			t.Errorf("orphaned GCP resources after teardown: %v", err)
 		}
-		// Assert owner-ref GC reaped the Gateway's children while the namespace is
-		// alive, before the namespace delete below would mask a child left by a broken
-		// owner reference. expectPDB tracks replicas since the PDB exists only at >1.
-		s.client.AssertOwnedChildrenGone(cctx, t, stack.Namespace, stack.GatewayName, stack.LinkReplicas > 1, orphanDrainTimeout)
+		// Checked while the namespace is alive: the delete below would mask a child left
+		// by a broken owner reference.
+		s.client.AssertOwnedChildrenGone(cctx, t, hk8s.OwnedChildren{
+			Namespace:              stack.Namespace,
+			Gateway:                stack.GatewayName,
+			ExpectPDB:              stack.LinkReplicas > 1,
+			Local:                  stack.TrafficPolicy == hk8s.TrafficPolicyLocal,
+			ClusterRoleBindingName: stack.LinkClusterRoleBindingName,
+			Timeout:                orphanDrainTimeout,
+		})
 		if err := s.client.DeleteNamespace(cctx, stack.Namespace); err != nil {
 			s.log.Error("delete namespace", zap.Error(err))
 		}

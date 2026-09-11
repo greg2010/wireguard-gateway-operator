@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
+	"io"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -26,6 +30,10 @@ import (
 	"k8s.io/client-go/util/retry"
 )
 
+// controlPlaneNodeLabel marks a kind control-plane node, which carries a NoSchedule
+// taint whenever the cluster has workers, so it is never a placement target.
+const controlPlaneNodeLabel = "node-role.kubernetes.io/control-plane"
+
 // gatewayGVR is the GroupVersionResource of the user-facing Gateway CR the
 // operator reconciles. The suite creates one and polls its status.address.
 var gatewayGVR = schema.GroupVersionResource{
@@ -34,9 +42,8 @@ var gatewayGVR = schema.GroupVersionResource{
 	Resource: "gateways",
 }
 
-// xgatewayGCPGVR is the GroupVersionResource of the Crossplane composite the
-// operator creates per Gateway. The suite reads it only for the teardown drain
-// check (it must be gone before the namespace is deleted) and for diagnostics.
+// xgatewayGCPGVR is the Crossplane composite the operator creates per Gateway. The suite reads it
+// only for the teardown drain check (gone before the namespace delete) and for diagnostics.
 var xgatewayGCPGVR = schema.GroupVersionResource{
 	Group:    "infra.wgnet.dev",
 	Version:  "v1alpha1",
@@ -59,21 +66,28 @@ var (
 	}
 )
 
+// harnessQPS and harnessBurst replace client-go's 5 QPS / 10 burst defaults. One Client is shared
+// by every parallel test polling once a second, so the default budget queues requests in the rate
+// limiter until their context expires and an assertion fails with a client error instead of the
+// product's state. A local kind apiserver is unmetered, so the ceiling only clears that poll rate.
+const (
+	harnessQPS   = 100
+	harnessBurst = 200
+)
+
 // Client wraps the typed and dynamic Kubernetes clients the e2e harness needs.
 type Client struct {
 	typed   kubernetes.Interface
 	dynamic dynamic.Interface
-	// rest is the resolved REST config the typed/dynamic clients were built from.
-	// It is retained so ExecInPod can open a SPDY remotecommand stream, which needs
-	// the transport config directly rather than a typed client.
+	// rest is retained so ExecInPod can open a SPDY remotecommand stream, which needs the
+	// transport config directly rather than a typed client.
 	rest *rest.Config
 	log  *zap.Logger
 }
 
-// NewClientFromKubeconfig builds a Client from a kubeconfig file. When context
-// is non-empty it overrides the current-context, which lets the suite target a
-// specific kind context even when KUBECONFIG carries several.
-func NewClientFromKubeconfig(path, context string, log *zap.Logger) (*Client, error) {
+// restConfigFromKubeconfig resolves a REST config from a kubeconfig file with the harness rate
+// limits applied. A non-empty context overrides the current-context.
+func restConfigFromKubeconfig(path, context string) (*rest.Config, error) {
 	loader := &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
 	overrides := &clientcmd.ConfigOverrides{}
 	if context != "" {
@@ -82,6 +96,18 @@ func NewClientFromKubeconfig(path, context string, log *zap.Logger) (*Client, er
 	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loader, overrides).ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("build rest config from %s: %w", path, err)
+	}
+	cfg.QPS, cfg.Burst = harnessQPS, harnessBurst
+	return cfg, nil
+}
+
+// NewClientFromKubeconfig builds a Client from a kubeconfig file. When context
+// is non-empty it overrides the current-context, which lets the suite target a
+// specific kind context even when KUBECONFIG carries several.
+func NewClientFromKubeconfig(path, context string, log *zap.Logger) (*Client, error) {
+	cfg, err := restConfigFromKubeconfig(path, context)
+	if err != nil {
+		return nil, err
 	}
 
 	typed, err := kubernetes.NewForConfig(cfg)
@@ -228,6 +254,15 @@ func (c *Client) DeletePod(ctx context.Context, ns, name string) error {
 	return nil
 }
 
+// PodNode returns the node a pod is scheduled on, empty when it is still Pending.
+func (c *Client) PodNode(ctx context.Context, ns, name string) (string, error) {
+	pod, err := c.typed.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get pod %s/%s: %w", ns, name, err)
+	}
+	return pod.Spec.NodeName, nil
+}
+
 // PodNamesByLabel returns the names of every pod in ns matching the label
 // selector.
 func (c *Client) PodNamesByLabel(ctx context.Context, ns, selector string) ([]string, error) {
@@ -331,13 +366,19 @@ type GatewayForward struct {
 	// Service is the bare in-cluster Service name the link DNATs the port to; the
 	// operator builds the FQDN from it and Namespace.
 	Service string
-	// Namespace is the target Service's namespace. Empty defaults to the Gateway's
-	// namespace and omits the field; a non-empty value targets another namespace,
-	// permitted only when it carries the cross-namespace ingress consent label.
+	// Namespace is the target Service's namespace. Empty defaults to the Gateway's and omits the
+	// field; another namespace is permitted only when it carries the ingress consent label.
 	Namespace string
 	// TargetPort is the port on Service.
 	TargetPort int
 }
+
+// Traffic-policy values of spec.trafficPolicy, mirroring the CRD's enum so a test can
+// branch on the mode without a bare string.
+const (
+	TrafficPolicyCluster = "Cluster"
+	TrafficPolicyLocal   = "Local"
+)
 
 // GatewaySpec is the subset of a Gateway CR's spec the suite sets when creating
 // the resource the operator reconciles.
@@ -352,13 +393,15 @@ type GatewaySpec struct {
 	Forwards []GatewayForward
 	// DNSHostnames populate spec.dnsHostnames (empty omits the field).
 	DNSHostnames []string
-	// WireguardListenPort sets spec.wireguard.listenPort. Zero omits the field so
-	// the CRD default (51820) applies; a non-zero value gives coexisting gateways
-	// distinct WG ports.
+	// WireguardListenPort sets spec.wireguard.listenPort. Zero omits the field so the CRD default
+	// (51820) applies; a non-zero value gives coexisting gateways distinct WG ports.
 	WireguardListenPort int
 	// Replicas sets spec.link.replicas. Zero omits the field so the CRD default (1)
 	// applies; a value >1 runs a hot standby behind leader election.
 	Replicas int32
+	// TrafficPolicy sets spec.trafficPolicy. Empty omits the field so the CRD default
+	// (Cluster) applies; "Local" runs the host-network DaemonSet data path.
+	TrafficPolicy string
 }
 
 // CreateGateway applies a Gateway CR (wgnet.dev/v1alpha1) in ns, which the operator
@@ -404,6 +447,9 @@ func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec Gatewa
 			"replicas": int64(spec.Replicas),
 		}
 	}
+	if spec.TrafficPolicy != "" {
+		gatewaySpec["trafficPolicy"] = spec.TrafficPolicy
+	}
 	if len(spec.DNSHostnames) > 0 {
 		hostnames := make([]any, 0, len(spec.DNSHostnames))
 		for _, h := range spec.DNSHostnames {
@@ -434,9 +480,15 @@ type GatewayStatus struct {
 	// Address is status.address, mirrored by the operator from the XGatewayGCP's
 	// observed public IP. Empty until observed.
 	Address string
+	// ActiveNode is status.link.activeNode, the node running the pod that holds the
+	// link Lease. Empty until a holder pod is observed.
+	ActiveNode string
 	// Ready is true when the Gateway carries a Ready=True condition, meaning the
 	// operator finished reconciling the XGatewayGCP and the link.
 	Ready bool
+	// LinkID is status.link.id, the allocated per-Gateway link id every Local-mode
+	// node-global name derives from. Zero in Cluster mode and before allocation.
+	LinkID int
 }
 
 // GetGatewayStatus reads the named Gateway in ns and extracts the address and
@@ -447,9 +499,13 @@ func (c *Client) GetGatewayStatus(ctx context.Context, ns, name string) (Gateway
 		return GatewayStatus{}, fmt.Errorf("get gateway %s/%s: %w", ns, name, err)
 	}
 	address, _, _ := unstructured.NestedString(obj.Object, "status", "address")
+	activeNode, _, _ := unstructured.NestedString(obj.Object, "status", "link", "activeNode")
+	linkID, _, _ := unstructured.NestedInt64(obj.Object, "status", "link", "id")
 	return GatewayStatus{
-		Address: address,
-		Ready:   readyCondition(obj),
+		Address:    address,
+		ActiveNode: activeNode,
+		Ready:      readyCondition(obj),
+		LinkID:     int(linkID),
 	}, nil
 }
 
@@ -480,10 +536,23 @@ func (c *Client) WaitGatewayReady(ctx context.Context, ns, name string, timeout 
 // matching condType, status, and reason (an empty reason matches any), or timeout
 // elapses. Unlike WaitGatewayReady it does not gate on the address.
 func (c *Client) WaitGatewayCondition(ctx context.Context, ns, name, condType, status, reason string, timeout time.Duration) error {
+	return c.waitGatewayCondition(ctx, ns, name, condType, status, reason, "", timeout)
+}
+
+// WaitGatewayConditionMessage is WaitGatewayCondition with a message requirement: the
+// condition's message must contain messageSubstring, an empty substring matching any
+// message.
+func (c *Client) WaitGatewayConditionMessage(ctx context.Context, ns, name, condType, status, reason, messageSubstring string, timeout time.Duration) error {
+	return c.waitGatewayCondition(ctx, ns, name, condType, status, reason, messageSubstring, timeout)
+}
+
+func (c *Client) waitGatewayCondition(ctx context.Context, ns, name, condType, status, reason, messageSubstring string, timeout time.Duration) error {
 	c.log.Info("waiting for gateway condition",
 		zap.String("namespace", ns), zap.String("name", name),
-		zap.String("type", condType), zap.String("status", status), zap.String("reason", reason))
-	return c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
+		zap.String("type", condType), zap.String("status", status), zap.String("reason", reason),
+		zap.String("message_substring", messageSubstring))
+	var last conditionSnapshot
+	err := c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
 		obj, err := c.dynamic.Resource(gatewayGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return false, nil
@@ -491,8 +560,46 @@ func (c *Client) WaitGatewayCondition(ctx context.Context, ns, name, condType, s
 		if err != nil {
 			return false, fmt.Errorf("get gateway %s/%s: %w", ns, name, err)
 		}
-		return hasCondition(obj, condType, status, reason), nil
+		last = readCondition(obj, condType)
+		return hasCondition(obj, condType, status, reason) && strings.Contains(last.message, messageSubstring), nil
 	})
+	if err != nil {
+		return fmt.Errorf("wait gateway %s/%s condition %s (last status=%q reason=%q message=%q): %w",
+			ns, name, condType, last.status, last.reason, last.message, err)
+	}
+	return nil
+}
+
+// conditionSnapshot is one status condition as last observed, so a wait that times out
+// can name what the Gateway actually reported.
+type conditionSnapshot struct {
+	status  string
+	reason  string
+	message string
+}
+
+// readCondition returns the named condition; a Gateway not carrying condType reads back
+// the zero snapshot.
+func readCondition(obj *unstructured.Unstructured, condType string) conditionSnapshot {
+	conds, _, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil {
+		return conditionSnapshot{}
+	}
+	for _, raw := range conds {
+		cond, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _, _ := unstructured.NestedString(cond, "type"); t != condType {
+			continue
+		}
+		var got conditionSnapshot
+		got.status, _, _ = unstructured.NestedString(cond, "status")
+		got.reason, _, _ = unstructured.NestedString(cond, "reason")
+		got.message, _, _ = unstructured.NestedString(cond, "message")
+		return got
+	}
+	return conditionSnapshot{}
 }
 
 // UpdateGateway applies a read-modify-write to the named Gateway's spec via mutate,
@@ -536,6 +643,16 @@ func (c *Client) SetLinkReplicas(ctx context.Context, ns, name string, n int32) 
 		spec["link"] = link
 		return nil
 	})
+}
+
+// GetLease returns the coordination.k8s.io Lease in ns. The link publishes its faults
+// as annotations on it, which the failure dump reads alongside the holder.
+func (c *Client) GetLease(ctx context.Context, ns, name string) (*coordinationv1.Lease, error) {
+	lease, err := c.typed.CoordinationV1().Leases(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get lease %s/%s: %w", ns, name, err)
+	}
+	return lease, nil
 }
 
 // GetLeaseHolder returns the holder of the coordination.k8s.io Lease in ns: the link
@@ -633,8 +750,8 @@ func (c *Client) WaitXGatewayGCPGone(ctx context.Context, ns, name string, timeo
 	})
 }
 
-// ownedChild is one in-cluster object the Gateway owns by controller reference,
-// named for the failure message and probed via getErr.
+// ownedChild is one in-cluster object the Gateway's delete path must reap, whether by
+// owner-ref GC or by the finalizer, named for the failure message and probed via getErr.
 type ownedChild struct {
 	kind string
 	name string
@@ -643,26 +760,52 @@ type ownedChild struct {
 	getErr func(ctx context.Context, ns, name string) error
 }
 
+// OwnedChildren describes the set of children a Gateway is expected to have created,
+// which varies with its traffic policy and replica count.
+type OwnedChildren struct {
+	// Namespace and Gateway name the Gateway whose children are checked.
+	Namespace string
+	Gateway   string
+	// ExpectPDB gates the link PodDisruptionBudget, which exists only above one replica.
+	ExpectPDB bool
+	// Local selects the DaemonSet, no-NetworkPolicy shape.
+	Local bool
+	// ClusterRoleBindingName is the Local-mode cluster-scoped binding, reaped by the operator's
+	// delete path rather than by garbage collection since it carries no ownerReference.
+	ClusterRoleBindingName string
+	// Timeout bounds the poll.
+	Timeout time.Duration
+}
+
 // AssertOwnedChildrenGone polls until every object the Gateway owns is NotFound,
 // failing if any remain. It must run after the Gateway CR is gone but before the
-// namespace delete (which would mask an unreaped child); expectPDB gates the link PDB.
-func (c *Client) AssertOwnedChildrenGone(ctx context.Context, t *testing.T, ns, gateway string, expectPDB bool, timeout time.Duration) {
+// namespace delete (which would mask an unreaped child).
+func (c *Client) AssertOwnedChildrenGone(ctx context.Context, t *testing.T, want OwnedChildren) {
 	t.Helper()
+
+	ns, gateway := want.Namespace, want.Gateway
+	local, expectPDB := want.Local, want.ExpectPDB
+	crbName := want.ClusterRoleBindingName
+	timeout := want.Timeout
 
 	linkName := gateway + "-link"
 	bundleName := gateway + "-bundle"
 
-	children := []ownedChild{
-		{"Deployment", linkName, func(ctx context.Context, ns, name string) error {
-			_, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+	workload := ownedChild{"Deployment", linkName, func(ctx context.Context, ns, name string) error {
+		_, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		return err
+	}}
+	if local {
+		workload = ownedChild{"DaemonSet", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
 			return err
-		}},
+		}}
+	}
+
+	children := []ownedChild{
+		workload,
 		{"ConfigMap", linkName, func(ctx context.Context, ns, name string) error {
 			_, err := c.typed.CoreV1().ConfigMaps(ns).Get(ctx, name, metav1.GetOptions{})
-			return err
-		}},
-		{"NetworkPolicy", linkName, func(ctx context.Context, ns, name string) error {
-			_, err := c.typed.NetworkingV1().NetworkPolicies(ns).Get(ctx, name, metav1.GetOptions{})
 			return err
 		}},
 		{"ServiceAccount", linkName, func(ctx context.Context, ns, name string) error {
@@ -685,6 +828,24 @@ func (c *Client) AssertOwnedChildrenGone(ctx context.Context, t *testing.T, ns, 
 			_, err := c.typed.CoreV1().Secrets(ns).Get(ctx, name, metav1.GetOptions{})
 			return err
 		}},
+		// The link pods' leader election creates this Lease, so it carries no
+		// ownerReference: the operator's delete path reaps it explicitly.
+		{"Lease", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.CoordinationV1().Leases(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}},
+	}
+	if !local {
+		children = append(children, ownedChild{"NetworkPolicy", linkName, func(ctx context.Context, ns, name string) error {
+			_, err := c.typed.NetworkingV1().NetworkPolicies(ns).Get(ctx, name, metav1.GetOptions{})
+			return err
+		}})
+	}
+	if local && crbName != "" {
+		children = append(children, ownedChild{"ClusterRoleBinding", crbName, func(ctx context.Context, _, name string) error {
+			_, err := c.typed.RbacV1().ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
+			return err
+		}})
 	}
 	if expectPDB {
 		children = append(children, ownedChild{"PodDisruptionBudget", linkName, func(ctx context.Context, ns, name string) error {
@@ -693,8 +854,9 @@ func (c *Client) AssertOwnedChildrenGone(ctx context.Context, t *testing.T, ns, 
 		}})
 	}
 
-	c.log.Info("asserting owner-ref GC reaped gateway children",
-		zap.String("namespace", ns), zap.String("gateway", gateway), zap.Bool("expectPDB", expectPDB))
+	c.log.Info("asserting the gateway delete path reaped its children",
+		zap.String("namespace", ns), zap.String("gateway", gateway),
+		zap.Bool("expectPDB", expectPDB), zap.Bool("local", local))
 
 	var remaining []string
 	err := c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
@@ -735,9 +897,8 @@ func readyCondition(obj *unstructured.Unstructured) bool {
 	return hasCondition(obj, "Ready", "True", "")
 }
 
-// hasCondition reports whether obj carries a status condition matching condType,
-// status, and (when non-empty) reason. A condition carrying observedGeneration must
-// have it at least obj's generation, so a poll after a spec edit ignores a stale one.
+// hasCondition reports whether obj carries a status condition matching condType, status and (when
+// non-empty) reason, ignoring one whose observedGeneration is behind obj's generation.
 func hasCondition(obj *unstructured.Unstructured, condType, status, reason string) bool {
 	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil || !found {
@@ -796,8 +957,8 @@ func (c *Client) RecentEvents(ctx context.Context, ns string, limit int) (string
 		return "", fmt.Errorf("list events %s: %w", ns, err)
 	}
 	items := events.Items
-	sort.Slice(items, func(i, j int) bool {
-		return eventTime(items[i]).Before(eventTime(items[j]))
+	slices.SortFunc(items, func(a, b corev1.Event) int {
+		return eventTime(a).Compare(eventTime(b))
 	})
 	if len(items) > limit {
 		items = items[len(items)-limit:]
@@ -810,9 +971,8 @@ func (c *Client) RecentEvents(ctx context.Context, ns string, limit int) (string
 	return b.String(), nil
 }
 
-// eventTime reports an event's effective last-seen time. Structured (Events API)
-// events leave LastTimestamp zero and carry EventTime instead, so prefer
-// LastTimestamp, then EventTime, then the creation time as a last resort.
+// eventTime reports an event's effective last-seen time. Structured (Events API) events leave
+// LastTimestamp zero and carry EventTime, so fall back to that, then to the creation time.
 func eventTime(e corev1.Event) time.Time {
 	if !e.LastTimestamp.IsZero() {
 		return e.LastTimestamp.Time
@@ -845,6 +1005,92 @@ func (c *Client) WaitDeploymentAvailable(ctx context.Context, ns, name string, t
 	})
 }
 
+// WorkerNodes returns the names of the cluster's schedulable worker nodes, sorted, so a
+// test can pin a backend to a chosen one deterministically.
+func (c *Client) WorkerNodes(ctx context.Context) ([]string, error) {
+	nodes, err := c.typed.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	names := make([]string, 0, len(nodes.Items))
+	for i := range nodes.Items {
+		if _, isControlPlane := nodes.Items[i].Labels[controlPlaneNodeLabel]; isControlPlane {
+			continue
+		}
+		names = append(names, nodes.Items[i].Name)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// NodeAddressesAndPodCIDRs returns every node's addresses and every node's podCIDR, the
+// excluded set a Local-mode /clientip assertion checks the observed address against.
+func (c *Client) NodeAddressesAndPodCIDRs(ctx context.Context) (addresses []string, cidrs []string, err error) {
+	nodes, err := c.typed.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("list nodes: %w", err)
+	}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		for _, addr := range node.Status.Addresses {
+			if addr.Address != "" {
+				addresses = append(addresses, addr.Address)
+			}
+		}
+		if node.Spec.PodCIDR != "" {
+			cidrs = append(cidrs, node.Spec.PodCIDR)
+		}
+		cidrs = append(cidrs, node.Spec.PodCIDRs...)
+	}
+	slices.Sort(addresses)
+	slices.Sort(cidrs)
+	return addresses, cidrs, nil
+}
+
+// linkPodSelector matches a gateway's link pods, mirroring the operator's unexported
+// selector labels.
+func linkPodSelector(gateway string) string {
+	return fmt.Sprintf("app.kubernetes.io/name=wireguard-gateway-operator,app.kubernetes.io/instance=%s,app.kubernetes.io/component=link", gateway)
+}
+
+// LinkPodIPs returns the pod IPs of the gateway's link pods, the addresses a
+// Cluster-mode masquerade rewrites a client's source to. A pod that has no IP yet is
+// skipped, so an empty result means no link pod has been assigned one.
+func (c *Client) LinkPodIPs(ctx context.Context, ns, gateway string) ([]string, error) {
+	selector := linkPodSelector(gateway)
+	pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("list link pods (ns=%s gateway=%s): %w", ns, gateway, err)
+	}
+	ips := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		if ip := pods.Items[i].Status.PodIP; ip != "" {
+			ips = append(ips, ip)
+		}
+	}
+	slices.Sort(ips)
+	return ips, nil
+}
+
+// LinkClusterRoleBindingName returns the gateway's cluster-scoped ClusterRoleBinding, found by the
+// operator's owner labels rather than recomputed, so the harness cannot drift from its hashing. It
+// returns "" when there is none, the Cluster-mode case, and an error when more than one matches.
+func (c *Client) LinkClusterRoleBindingName(ctx context.Context, ns, gateway string) (string, error) {
+	selector := fmt.Sprintf("wgnet.dev/gateway-namespace=%s,wgnet.dev/gateway-name=%s", ns, gateway)
+	list, err := c.typed.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return "", fmt.Errorf("list clusterrolebindings (ns=%s gateway=%s): %w", ns, gateway, err)
+	}
+	switch len(list.Items) {
+	case 0:
+		return "", nil
+	case 1:
+		return list.Items[0].Name, nil
+	default:
+		return "", fmt.Errorf("gateway %s/%s matched %d clusterrolebindings, want at most one", ns, gateway, len(list.Items))
+	}
+}
+
 // WaitEndpointsReady polls the named Service's EndpointSlices until at least one
 // address is Ready. The readinessProbe-less echo reports Available before it is a
 // ready endpoint, so a retarget gates on this before the DNAT goes live.
@@ -853,12 +1099,12 @@ func (c *Client) WaitEndpointsReady(ctx context.Context, namespace, serviceName 
 		zap.String("namespace", namespace), zap.String("service", serviceName))
 	selector := fmt.Sprintf("%s=%s", discoveryv1.LabelServiceName, serviceName)
 	return c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
-		slices, err := c.typed.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+		epSlices, err := c.typed.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
 			return false, fmt.Errorf("list endpointslices (ns=%s service=%s): %w", namespace, serviceName, err)
 		}
-		for i := range slices.Items {
-			slice := &slices.Items[i]
+		for i := range epSlices.Items {
+			slice := &epSlices.Items[i]
 			for j := range slice.Endpoints {
 				ep := &slice.Endpoints[j]
 				if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
@@ -871,6 +1117,199 @@ func (c *Client) WaitEndpointsReady(ctx context.Context, namespace, serviceName 
 		}
 		return false, nil
 	})
+}
+
+// ServiceRef names a Service by namespace, so one wait can cover backends spread over
+// several namespaces.
+type ServiceRef struct {
+	Namespace, Name string
+}
+
+// WaitEndpointsReadyOnNode polls until every ref has a ready endpoint whose node is
+// node, under one deadline rather than a per-service sum. It asserts placement as well
+// as readiness, which is what a Local-mode handoff waits on.
+func (c *Client) WaitEndpointsReadyOnNode(ctx context.Context, refs []ServiceRef, node string, timeout time.Duration) error {
+	c.log.Info("waiting for service endpoints ready on node",
+		zap.String("node", node), zap.Int("services", len(refs)))
+	var pending ServiceRef
+	err := c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
+		for _, ref := range refs {
+			ready, err := c.endpointReadyOnNode(ctx, ref, node)
+			if err != nil {
+				pending = ref
+				return false, err
+			}
+			if !ready {
+				pending = ref
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait endpoints ready on node %s (last pending %s/%s): %w", node, pending.Namespace, pending.Name, err)
+	}
+	return nil
+}
+
+// endpointReadyOnNode reports whether ref has at least one ready endpoint address whose
+// EndpointSlice entry names node.
+func (c *Client) endpointReadyOnNode(ctx context.Context, ref ServiceRef, node string) (bool, error) {
+	selector := fmt.Sprintf("%s=%s", discoveryv1.LabelServiceName, ref.Name)
+	epSlices, err := c.typed.DiscoveryV1().EndpointSlices(ref.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return false, fmt.Errorf("list endpointslices (ns=%s service=%s): %w", ref.Namespace, ref.Name, err)
+	}
+	for i := range epSlices.Items {
+		for j := range epSlices.Items[i].Endpoints {
+			ep := &epSlices.Items[i].Endpoints[j]
+			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+				continue
+			}
+			if len(ep.Addresses) == 0 || ep.NodeName == nil || *ep.NodeName != node {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ScaleDeployment sets the named Deployment's replica count, the pod-scoped way to
+// remove a backend's last ready endpoint without touching the node.
+func (c *Client) ScaleDeployment(ctx context.Context, ns, name string, replicas int32) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		dep, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get deployment %s/%s: %w", ns, name, err)
+		}
+		dep.Spec.Replicas = &replicas
+		if _, err := c.typed.AppsV1().Deployments(ns).Update(ctx, dep, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("scale deployment %s/%s to %d: %w", ns, name, replicas, err)
+		}
+		return nil
+	})
+}
+
+// WaitLinkPodReadyOnNode polls until the gateway has a Ready link pod on node and
+// returns its name, which is how a disruption assertion picks up the replacement.
+func (c *Client) WaitLinkPodReadyOnNode(ctx context.Context, ns, gateway, node string, timeout time.Duration) (string, error) {
+	c.log.Info("waiting for link pod ready on node",
+		zap.String("namespace", ns), zap.String("gateway", gateway), zap.String("node", node))
+	var name, lastSeen string
+	err := c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
+		pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: linkPodSelector(gateway)})
+		if err != nil {
+			return false, fmt.Errorf("list link pods (ns=%s gateway=%s): %w", ns, gateway, err)
+		}
+		seen := make([]string, 0, len(pods.Items))
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			seen = append(seen, describeLinkPod(pod))
+			if pod.Spec.NodeName == node && pod.DeletionTimestamp == nil && podReady(pod) {
+				name = pod.Name
+				return true, nil
+			}
+		}
+		lastSeen = strings.Join(seen, "; ")
+		return false, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("wait link pod of %s/%s ready on node %s (last seen: %s): %w", ns, gateway, node, lastSeen, err)
+	}
+	return name, nil
+}
+
+// describeLinkPod renders the fields a link-pod readiness wait is decided on, so a
+// timeout says which candidate fell short and why.
+func describeLinkPod(pod *corev1.Pod) string {
+	ready := "Ready=<none>"
+	for i := range pod.Status.Conditions {
+		if pod.Status.Conditions[i].Type == corev1.PodReady {
+			ready = fmt.Sprintf("Ready=%s", pod.Status.Conditions[i].Status)
+			break
+		}
+	}
+	return fmt.Sprintf("%s node=%s phase=%s deleting=%t %s",
+		pod.Name, pod.Spec.NodeName, pod.Status.Phase, pod.DeletionTimestamp != nil, ready)
+}
+
+// NodeIfaceIndex reads /sys/class/net/<iface>/ifindex inside pod. The link pods run
+// hostNetwork, so the value identifies the node's interface: an unchanged index across
+// a restart means the interface was adopted rather than recreated.
+func (c *Client) NodeIfaceIndex(ctx context.Context, ns, pod, iface string) (int, error) {
+	path := "/sys/class/net/" + iface + "/ifindex"
+	stdout, stderr, err := c.ExecInPod(ctx, ns, pod, []string{"cat", path})
+	if err != nil {
+		return 0, fmt.Errorf("read %s in %s/%s: %w (stderr: %s)", path, ns, pod, err, strings.TrimSpace(stderr))
+	}
+	index, err := strconv.Atoi(strings.TrimSpace(stdout))
+	if err != nil {
+		return 0, fmt.Errorf("parse %s in %s/%s from %q: %w", path, ns, pod, strings.TrimSpace(stdout), err)
+	}
+	return index, nil
+}
+
+// PodRestartCount returns the pod's summed container restart count, which rises when a
+// container is replaced in place while the pod itself survives.
+func (c *Client) PodRestartCount(ctx context.Context, ns, pod string) (int32, error) {
+	p, err := c.typed.CoreV1().Pods(ns).Get(ctx, pod, metav1.GetOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("get pod %s/%s: %w", ns, pod, err)
+	}
+	var restarts int32
+	for i := range p.Status.ContainerStatuses {
+		restarts += p.Status.ContainerStatuses[i].RestartCount
+	}
+	return restarts, nil
+}
+
+// RestartDaemonSet forces a rolling update by stamping the pod-template restartedAt
+// annotation, the DaemonSet twin of RestartDeployment.
+func (c *Client) RestartDaemonSet(ctx context.Context, ns, name string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		ds, err := c.typed.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get daemonset %s/%s: %w", ns, name, err)
+		}
+		if ds.Spec.Template.Annotations == nil {
+			ds.Spec.Template.Annotations = map[string]string{}
+		}
+		ds.Spec.Template.Annotations["kubectl.kubernetes.io/restartedAt"] = time.Now().Format(time.RFC3339Nano)
+		if _, err := c.typed.AppsV1().DaemonSets(ns).Update(ctx, ds, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("restart daemonset %s/%s: %w", ns, name, err)
+		}
+		return nil
+	})
+}
+
+// WaitDaemonSetReady polls until every desired DaemonSet pod is ready on the current
+// generation, so a roll that is still replacing pods does not read as converged.
+func (c *Client) WaitDaemonSetReady(ctx context.Context, ns, name string, timeout time.Duration) error {
+	c.log.Info("waiting for daemonset ready", zap.String("namespace", ns), zap.String("name", name))
+	lastSeen := "not observed"
+	err := c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
+		ds, err := c.typed.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			lastSeen = "not found"
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("get daemonset %s/%s: %w", ns, name, err)
+		}
+		st := ds.Status
+		lastSeen = fmt.Sprintf("generation=%d observedGeneration=%d desired=%d updated=%d ready=%d available=%d",
+			ds.Generation, st.ObservedGeneration, st.DesiredNumberScheduled,
+			st.UpdatedNumberScheduled, st.NumberReady, st.NumberAvailable)
+		return st.ObservedGeneration >= ds.Generation &&
+			st.UpdatedNumberScheduled == st.DesiredNumberScheduled &&
+			st.NumberReady == st.DesiredNumberScheduled &&
+			st.DesiredNumberScheduled > 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("wait daemonset %s/%s ready (last seen: %s): %w", ns, name, lastSeen, err)
+	}
+	return nil
 }
 
 // WaitCRDEstablished polls the named CustomResourceDefinition until it reports an
@@ -936,6 +1375,39 @@ func (c *Client) PodLogsByLabel(ctx context.Context, ns, selector string, tailLi
 	return string(buf), nil
 }
 
+// PodsByLabel returns the pods in ns matching selector, sorted by name so a dump built
+// from them is stable across runs.
+func (c *Client) PodsByLabel(ctx context.Context, ns, selector string) ([]corev1.Pod, error) {
+	pods, err := c.typed.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("list pods (ns=%s selector=%s): %w", ns, selector, err)
+	}
+	items := pods.Items
+	slices.SortFunc(items, func(a, b corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
+	return items, nil
+}
+
+// ContainerLogTail returns the last tailLines of one container's log. previous selects
+// the log of the container's prior instance, which is the only record of why a
+// restarting container died. Partial output is returned alongside a read error.
+func (c *Client) ContainerLogTail(ctx context.Context, ns, pod, container string, previous bool, tailLines int64) (string, error) {
+	stream, err := c.typed.CoreV1().Pods(ns).GetLogs(pod, &corev1.PodLogOptions{
+		Container: container,
+		Previous:  previous,
+		TailLines: &tailLines,
+	}).Stream(ctx)
+	if err != nil {
+		return "", fmt.Errorf("stream logs %s/%s container %s (previous=%t): %w", ns, pod, container, previous, err)
+	}
+	defer stream.Close()
+
+	out, err := io.ReadAll(stream)
+	if err != nil {
+		return string(out), fmt.Errorf("read logs %s/%s container %s: %w", ns, pod, container, err)
+	}
+	return string(out), nil
+}
+
 // ServiceEndpointSummary returns a per-Service line for every Service in ns: name,
 // ClusterIP, and the Ready endpoint addresses backing it. Addresses are deduplicated
 // and sorted for a stable line across the slices one Service can own.
@@ -944,14 +1416,14 @@ func (c *Client) ServiceEndpointSummary(ctx context.Context, ns string) (string,
 	if err != nil {
 		return "", fmt.Errorf("list services %s: %w", ns, err)
 	}
-	slices, err := c.typed.DiscoveryV1().EndpointSlices(ns).List(ctx, metav1.ListOptions{})
+	epSlices, err := c.typed.DiscoveryV1().EndpointSlices(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("list endpointslices %s: %w", ns, err)
 	}
 
 	readyByService := make(map[string]map[string]struct{})
-	for i := range slices.Items {
-		slice := &slices.Items[i]
+	for i := range epSlices.Items {
+		slice := &epSlices.Items[i]
 		svc := slice.Labels[discoveryv1.LabelServiceName]
 		if svc == "" {
 			continue
@@ -978,11 +1450,7 @@ func (c *Client) ServiceEndpointSummary(ctx context.Context, ns string) (string,
 	for i := range services.Items {
 		svc := &services.Items[i]
 		ready := readyByService[svc.Name]
-		sorted := make([]string, 0, len(ready))
-		for a := range ready {
-			sorted = append(sorted, a)
-		}
-		sort.Strings(sorted)
+		sorted := slices.Sorted(maps.Keys(ready))
 		fmt.Fprintf(&b, "%s clusterIP=%s readyAddresses=%d %v\n",
 			svc.Name, svc.Spec.ClusterIP, len(sorted), sorted)
 	}

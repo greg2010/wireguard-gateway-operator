@@ -1,12 +1,13 @@
-// Package k8s holds the gateway e2e harness drivers for the kind cluster, the
-// Kubernetes API client (typed + dynamic), and the helm releases that deploy
-// Crossplane and the gateway chart.
+// Package k8s holds the gateway e2e harness drivers: the kind cluster, the Kubernetes
+// API client, and the helm releases that deploy Crossplane and the gateway chart.
 package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"go.uber.org/zap"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
@@ -19,9 +20,15 @@ import (
 // e2eClusterName is the kind cluster the e2e suite provisions.
 const e2eClusterName = "gateway-e2e"
 
-// kubeletConfigPatch tunes the node kubelet for the link pod: Watch detection plus a
-// 10s sync floor caps the mounted-ConfigMap lag so a post-Ready forward edit reaches
-// the link in time.
+const (
+	// kindReadyTimeout bounds the wait for every node to report Ready. Three nodes join
+	// well inside it; exceeding it is a broken environment, not a slow one.
+	kindReadyTimeout = 5 * time.Minute
+	nodeExecTimeout  = 30 * time.Second
+)
+
+// Watch detection plus a 10s sync floor caps the mounted-ConfigMap lag, so a post-Ready
+// forward edit reaches the link pod in time.
 const kubeletConfigPatch = `apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
 syncFrequency: 10s
@@ -66,15 +73,20 @@ func (k *KindCluster) Ensure(_ context.Context) error {
 		return nil
 	}
 	k.log.Info("creating kind cluster", zap.String("cluster", k.name))
+	// kind clears the control-plane NoSchedule taint only for a single-node cluster, so
+	// with workers present every workload lands on the two workers.
 	config := &v1alpha4.Cluster{
-		Nodes: []v1alpha4.Node{{
-			Role:                 v1alpha4.ControlPlaneRole,
-			KubeadmConfigPatches: []string{kubeletConfigPatch},
-		}},
+		Nodes: []v1alpha4.Node{
+			{Role: v1alpha4.ControlPlaneRole, KubeadmConfigPatches: []string{kubeletConfigPatch}},
+			{Role: v1alpha4.WorkerRole, KubeadmConfigPatches: []string{kubeletConfigPatch}},
+			{Role: v1alpha4.WorkerRole, KubeadmConfigPatches: []string{kubeletConfigPatch}},
+		},
 	}
 	if err := k.provider.Create(k.name,
 		cluster.CreateWithV1Alpha4Config(config),
-		cluster.CreateWithWaitForReady(0),
+		// Wait for every node to report Ready before the charts install, so a
+		// DaemonSet readiness assertion cannot race a worker still joining.
+		cluster.CreateWithWaitForReady(kindReadyTimeout),
 	); err != nil {
 		return fmt.Errorf("kind create cluster %s: %w", k.name, err)
 	}
@@ -107,9 +119,22 @@ func (k *KindCluster) Delete(_ context.Context) error {
 	return nil
 }
 
-// LoadImage side-loads a local docker image into the cluster's nodes via the
-// kind CLI. The Go API does not expose image loading, so the CLI is the
-// supported path; kind must be on PATH.
+// Nodes returns the node container names for per-node setup steps. The list comes from
+// the kind provider, not a hardcoded suffix, so it tracks the node set.
+func (k *KindCluster) Nodes() ([]string, error) {
+	names, err := k.provider.ListNodes(k.name)
+	if err != nil {
+		return nil, fmt.Errorf("kind list nodes %s: %w", k.name, err)
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, n.String())
+	}
+	return out, nil
+}
+
+// LoadImage side-loads a local docker image into the cluster's nodes. The Go API does
+// not expose image loading, so this shells out and kind must be on PATH.
 func (k *KindCluster) LoadImage(ctx context.Context, imageRef string) error {
 	k.log.Info("loading image into kind cluster",
 		zap.String("cluster", k.name),
@@ -121,4 +146,38 @@ func (k *KindCluster) LoadImage(ctx context.Context, imageRef string) error {
 		return fmt.Errorf("kind load docker-image %s: %w\n%s", imageRef, err, out)
 	}
 	return nil
+}
+
+// NodeExec runs argv in the kind node's container and returns its combined output.
+// The call is bounded by nodeExecTimeout: a wedged node must not consume the failure
+// cleanup budget, which the GCP orphan drain shares.
+func NodeExec(ctx context.Context, node string, argv ...string) (string, error) {
+	return nodeExec(ctx, shared.RunCmd, node, argv...)
+}
+
+// NodeExecStdout is NodeExec returning stdout alone, for output that is parsed: a
+// command's stderr warnings would otherwise parse as data.
+func NodeExecStdout(ctx context.Context, node string, argv ...string) (string, error) {
+	return nodeExec(ctx, shared.RunCmdStdout, node, argv...)
+}
+
+func nodeExec(
+	ctx context.Context,
+	run func(context.Context, []string, string, ...string) (string, error),
+	node string,
+	argv ...string,
+) (string, error) {
+	if len(argv) == 0 {
+		return "", fmt.Errorf("docker exec %s: no argv", node)
+	}
+	cctx, cancel := context.WithTimeout(ctx, nodeExecTimeout)
+	defer cancel()
+	out, err := run(cctx, nil, "docker", append([]string{"exec", node}, argv...)...)
+	if err != nil {
+		if ctx.Err() == nil && errors.Is(cctx.Err(), context.DeadlineExceeded) {
+			return out, fmt.Errorf("docker exec %s %s: timed out after %s: %w", node, argv[0], nodeExecTimeout, err)
+		}
+		return out, fmt.Errorf("docker exec %s %s: %w", node, argv[0], err)
+	}
+	return out, nil
 }

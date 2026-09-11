@@ -1,6 +1,6 @@
 .PHONY: test test-unit test-integration test-e2e build clean lint lint-fix mocks helm-lint setup-gcp setup-gcp-sa gcp-creds docker-build crossplane-models generate manifests envtest
 
-E2E_PARALLEL ?= 6
+E2E_PARALLEL ?= 8
 
 lint:
 	gopls check -severity=hint $$(go list -f '{{range .GoFiles}}{{$$.Dir}}/{{.}}{{"\n"}}{{end}}' ./...)
@@ -25,9 +25,8 @@ generate:
 manifests:
 	go tool controller-gen crd rbac:roleName=gateway-operator paths=./pkg/api/... paths=./internal/controller/... output:crd:dir=k8s/charts/wireguard-gateway-operator/templates/crds output:rbac:dir=k8s/charts/wireguard-gateway-operator/templates
 
-# Resolve the envtest binary path for the pinned k8s version. setup-envtest is
-# pinned via the go.mod tool directive (tracking controller-runtime); the assets
-# version is selected by ENVTEST_K8S_VERSION.
+# setup-envtest is pinned via the go.mod tool directive (tracking
+# controller-runtime); the assets version is selected by ENVTEST_K8S_VERSION.
 ENVTEST_K8S_VERSION ?= 1.35.x
 envtest:
 	@go tool setup-envtest use -p path $(ENVTEST_K8S_VERSION)
@@ -35,8 +34,7 @@ envtest:
 helm-lint:
 	helm lint k8s/charts/wireguard-gateway-operator
 
-# Stand up the GCP test project, create the provider-gcp service account, and
-# obtain credentials. All read config from .env (see .env.example) and are
+# The GCP setup targets read config from .env (see .env.example) and are
 # idempotent.
 setup-gcp:
 	scripts/setup-gcp-project.sh
@@ -49,11 +47,8 @@ gcp-creds:
 
 test: test-unit test-integration test-e2e
 
-# Per-suite targets mirror the CI split: unit / integration / e2e run as
-# independent jobs so a slow-suite failure does not mask the others. The timeout
-# accommodates the controller package's envtest tests, each of which boots its own
-# control plane, so the package's aggregate wall-clock under -race is far above a
-# pure-unit budget.
+# Per-suite targets mirror the CI split. The unit timeout accommodates the
+# controller package's envtest tests, each of which boots a control plane.
 test-unit:
 	go test -race -timeout=180s -coverprofile=coverage.out $$(go list ./... | grep -vE '/test/(integration|e2e)(/|$$)')
 
