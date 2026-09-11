@@ -23,6 +23,13 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
       type: string
+    - jsonPath: .spec.trafficPolicy
+      name: Policy
+      type: string
+    - jsonPath: .status.link.activeNode
+      name: Node
+      priority: 1
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -58,9 +65,8 @@ spec:
                   properties:
                     namespace:
                       description: |-
-                        Namespace of the target Service. Defaults to the Gateway's namespace.
-                        Cross-namespace forwards require the target namespace to carry the opt-in
-                        label.
+                        Namespace of the target Service, defaulting to the Gateway's namespace. Another
+                        namespace must carry the wgnet.dev/allow-gateway-ingress=true label.
                       pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     port:
@@ -118,9 +124,8 @@ spec:
                     type: string
                   projectID:
                     description: |-
-                      ProjectID is the GCP project that owns the gateway VM and its Secret Manager
-                      secret. The boot keyfetch reads it from instance metadata to resolve the
-                      secret URL.
+                      ProjectID is the GCP project owning the gateway VM and its Secret Manager secret;
+                      the boot keyfetch resolves the secret URL through it.
                     minLength: 1
                     type: string
                   region:
@@ -147,9 +152,16 @@ spec:
               link:
                 default: {}
                 description: |-
-                  Link configures the in-cluster link Deployment. Every value defaults via the
-                  CRD, so the block may be omitted to get a single-replica link.
+                  Link configures the in-cluster link workload: a Deployment in Cluster mode, a
+                  DaemonSet in Local mode. Every value has a default, so the block may be omitted.
                 properties:
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      NodeSelector is applied to the link pod template: the Deployment's in Cluster
+                      mode, the DaemonSet's in Local mode.
+                    type: object
                   replicas:
                     default: 1
                     description: |-
@@ -162,18 +174,30 @@ spec:
               provider:
                 default: gcp
                 description: |-
-                  Provider selects the provider-specific Crossplane Composition that
-                  provisions the gateway VM, matched by the composite's compositionSelector.
-                  Only gcp is supported today.
+                  Provider selects the Composition that provisions the gateway VM. The only
+                  supported value is gcp.
                 enum:
                 - gcp
                 type: string
+              trafficPolicy:
+                default: Cluster
+                description: |-
+                  TrafficPolicy selects the data path. Cluster masquerades tunnel egress at the
+                  gateway VM and DNATs to a Service ClusterIP; Local preserves the client source
+                  address and DNATs to a ready backend pod on the node holding the link Lease.
+                  Immutable: the VM's ruleset is baked at boot.
+                enum:
+                - Cluster
+                - Local
+                type: string
+                x-kubernetes-validations:
+                - message: spec.trafficPolicy is immutable
+                  rule: self == oldSelf
               wireguard:
                 default: {}
                 description: |-
-                  Wireguard carries the provider-agnostic WireGuard tunnel parameters. Every
-                  value defaults via the CRD, so the block may be omitted to get the standard
-                  tunnel.
+                  Wireguard carries the WireGuard tunnel parameters. Every value has a default, so
+                  the block may be omitted.
                 properties:
                   gatewayAddress:
                     default: 10.99.0.1
@@ -229,6 +253,9 @@ spec:
             - message: a UDP forward must not use the WireGuard listen port (spec.wireguard.listenPort)
               rule: '!has(self.forwards) || self.forwards.all(f, !(f.protocol == ''UDP''
                 && f.port == self.wireguard.listenPort))'
+            - message: spec.link.replicas applies only to trafficPolicy Cluster; Local
+                runs a DaemonSet on every eligible node
+              rule: self.trafficPolicy != 'Local' || self.link.replicas == 1
           status:
             properties:
               address:
@@ -294,6 +321,24 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              link:
+                description: Link is the observed state of this Gateway's link workload.
+                properties:
+                  activeNode:
+                    description: |-
+                      ActiveNode is the node running the pod that holds the link Lease, in either
+                      mode. Empty until a holder pod is observed.
+                    type: string
+                  id:
+                    description: |-
+                      ID is the per-Gateway link id allocated in Local mode, in 1..250, and 0 in Cluster
+                      mode. Once written it is never recomputed or reassigned: the interface name,
+                      nftables table, firewall mark, route table and health port all derive from it.
+                    format: int32
+                    maximum: 250
+                    minimum: 1
+                    type: integer
+                type: object
               serviceAccountEmail:
                 type: string
             type: object

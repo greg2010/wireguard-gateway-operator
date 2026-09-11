@@ -18,30 +18,47 @@ type CloudProvider string
 // ProviderGCP is the only provider supported today.
 const ProviderGCP CloudProvider = "gcp"
 
+// TrafficPolicy selects a Gateway's data-path mode.
+type TrafficPolicy string
+
+const (
+	TrafficPolicyCluster TrafficPolicy = "Cluster"
+	TrafficPolicyLocal   TrafficPolicy = "Local"
+)
+
 // +kubebuilder:validation:XValidation:rule="!has(self.forwards) || self.forwards.all(f1, self.forwards.exists_one(f2, f2.port == f1.port && f2.protocol == f1.protocol))",message="each forward must use a unique port and protocol combination"
 // +kubebuilder:validation:XValidation:rule="!has(self.forwards) || self.forwards.all(f, !(f.protocol == 'UDP' && f.port == self.wireguard.listenPort))",message="a UDP forward must not use the WireGuard listen port (spec.wireguard.listenPort)"
+// +kubebuilder:validation:XValidation:rule="self.trafficPolicy != 'Local' || self.link.replicas == 1",message="spec.link.replicas applies only to trafficPolicy Cluster; Local runs a DaemonSet on every eligible node"
 type GatewaySpec struct {
 	GCP GatewayGCPSpec `json:"gcp"`
 
-	// Wireguard carries the provider-agnostic WireGuard tunnel parameters. Every
-	// value defaults via the CRD, so the block may be omitted to get the standard
-	// tunnel.
+	// Wireguard carries the WireGuard tunnel parameters. Every value has a default, so
+	// the block may be omitted.
 	// +optional
 	// +kubebuilder:default={}
-	Wireguard GatewayWireguardSpec `json:"wireguard,omitempty"`
+	Wireguard GatewayWireguardSpec `json:"wireguard"`
 
-	// Link configures the in-cluster link Deployment. Every value defaults via the
-	// CRD, so the block may be omitted to get a single-replica link.
+	// Link configures the in-cluster link workload: a Deployment in Cluster mode, a
+	// DaemonSet in Local mode. Every value has a default, so the block may be omitted.
 	// +optional
 	// +kubebuilder:default={}
-	Link GatewayLinkSpec `json:"link,omitempty"`
+	Link GatewayLinkSpec `json:"link"`
 
-	// Provider selects the provider-specific Crossplane Composition that
-	// provisions the gateway VM, matched by the composite's compositionSelector.
-	// Only gcp is supported today.
+	// Provider selects the Composition that provisions the gateway VM. The only
+	// supported value is gcp.
 	// +kubebuilder:validation:Enum=gcp
 	// +kubebuilder:default=gcp
 	Provider CloudProvider `json:"provider,omitempty"`
+
+	// TrafficPolicy selects the data path. Cluster masquerades tunnel egress at the
+	// gateway VM and DNATs to a Service ClusterIP; Local preserves the client source
+	// address and DNATs to a ready backend pod on the node holding the link Lease.
+	// Immutable: the VM's ruleset is baked at boot.
+	// +optional
+	// +kubebuilder:validation:Enum=Cluster;Local
+	// +kubebuilder:default=Cluster
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.trafficPolicy is immutable"
+	TrafficPolicy TrafficPolicy `json:"trafficPolicy,omitempty"`
 
 	// Forwards are the public ports DNAT'd through the gateway to in-cluster pods.
 	// +kubebuilder:validation:MaxItems=64
@@ -52,9 +69,8 @@ type GatewaySpec struct {
 }
 
 type GatewayGCPSpec struct {
-	// ProjectID is the GCP project that owns the gateway VM and its Secret Manager
-	// secret. The boot keyfetch reads it from instance metadata to resolve the
-	// secret URL.
+	// ProjectID is the GCP project owning the gateway VM and its Secret Manager secret;
+	// the boot keyfetch resolves the secret URL through it.
 	// +kubebuilder:validation:MinLength=1
 	ProjectID string `json:"projectID"`
 
@@ -125,7 +141,8 @@ type GatewayWireguardSpec struct {
 	ReconcileInterval string `json:"reconcileInterval,omitempty"`
 }
 
-// GatewayLinkSpec configures the in-cluster link Deployment.
+// GatewayLinkSpec configures the in-cluster link workload: a Deployment in Cluster
+// mode, a DaemonSet in Local mode.
 type GatewayLinkSpec struct {
 	// Replicas is the number of link pods. Values >1 enable hot-standby
 	// failover and safe rolling updates via leader election.
@@ -133,6 +150,11 @@ type GatewayLinkSpec struct {
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Replicas int32 `json:"replicas,omitempty"`
+
+	// NodeSelector is applied to the link pod template: the Deployment's in Cluster
+	// mode, the DaemonSet's in Local mode.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 }
 
 type Forward struct {
@@ -151,9 +173,8 @@ type Forward struct {
 	// +kubebuilder:validation:Pattern=^[a-z]([-a-z0-9]*[a-z0-9])?$
 	Service string `json:"service"`
 
-	// Namespace of the target Service. Defaults to the Gateway's namespace.
-	// Cross-namespace forwards require the target namespace to carry the opt-in
-	// label.
+	// Namespace of the target Service, defaulting to the Gateway's namespace. Another
+	// namespace must carry the wgnet.dev/allow-gateway-ingress=true label.
 	// +kubebuilder:validation:Pattern=^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
@@ -165,11 +186,31 @@ type Forward struct {
 	TargetPort int32 `json:"targetPort,omitempty"`
 }
 
+// GatewayLinkStatus is the observed state of a Gateway's link workload.
+type GatewayLinkStatus struct {
+	// ID is the per-Gateway link id allocated in Local mode, in 1..250, and 0 in Cluster
+	// mode. Once written it is never recomputed or reassigned: the interface name,
+	// nftables table, firewall mark, route table and health port all derive from it.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=250
+	// +optional
+	ID int32 `json:"id,omitempty"`
+
+	// ActiveNode is the node running the pod that holds the link Lease, in either
+	// mode. Empty until a holder pod is observed.
+	// +optional
+	ActiveNode string `json:"activeNode,omitempty"`
+}
+
 type GatewayStatus struct {
 	// Address is the gateway VM's public ingress IP, mirrored from the XGatewayGCP.
 	Address string `json:"address,omitempty"`
 
 	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
+
+	// Link is the observed state of this Gateway's link workload.
+	// +optional
+	Link GatewayLinkStatus `json:"link"`
 
 	// +listType=map
 	// +listMapKey=type
@@ -183,6 +224,8 @@ type GatewayStatus struct {
 // +kubebuilder:resource:shortName=gw
 // +kubebuilder:printcolumn:name="Address",type=string,JSONPath=`.status.address`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Policy",type=string,JSONPath=`.spec.trafficPolicy`
+// +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.link.activeNode`,priority=1
 
 type Gateway struct {
 	metav1.TypeMeta   `json:",inline"`
