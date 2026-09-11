@@ -17,11 +17,25 @@ egress. You still get stable public endpoints in front of cluster workloads.
 
 Each `Gateway` reconciles two halves. A Crossplane composition provisions a GCP
 VM running WireGuard and nftables: it holds the public IP and opens the listed
-ports. An in-cluster `gateway-link` Deployment peers with that VM and DNATs the
-forwarded ports to the backend Services. Because the cluster only ever dials
-outbound, no inbound firewall rule is needed cluster-side. When `dnsHostnames` is
-set, the operator publishes a `DNSEndpoint` pointing those names at the VM's
-public IP for external-dns to serve.
+ports. An in-cluster `gateway-link` peers with that VM and DNATs the forwarded
+ports to the backends. Because the cluster only ever dials outbound, no inbound
+firewall rule is needed cluster-side. When `dnsHostnames` is set, the operator
+publishes a `DNSEndpoint` pointing those names at the VM's public IP for
+external-dns to serve.
+
+`spec.trafficPolicy` picks the shape of that in-cluster half. `Cluster`, the
+default, runs the link as a Deployment: the tunnel terminates in the link pod's
+own network namespace, each forwarded port is DNAT'd to the backend Service's
+ClusterIP, and the backend sees the link as the client. `Local` runs the link as
+a hostNetwork DaemonSet and terminates the tunnel in the node's network
+namespace: one node holds a Lease, DNATs each public port to a ready backend pod
+on that node, and routes the replies back into the tunnel through a per-Gateway
+`ip rule` matching the connmark set on the tunnel's ingress. Every per-Gateway name
+and number a Local link programs on the node — tunnel interface, nftables table,
+firewall mark, route table — derives from the id in `status.link.id`, so several
+Local Gateways coexist on one node. The operator also records that id in the
+`wgnet.dev/link-id` annotation and reads it back when status is empty, so a
+Gateway restored without its status keeps its id and the node state it names.
 
 A minimal `Gateway`:
 
@@ -46,6 +60,8 @@ This gives `my-app` a public endpoint on a cloud VM that forwards port 443 to th
 in-cluster Service. See [Creating a gateway](#creating-a-gateway) for the full
 spec.
 
+The `Cluster` path:
+
 ```
             client
                │
@@ -68,6 +84,21 @@ spec.
        backend Service ──▶ pods
 ```
 
+The `Local` path, from the tunnel down:
+
+```
+               │  WireGuard tunnel
+               ▼
+┌─────────────────────────────┐
+│  active node's netns        │
+│  gateway-link DaemonSet     │
+│  DNAT port → backend pod IP │
+└──────────────┬──────────────┘
+               │  pod IP on this node
+               ▼
+        backend pod
+```
+
 ## Cloud backends
 
 Gateway-VM provisioning is backend-specific, and only GCP exists today.
@@ -82,7 +113,9 @@ Gateway-VM provisioning is backend-specific, and only GCP exists today.
 | Requirement | Notes | Docs |
 | --- | --- | --- |
 | Kubernetes cluster + kubectl | Any conformant cluster; typically one that cannot expose its own LoadBalancer. | [kubectl](https://kubernetes.io/docs/tasks/tools/) |
-| Privileged pods in gateway namespaces | The link pod runs a privileged init container to enable IPv4 forwarding; the namespace where you create a Gateway must not enforce restricted/baseline PodSecurity (label it `pod-security.kubernetes.io/enforce: privileged` if your cluster defaults to enforcement). | [Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/) |
+| Privileged pods in gateway namespaces | The link container runs as root with `NET_ADMIN` in both traffic policies. `Cluster` adds a privileged init container that enables IPv4 forwarding in the pod's network namespace; `Local` has no init container and instead needs `hostNetwork` plus a read-write hostPath mount of the node's `/proc/sys/net`. Either way the namespace where you create a Gateway must not enforce restricted/baseline PodSecurity (label it `pod-security.kubernetes.io/enforce: privileged` if your cluster defaults to enforcement). | [Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/) |
+| Loose `rp_filter` on Local-mode nodes | A node that runs a Local-mode link needs `net.ipv4.conf.all.rp_filter` set to 0 or 2. The link lowers only the tunnel interface's own value and never the node-wide one, and the kernel takes the maximum of the two. A node that fails this reports `RPFilterStrict` on the Gateway's `Ready` condition. The link also programs a `throw` route per backend pod IP in the Gateway's route table, so a marked reply's reverse-path lookup falls through to the main table and passes validation on the pod-facing interface even where `net.ipv4.conf.all.src_valid_mark` is 1 and that interface's `rp_filter` is strict. | [rp_filter](https://docs.kernel.org/networking/ip-sysctl.html) |
+| Exclusive packet-mark bits on Local-mode nodes | A Local-mode link claims the upper 16 bits of the packet mark and of the conntrack mark on the nodes it may run on, mask `0xffff0000`. It marks each tunnel connection with `<link id> << 16`, restores that value into the mark of reply packets, and steers them with `ip rule fwmark <link id> << 16/0xffff0000`. `status.link.id` is 1..250, so the values themselves sit in bits 16-23. Every other mark user on the node must leave that mask untouched: check your CNI's packet-mark mask, and any service mesh or policy routing that marks packets. An overlap routes foreign packets into the tunnel or misroutes the link's replies. | [ip rule](https://man7.org/linux/man-pages/man8/ip-rule.8.html) |
 | Helm | Installs Crossplane core and the operator chart. | [Helm](https://helm.sh/docs/intro/install/) |
 | Crossplane | Installed in the cluster; realizes the gateway VM composition. | [Crossplane install](https://docs.crossplane.io/latest/get-started/install/) |
 | GCP provider (installed) | The Upbound provider-gcp packages, installed via Crossplane's package mechanism. | [Crossplane providers](https://docs.crossplane.io/latest/packages/providers/) |
@@ -276,6 +309,9 @@ in-cluster `service` name, and an optional `targetPort` (defaults to `port`).
 parameters, all defaulted: `listenPort` (the gateway VM's WireGuard UDP port,
 range 1–65535), `subnet`, `gatewayAddress`, `linkAddress`, `keepalive`, `mtu`,
 and `reconcileInterval`. An omitted `spec.wireguard` yields the standard tunnel.
+`spec.trafficPolicy` selects the data path, `Cluster` by default; see
+[Traffic policy](#traffic-policy). `spec.link` configures the link workload:
+`replicas` and a `nodeSelector` applied to its pod template.
 
 ```yaml
 apiVersion: wgnet.dev/v1alpha1
@@ -310,8 +346,8 @@ kubectl get gateway -n my-app
 ```
 
 ```
-NAME   ADDRESS         READY
-edge   203.0.113.42    True
+NAME   ADDRESS         READY   POLICY
+edge   203.0.113.42    True    Cluster
 ```
 
 Forward validation is enforced at apply time and rejected by the Kubernetes API
@@ -323,8 +359,63 @@ server:
 
 The `ADDRESS` column is the gateway VM's public IP, mirrored onto
 `status.address` once provisioning completes; `READY` reflects the `Ready`
-condition. With `dnsHostnames` set and external-dns running, the listed names
-resolve to that IP.
+condition and `POLICY` the traffic policy. `kubectl get gateway -o wide` adds
+`NODE`, the node holding the link Lease. With `dnsHostnames` set and external-dns
+running, the listed names resolve to that IP.
+
+## Traffic policy
+
+`spec.trafficPolicy` selects the data path. It is immutable, because the gateway
+VM's ruleset is written at first boot: serving an existing workload the other way
+means a second Gateway and a DNS move.
+
+| | `Cluster` (default) | `Local` |
+| --- | --- | --- |
+| Link workload | Deployment, `spec.link.replicas` pods | hostNetwork DaemonSet, one pod per eligible node (`spec.link.replicas` must stay 1) |
+| Tunnel terminates in | the link pod's network namespace | the active node's network namespace |
+| DNAT target | the backend Service's ClusterIP | a ready backend pod on the active node |
+| Backend sees the client as | the link's tunnel address | the real client address, TCP and UDP |
+| Backend reachable on | any node, via kube-proxy | the active node only |
+
+In `Local` mode a Lease elects one active node, preferring nodes that carry a
+ready backend pod for every forward. `status.link.activeNode` names the holder.
+Local mode requires:
+
+- Loose `rp_filter` on every node the link may run on, per
+  [Prerequisites](#prerequisites).
+- `hostNetwork` and `NET_ADMIN` for the link pod on every node the DaemonSet
+  schedules to. Narrow that set with `spec.link.nodeSelector`.
+- A ready backend pod on the active node for every forward. A forward without one
+  is not programmed and its traffic is dropped; the rest keep serving.
+- The upper 16 bits of the packet and conntrack marks, mask `0xffff0000`, free for
+  the link on every node it may run on, per [Prerequisites](#prerequisites).
+
+The operator holds cluster-wide `create` and `delete` on ClusterRoleBindings, so it
+can bind each `Local` link's ServiceAccount to the chart's
+`gateway-link-endpointslice-reader` ClusterRole, which grants the cluster-scoped
+EndpointSlice reads the link needs to find backend pods on its node. Kubernetes
+escalation prevention limits what it may grant to permissions it holds itself; the
+chart satisfies that with a `bind` grant on that one ClusterRole by name.
+
+`Ready=False` reasons the link itself publishes, and the policies each applies to:
+
+| Reason | Policy | Meaning |
+| --- | --- | --- |
+| `NoLocalEndpoint` | `Local` | some forward has no ready backend pod on the active node; the message names each one |
+| `RPFilterStrict` | `Local` | the active node's `net.ipv4.conf.all.rp_filter` is neither 0 nor 2 |
+| `ApplyFailed` | both | the link could not program the data plane: a command failed or the health server would not bind. In `Local` mode it also covers a node whose `net.ipv4.ip_forward` is 0 or whose pre-check sysctls are unreadable |
+
+The `Local` node checks (`rp_filter`, `ip_forward`, sysctl readability) run once at link
+start, so after fixing a node restart its link pod for the fault to clear: delete the
+pod and the DaemonSet recreates it. A link pod that finds its Gateway's interface
+already on the node at start keeps it: the interface is fenced once a link pod on
+another node is observed holding the Lease, and re-applied in place if this pod
+acquires the Lease.
+
+`spec.wireguard.linkAddress` (default `10.99.0.2`) may be identical across
+Gateways in either mode. A `Local` link assigns it to that Gateway's own tunnel
+interface in the node's namespace, and every nftables rule, route and routing rule
+it installs selects by interface and firewall mark, never by that address.
 
 ## Cross-namespace forwards
 
@@ -347,8 +438,10 @@ kubectl label namespace other-ns wgnet.dev/allow-gateway-ingress=true
 ```
 
 Backend Services of type `ClusterIP` and `NodePort` are supported (both carry a
-routable ClusterIP to DNAT to). `ExternalName` and headless Services are
-rejected: the Gateway reports `Ready=False` with reason `UnsupportedServiceType`.
+routable ClusterIP to DNAT to). `ExternalName` Services are rejected in both
+traffic policies, and headless Services in `Cluster` mode only, where the DNAT
+needs a ClusterIP that `Local` mode never reads; a rejected forward leaves the
+Gateway `Ready=False` with reason `UnsupportedServiceType`.
 
 ## Operations
 
@@ -382,6 +475,12 @@ composite destroys the Address, Firewall, service account, Secrets, and Instance
 and releases the reserved public IP, though the VPC survives. Deleting the last
 `Gateway` CR in the cluster additionally tears down the VPC, which is refcounted
 across Gateways.
+
+Deleting a `Gateway` unwinds its link first, in both traffic policies: the
+operator deletes the link workload and waits for the link pods to exit, then
+reaps the leader-election Lease `<gateway>-link`, because a live elector
+re-creates a deleted Lease on its next renew. A pod stuck terminating for longer
+than its own grace period plus 30s does not hold that teardown up.
 
 ### Break-glass SSH
 
