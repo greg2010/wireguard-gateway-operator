@@ -5,6 +5,13 @@ package gcp
 
 // XGatewayGCPSpec defines model for XGatewayGCPSpec.
 type XGatewayGCPSpec struct {
+	Address *struct {
+		External *struct {
+			Ip   *string `json:"ip,omitempty"`
+			Name *string `json:"name,omitempty"`
+		} `json:"external,omitempty"`
+		Type *string `json:"type,omitempty"`
+	} `json:"address,omitempty"`
 	AllowedPorts *[]struct {
 		Port     int    `json:"port"`
 		Protocol string `json:"protocol"`
@@ -16,7 +23,6 @@ type XGatewayGCPSpec struct {
 	ProjectID          *string `json:"projectID,omitempty"`
 	ProviderConfigName *string `json:"providerConfigName,omitempty"`
 	Region             string  `json:"region"`
-	ReservedIP         *bool   `json:"reservedIP,omitempty"`
 	SecretId           *string `json:"secretId,omitempty"`
 	ServiceAccountId   *string `json:"serviceAccountId,omitempty"`
 	SharedNetworkName  string  `json:"sharedNetworkName"`
@@ -38,5 +44,6 @@ type XGatewayGCPSpec struct {
 // XGatewayGCPStatus defines model for XGatewayGCPStatus.
 type XGatewayGCPStatus struct {
 	Address             *string `json:"address,omitempty"`
+	Message             *string `json:"message,omitempty"`
 	ServiceAccountEmail *string `json:"serviceAccountEmail,omitempty"`
 }

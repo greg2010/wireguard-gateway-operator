@@ -2,10 +2,53 @@
 {{- $xr := .observed.composite.resource -}}
 {{- $spec := $xr.spec -}}
 {{- $region := $spec.region -}}
-{{- $reservedIP := dig "reservedIP" false $spec -}}
+{{- $addrBlock := dig "address" (dict) $spec -}}
+{{- $addrType := dig "type" "Reserved" $addrBlock -}}
+{{- $external := dig "external" (dict) $addrBlock -}}
+{{- $extName := dig "name" "" $external -}}
+{{- $extIP := dig "ip" "" $external -}}
+{{- $isReserved := eq $addrType "Reserved" -}}
+{{- $isEphemeral := eq $addrType "Ephemeral" -}}
+{{- $isExternal := eq $addrType "External" -}}
+{{- $isExternalName := and $isExternal (ne $extName "") -}}
+{{- $isExternalIP := and $isExternal (ne $extIP "") -}}
+{{- $addressResourceName := "" -}}
+{{- if $isReserved -}}{{- $addressResourceName = "address" -}}{{- end -}}
+{{- if $isExternalName -}}{{- $addressResourceName = "address-observed" -}}{{- end -}}
+{{- $observedAddressIP := "" -}}
+{{- $targetFromAddress := ne $addressResourceName "" -}}
+{{- if $targetFromAddress -}}
+{{- $observedAddressIP = dig "status" "atProvider" "address" "" (getComposedResource . $addressResourceName) -}}
+{{- end -}}
 {{- $providerConfig := dig "providerConfigName" "default" $spec -}}
 {{- $saEmail := dig "status" "atProvider" "email" "" (getComposedResource . "service-account") -}}
-{{- $addressIP := dig "status" "atProvider" "address" "" (getComposedResource . "address") -}}
+{{- $nics := dig "status" "atProvider" "networkInterface" (list) (getComposedResource . "instance") -}}
+{{- /* An observed VM keeps its own service account: rendering an empty email is a stop/replace diff. */ -}}
+{{- $instanceSAEmail := $saEmail -}}
+{{- if eq $instanceSAEmail "" -}}
+{{- $instanceSAEmail = dig "status" "atProvider" "serviceAccount" "email" "" (getComposedResource . "instance") -}}
+{{- end -}}
+{{- $instanceObserved := hasKey (dig "resources" (dict) .observed) "instance" -}}
+{{- if and $instanceObserved (eq $instanceSAEmail "") }}
+{{- fail "instance observed without a service-account email" }}
+{{- end }}
+{{- $observedNatIP := "" -}}
+{{- if gt (len $nics) 0 -}}
+{{- $acs := dig "accessConfig" (list) (index $nics 0) -}}
+{{- if gt (len $acs) 0 -}}
+{{- $observedNatIP = dig "natIp" "" (index $acs 0) -}}
+{{- end -}}
+{{- end -}}
+{{- $targetIPKnown := true -}}
+{{- if $targetFromAddress -}}
+{{- $targetIPKnown = ne $observedAddressIP "" -}}
+{{- end -}}
+{{- $targetIP := "" -}}
+{{- if $isExternalIP -}}
+{{- $targetIP = $extIP -}}
+{{- else if $targetFromAddress -}}
+{{- $targetIP = $observedAddressIP -}}
+{{- end -}}
 {{- $tcpPorts := list -}}
 {{- $udpPorts := list (toString $spec.wgListenPort) -}}
 {{- range (dig "allowedPorts" (list) $spec) -}}
@@ -15,20 +58,24 @@
 {{- $udpPorts = append $udpPorts (toString .port) -}}
 {{- end -}}
 {{- end -}}
-{{- $address := "" -}}
-{{- if $reservedIP -}}
-{{- $address = $addressIP -}}
-{{- else -}}
-{{- $nics := dig "status" "atProvider" "networkInterface" (list) (getComposedResource . "instance") -}}
-{{- if gt (len $nics) 0 -}}
-{{- $acs := dig "accessConfig" (list) (index $nics 0) -}}
-{{- if gt (len $acs) 0 -}}
-{{- $address = dig "natIp" "" (index $acs 0) -}}
+{{- $boundIP := $observedNatIP -}}
+{{- if and (not $isEphemeral) $targetIPKnown -}}{{- $boundIP = $targetIP -}}{{- end -}}
+{{- /* An observed Instance always re-renders: withholding it deletes the running VM. */ -}}
+{{- $instanceReady := or $instanceObserved (and (ne $saEmail "") $targetIPKnown) -}}
+{{- $message := "" -}}
+{{- range $name, $res := dig "resources" (dict) .observed -}}
+{{- if eq $message "" -}}
+{{- range dig "resource" "status" "conditions" (list) $res -}}
+{{- $ctype := dig "type" "" . -}}
+{{- $cstatus := dig "status" "" . -}}
+{{- $cmsg := dig "message" "" . -}}
+{{- if and (eq $message "") (or (eq $ctype "Synced") (eq $ctype "Ready")) (eq $cstatus "False") (ne $cmsg "") -}}
+{{- $message = printf "%s: %s" $name $cmsg -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- $instanceReady := and (ne $saEmail "") (or (not $reservedIP) (ne $addressIP "")) -}}
-{{- if ne $saEmail "" }}
+{{- end -}}
+{{- if ne $instanceSAEmail "" }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1
 kind: Firewall
@@ -42,7 +89,7 @@ spec:
       - 0.0.0.0/0
     network: {{ $spec.sharedNetworkName | quote }}
     targetServiceAccounts:
-      - {{ $saEmail | quote }}
+      - {{ $instanceSAEmail | quote }}
     allow:
       {{- if gt (len $tcpPorts) 0 }}
       - protocol: tcp
@@ -60,7 +107,7 @@ spec:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
-{{- if and (ne $saEmail "") (dig "enableOsLogin" true $spec) }}
+{{- if and (ne $instanceSAEmail "") (dig "enableOsLogin" true $spec) }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1
 kind: Firewall
@@ -74,7 +121,7 @@ spec:
       - 35.235.240.0/20
     network: {{ $spec.sharedNetworkName | quote }}
     targetServiceAccounts:
-      - {{ $saEmail | quote }}
+      - {{ $instanceSAEmail | quote }}
     allow:
       - protocol: tcp
         ports:
@@ -83,7 +130,7 @@ spec:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
-{{- if $reservedIP }}
+{{- if $isReserved }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1
 kind: Address
@@ -93,6 +140,22 @@ metadata:
 spec:
   forProvider:
     addressType: EXTERNAL
+    region: {{ $region | quote }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if $isExternalName }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Address
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: address-observed
+    crossplane.io/external-name: {{ $extName | quote }}
+spec:
+  managementPolicies: ["Observe"]
+  forProvider:
     region: {{ $region | quote }}
   providerConfigRef:
     name: {{ $providerConfig | quote }}
@@ -140,7 +203,7 @@ spec:
   providerConfigRef:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
-{{- if ne $saEmail "" }}
+{{- if ne $instanceSAEmail "" }}
 ---
 apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
 kind: SecretIAMMember
@@ -150,7 +213,7 @@ metadata:
 spec:
   forProvider:
     role: roles/secretmanager.secretAccessor
-    member: {{ printf "serviceAccount:%s" $saEmail | quote }}
+    member: {{ printf "serviceAccount:%s" $instanceSAEmail | quote }}
     secretIdSelector:
       matchControllerRef: true
   providerConfigRef:
@@ -206,13 +269,13 @@ spec:
     networkInterface:
       - network: {{ $spec.sharedNetworkName | quote }}
         accessConfig:
-          {{- if $reservedIP }}
-          - natIp: {{ $addressIP | quote }}
-          {{- else }}
+          {{- if or $isEphemeral (eq $boundIP "") }}
           - {}
+          {{- else }}
+          - natIp: {{ $boundIP | quote }}
           {{- end }}
     serviceAccount:
-      email: {{ $saEmail | quote }}
+      email: {{ $instanceSAEmail | quote }}
       scopes:
         - https://www.googleapis.com/auth/cloud-platform
     desiredStatus: RUNNING
@@ -231,9 +294,12 @@ spec:
 apiVersion: infra.wgnet.dev/v1alpha1
 kind: XGatewayGCP
 status:
-  {{- if ne $address "" }}
-  address: {{ $address | quote }}
+  {{- if ne $boundIP "" }}
+  address: {{ $boundIP | quote }}
   {{- end }}
   {{- if ne $saEmail "" }}
   serviceAccountEmail: {{ $saEmail | quote }}
+  {{- end }}
+  {{- if ne $message "" }}
+  message: {{ $message | quote }}
   {{- end }}

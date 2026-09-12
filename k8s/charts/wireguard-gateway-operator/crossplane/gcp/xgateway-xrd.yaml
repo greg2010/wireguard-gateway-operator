@@ -29,7 +29,15 @@ spec:
                 userData: { type: string }
                 sharedNetworkName: { type: string }
                 providerConfigName: { type: string }
-                reservedIP: { type: boolean }
+                address:
+                  type: object
+                  properties:
+                    type: { type: string }
+                    external:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        ip: { type: string }
                 projectID: { type: string }
                 wgListenPort: { type: integer }
                 wgMTU: { type: integer }
@@ -59,3 +67,4 @@ spec:
               properties:
                 address: { type: string }
                 serviceAccountEmail: { type: string }
+                message: { type: string }
