@@ -305,7 +305,8 @@ in-cluster `service` name, and an optional `targetPort` (defaults to `port`).
 
 `spec.gcp` holds the GCP placement: `projectID` (required), `region` (required),
 `zone` (required), and the defaulted `machineType`, `image`, `diskSizeGB`,
-`subnetCIDR`, `reservedIP`, and `spot`. `spec.wireguard` holds the tunnel
+`address`, and `spot`. `address` selects the VM's public ingress address; see
+below. `spec.wireguard` holds the tunnel
 parameters, all defaulted: `listenPort` (the gateway VM's WireGuard UDP port,
 range 1–65535), `subnet`, `gatewayAddress`, `linkAddress`, `keepalive`, `mtu`,
 and `reconcileInterval`. An omitted `spec.wireguard` yields the standard tunnel.
@@ -358,10 +359,43 @@ server:
 - At most 64 forwards per Gateway.
 
 The `ADDRESS` column is the gateway VM's public IP, mirrored onto
-`status.address` once provisioning completes; `READY` reflects the `Ready`
+`status.address` once provisioning completes; for `type: External` this is the
+address reserved outside the operator. `READY` reflects the `Ready`
 condition and `POLICY` the traffic policy. `kubectl get gateway -o wide` adds
 `NODE`, the node holding the link Lease. With `dnsHostnames` set and external-dns
 running, the listed names resolve to that IP.
+
+`spec.gcp.address` selects where the gateway VM's public ingress address comes
+from, `Reserved` by default:
+
+```yaml
+spec:
+  gcp:
+    address:
+      type: Reserved   # or: Ephemeral
+---
+spec:
+  gcp:
+    address:
+      type: External
+      external:
+        name: prod-edge-ip   # a GCP regional Address resource name
+---
+spec:
+  gcp:
+    address:
+      type: External
+      external:
+        ip: 203.0.113.42     # a literal reserved external IPv4
+```
+
+For `type: External`, the address must already exist in `spec.gcp.projectID` /
+`spec.gcp.region`; the operator never creates or deletes it.
+
+**Upgrading**: a Gateway that carried `reservedIP: false` reads as
+`address.type: Reserved` after the CRD upgrade and is given a new reserved
+address on its next reconcile. Set `address.type: Ephemeral` explicitly to keep
+the old behaviour.
 
 ## Traffic policy
 
@@ -465,14 +499,16 @@ The composition rebuilds it in roughly two minutes, during which the tunnel and
 every forwarded port are down. `NetworkPolicy` and forward changes need none of
 this; they reconcile in place.
 
-With `reservedIP: true` the rebuilt instance reattaches the same reserved
-address. With `reservedIP: false` it takes an ephemeral one, so even this
+With `address.type: Reserved` or `External` the rebuilt instance reattaches the
+same address. With `address.type: Ephemeral` it takes a new one, so even this
 instance-only rebuild lands on a new public IP and every `dnsHostnames` name has
 to re-propagate.
 
 Do not widen the deletion to force a rebuild. Deleting the `XGatewayGCP`
-composite destroys the Address, Firewall, service account, Secrets, and Instance
-and releases the reserved public IP, though the VPC survives. Deleting the last
+composite destroys the Address (`address.type: Reserved` only), Firewall,
+service account, Secrets, and Instance; an operator-created `Reserved` address is
+released, an `External` address stays reserved and unattached, and the VPC
+survives. Deleting the last
 `Gateway` CR in the cluster additionally tears down the VPC, which is refcounted
 across Gateways.
 
