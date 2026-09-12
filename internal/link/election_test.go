@@ -1971,11 +1971,14 @@ func TestEndCycleWaitsForRegistration(t *testing.T) {
 			}
 			var pending atomic.Bool
 			lock := newAcquisitionLock(nil)
+			torndown := make(chan struct{})
+			close(torndown)
 			cycle := &leadershipCycle{
 				cancelElection: func() { record("cancel") },
 				pending:        &pending,
 				lock:           lock,
 				registered:     make(chan struct{}),
+				teardownDone:   torndown,
 			}
 			if tc.acquired {
 				lock.once.Do(func() { close(lock.acquired) })

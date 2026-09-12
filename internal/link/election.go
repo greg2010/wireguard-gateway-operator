@@ -106,6 +106,8 @@ type leadershipCycle struct {
 	// registered is closed once lead has stored the reload loop's signals, which the
 	// acquire write can precede.
 	registered chan struct{}
+	// teardownDone is closed once the lead callback's fence and fault-clear write have returned.
+	teardownDone chan struct{}
 
 	mu         sync.Mutex
 	ended      bool
@@ -263,6 +265,7 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 			pending:        &pendingFence,
 			lock:           lock,
 			registered:     make(chan struct{}),
+			teardownDone:   make(chan struct{}),
 		}
 		stopShutdownWatch := context.AfterFunc(gctx, func() {
 			d.endCycle(outerCtx, cycle, "reason", "shutdown")
@@ -292,6 +295,9 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 					watchCtx, cancelWatch := context.WithCancel(leaderCtx)
 					reloadDone := make(chan struct{})
 					cycle.lead(cancelWatch, reloadDone)
+					// Ordered against endCycle's wait: it must observe this cycle's fence and any
+					// fault-clear write as returned before it cancels the elector's context.
+					defer close(cycle.teardownDone)
 					var steppedDown atomic.Bool
 					if d.ew != nil {
 						endCycle := func() { d.endCycle(outerCtx, cycle, "reason", "handoff") }
@@ -395,9 +401,8 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 	return nil
 }
 
-// endCycle releases in order: refuse a new acquisition, stop the reload loop and wait for it to
-// exit, fence, then cancel the elector, so the Lease goes free no earlier than the fence. An
-// acquisition write that outlives the retry bound and then lands is fenced after its release.
+// endCycle fences an acquired cycle, waits for the lead callback's writes, then cancels the
+// elector. A late acquisition write that outlives the retry bound is fenced after its release.
 func (d *electionDeps) endCycle(ctx context.Context, c *leadershipCycle, kv ...any) {
 	c.mu.Lock()
 	c.ended = true
@@ -421,6 +426,9 @@ func (d *electionDeps) endCycle(ctx context.Context, c *leadershipCycle, kv ...a
 			stop()
 			<-reloadDone
 			d.fenceCycle(ctx, c, kv...)
+			// The lead callback may still be clearing the fault it seeded; releasing the
+			// Lease before that write returns can race it and duplicate the release event.
+			<-c.teardownDone
 		}
 	}
 	c.cancelElection()
