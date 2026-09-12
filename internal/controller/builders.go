@@ -131,7 +131,30 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 	id := gcpID(gw.Namespace, gw.Name)
 	image := effectiveGCPImage(gw)
 	diskSizeGB := int(effectiveGCPDiskSizeGB(gw))
-	reservedIP := effectiveGCPReservedIP(gw)
+	addr := effectiveGCPAddress(gw)
+	addrType := string(addr.Type)
+	xgAddress := &struct {
+		External *struct {
+			Ip   *string `json:"ip,omitempty"` //nolint:revive // name fixed by the generated composite schema
+			Name *string `json:"name,omitempty"`
+		} `json:"external,omitempty"`
+		Type *string `json:"type,omitempty"`
+	}{Type: &addrType}
+	if addr.External != nil {
+		extName := addr.External.Name
+		extIP := addr.External.IP
+		ext := &struct {
+			Ip   *string `json:"ip,omitempty"` //nolint:revive // name fixed by the generated composite schema
+			Name *string `json:"name,omitempty"`
+		}{}
+		if extName != "" {
+			ext.Name = &extName
+		}
+		if extIP != "" {
+			ext.Ip = &extIP
+		}
+		xgAddress.External = ext
+	}
 	spot := effectiveGCPSpot(gw)
 	projectID := gw.Spec.GCP.ProjectID
 	wgGatewayAddress := effectiveWGGatewayAddress(gw)
@@ -139,6 +162,7 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 	wgSubnet := effectiveWGSubnet(gw)
 
 	spec := gcp.XGatewayGCPSpec{
+		Address:            xgAddress,
 		Region:             gw.Spec.GCP.Region,
 		Zone:               gw.Spec.GCP.Zone,
 		MachineType:        gw.Spec.GCP.MachineType,
@@ -153,7 +177,6 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 		WgSubnet:           &wgSubnet,
 		ProjectID:          &projectID,
 		TrafficPolicy:      new(strings.ToLower(string(effectiveTrafficPolicy(gw)))),
-		ReservedIP:         &reservedIP,
 		Spot:               &spot,
 		EnableOsLogin:      new(cfg.EnableOSLogin),
 		ServiceAccountId:   &id,
@@ -274,13 +297,14 @@ func effectiveGCPDiskSizeGB(gw *wgnetv1alpha1.Gateway) int32 {
 	return gw.Spec.GCP.DiskSizeGB
 }
 
-// effectiveGCPReservedIP returns whether a static external IP is allocated,
-// defaulting a nil pointer to true to mirror the CRD default.
-func effectiveGCPReservedIP(gw *wgnetv1alpha1.Gateway) bool {
-	if gw.Spec.GCP.ReservedIP == nil {
-		return true
+// effectiveGCPAddress returns the address block, defaulting an unset Type to Reserved
+// for in-memory Gateways that bypassed CRD defaulting.
+func effectiveGCPAddress(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.GatewayGCPAddressSpec {
+	addr := gw.Spec.GCP.Address
+	if addr.Type == "" {
+		addr.Type = wgnetv1alpha1.GatewayGCPAddressReserved
 	}
-	return *gw.Spec.GCP.ReservedIP
+	return addr
 }
 
 func effectiveGCPSpot(gw *wgnetv1alpha1.Gateway) bool {

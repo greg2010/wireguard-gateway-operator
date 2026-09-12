@@ -180,7 +180,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if lerr != nil {
 			return r.fail(ctx, &gw, "read link activity", lerr)
 		}
-		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", false, invalid, ls); serr != nil {
+		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", false, invalid, ls, ""); serr != nil {
 			return ctrl.Result{}, fmt.Errorf("mirror status: %w", serr)
 		}
 		result := ctrl.Result{}
@@ -208,7 +208,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.fail(ctx, &gw, "ensure xgatewaygcp", err)
 	}
 
-	address, saEmail, err := r.readXGatewayGCPStatus(ctx, &gw)
+	address, saEmail, message, err := r.readXGatewayGCPStatus(ctx, &gw)
 	if err != nil {
 		return r.fail(ctx, &gw, "read xgatewaygcp status", err)
 	}
@@ -227,7 +227,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	ready := address != "" && ls.Active && len(invalid) == 0 && ls.FaultReason == ""
-	if err := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ready, invalid, ls); err != nil {
+	if err := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ready, invalid, ls, message); err != nil {
 		return ctrl.Result{}, fmt.Errorf("mirror status: %w", err)
 	}
 
@@ -520,9 +520,8 @@ func (r *GatewayReconciler) releaseAfterSharedNetwork(ctx context.Context, gw *w
 	return ctrl.Result{RequeueAfter: validationRequeueAfter}, nil
 }
 
-// releaseFinalizer deletes the link workload before reaping the Lease and ClusterRoleBinding: no
-// owner-ref reaps the Lease and a live elector re-creates it. The pod wait is bounded so one stuck
-// Terminating cannot strand the namespace; an elector on a partitioned node can re-create it.
+// Deletes the link workload before the Lease and ClusterRoleBinding: nothing owner-reaps the Lease
+// and a live elector re-creates it. The pod wait is bounded so one stuck Terminating cannot strand.
 func (r *GatewayReconciler) releaseFinalizer(ctx context.Context, gw *wgnetv1alpha1.Gateway) (ctrl.Result, error) {
 	if err := r.deleteLinkWorkload(ctx, gw); err != nil {
 		return ctrl.Result{}, err
@@ -962,25 +961,29 @@ func (r *GatewayReconciler) xgatewayGCPExists(ctx context.Context, gw *wgnetv1al
 	return true, nil
 }
 
-// readXGatewayGCPStatus reads the composite's observed address and serviceAccountEmail.
-// A missing composite yields empty values: the apply has not yet propagated.
-func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnetv1alpha1.Gateway) (address, saEmail string, err error) {
+// readXGatewayGCPStatus reads the composite's observed address, serviceAccountEmail and
+// message. A missing composite yields empty values: the apply has not yet propagated.
+func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnetv1alpha1.Gateway) (address, saEmail, message string, err error) {
 	xg := newXGatewayGCP()
 	if err := r.Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}, xg); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", "", nil
+			return "", "", "", nil
 		}
-		return "", "", fmt.Errorf("get xgatewaygcp: %w", err)
+		return "", "", "", fmt.Errorf("get xgatewaygcp: %w", err)
 	}
 	address, _, err = unstructured.NestedString(xg.Object, "status", "address")
 	if err != nil {
-		return "", "", fmt.Errorf("read status.address: %w", err)
+		return "", "", "", fmt.Errorf("read status.address: %w", err)
 	}
 	saEmail, _, err = unstructured.NestedString(xg.Object, "status", "serviceAccountEmail")
 	if err != nil {
-		return "", "", fmt.Errorf("read status.serviceAccountEmail: %w", err)
+		return "", "", "", fmt.Errorf("read status.serviceAccountEmail: %w", err)
 	}
-	return address, saEmail, nil
+	message, _, err = unstructured.NestedString(xg.Object, "status", "message")
+	if err != nil {
+		return "", "", "", fmt.Errorf("read status.message: %w", err)
+	}
+	return address, saEmail, message, nil
 }
 
 // linkStatus is what the operator observes about a Gateway's link from the Lease and
@@ -1068,9 +1071,9 @@ func (r *GatewayReconciler) linkStatusOf(ctx context.Context, gw *wgnetv1alpha1.
 	return ls, nil
 }
 
-// mirrorStatusWithForwards sets Ready, preferring an invalid forward over a link fault over
-// Ready over Provisioning. An unchanged status is not written, to avoid a write loop.
-func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway, address, saEmail string, ready bool, invalid []invalidForward, ls linkStatus) error {
+// Ready precedence: invalid forward, then link fault, then ready, then provisioning. An unchanged
+// status is not written, to avoid a write loop; compositeMessage reaches Provisioning only.
+func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway, address, saEmail string, ready bool, invalid []invalidForward, ls linkStatus, compositeMessage string) error {
 	cond := metav1.Condition{Type: conditionReady}
 	switch {
 	case len(invalid) > 0:
@@ -1089,6 +1092,9 @@ func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wg
 		cond.Status = metav1.ConditionFalse
 		cond.Reason = reasonProvisioning
 		cond.Message = "waiting for gateway address and active link tunnel"
+		if m := truncateFaultMessage(compositeMessage); m != "" {
+			cond.Message += ": " + m
+		}
 	}
 
 	// Earlier SSA applies stale the in-memory resourceVersion, so the write re-Gets a
