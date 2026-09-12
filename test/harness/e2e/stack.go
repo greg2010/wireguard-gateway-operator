@@ -395,7 +395,7 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 			s.log.Warn("test failed; preserving per-test resources", zap.String("ns", stack.Namespace))
 			return
 		}
-		// Bounded under the whole-binary `go test -timeout 10m` so a slow drain is not
+		// Bounded under the whole-binary `go test -timeout 15m` so a slow drain is not
 		// SIGKILLed mid-flight and left leaking the VM.
 		cctx, cancel := context.WithTimeout(context.Background(), orphanDrainTimeout+3*time.Minute)
 		defer cancel()
