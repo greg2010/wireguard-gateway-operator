@@ -50,10 +50,8 @@ type GatewaySpec struct {
 	// +kubebuilder:default=gcp
 	Provider CloudProvider `json:"provider,omitempty"`
 
-	// TrafficPolicy selects the data path. Cluster masquerades tunnel egress at the
-	// gateway VM and DNATs to a Service ClusterIP; Local preserves the client source
-	// address and DNATs to a ready backend pod on the node holding the link Lease.
-	// Immutable: the VM's ruleset is baked at boot.
+	// Cluster masquerades tunnel egress at the VM and DNATs to a Service ClusterIP; Local keeps the
+	// client source address and DNATs to a ready pod on the link Lease holder's node. Immutable.
 	// +optional
 	// +kubebuilder:validation:Enum=Cluster;Local
 	// +kubebuilder:default=Cluster
@@ -93,14 +91,54 @@ type GatewayGCPSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	DiskSizeGB int32 `json:"diskSizeGB,omitempty"`
 
-	// ReservedIP allocates a static external IP so the address survives an
-	// instance replace.
-	// +kubebuilder:default=true
-	ReservedIP *bool `json:"reservedIP,omitempty"`
+	// Address selects the gateway VM's public ingress address. Every value has a
+	// default, so the block may be omitted.
+	// +optional
+	// +kubebuilder:default={}
+	Address GatewayGCPAddressSpec `json:"address"`
 
 	// Spot runs the gateway VM as a preemptible spot instance.
 	// +kubebuilder:default=false
 	Spot bool `json:"spot,omitempty"`
+}
+
+// GatewayGCPAddressType selects where the gateway VM's public ingress address comes from.
+type GatewayGCPAddressType string
+
+const (
+	GatewayGCPAddressEphemeral GatewayGCPAddressType = "Ephemeral"
+	GatewayGCPAddressReserved  GatewayGCPAddressType = "Reserved"
+	GatewayGCPAddressExternal  GatewayGCPAddressType = "External"
+)
+
+// GatewayGCPAddressSpec selects the gateway VM's public ingress address.
+// +kubebuilder:validation:XValidation:rule="(has(self.type) && self.type == 'External') == has(self.external)",message="spec.gcp.address.external is required when type is External and forbidden otherwise"
+type GatewayGCPAddressSpec struct {
+	// Ephemeral takes whatever address the instance is assigned; Reserved allocates a static regional
+	// address alongside the VM; External binds an address reserved outside the operator.
+	// +optional
+	// +kubebuilder:validation:Enum=Ephemeral;Reserved;External
+	// +kubebuilder:default=Reserved
+	Type GatewayGCPAddressType `json:"type,omitempty"`
+
+	// External identifies the pre-existing regional external address to bind. It must
+	// live in spec.gcp.projectID and spec.gcp.region.
+	// +optional
+	External *GatewayGCPExternalAddress `json:"external,omitempty"`
+}
+
+// GatewayGCPExternalAddress identifies an address the operator neither creates nor deletes.
+// +kubebuilder:validation:XValidation:rule="has(self.name) != has(self.ip)",message="spec.gcp.address.external must set exactly one of name and ip"
+type GatewayGCPExternalAddress struct {
+	// Name is the GCP regional Address resource name.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name,omitempty"`
+
+	// IP is the literal IPv4 address of a reserved regional external address.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$`
+	IP string `json:"ip,omitempty"`
 }
 
 // GatewayWireguardSpec is the WireGuard tunnel configuration shared by the
@@ -188,9 +226,8 @@ type Forward struct {
 
 // GatewayLinkStatus is the observed state of a Gateway's link workload.
 type GatewayLinkStatus struct {
-	// ID is the per-Gateway link id allocated in Local mode, in 1..250, and 0 in Cluster
-	// mode. Once written it is never recomputed or reassigned: the interface name,
-	// nftables table, firewall mark, route table and health port all derive from it.
+	// Link id allocated in Local mode, 0 in Cluster mode. Never reassigned once written: interface
+	// name, nftables table, firewall mark, route table and health port all derive from it.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=250
 	// +optional
