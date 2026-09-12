@@ -219,8 +219,13 @@ func TestBuildXGatewayGCP(t *testing.T) {
 	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "diskSizeGB"); got != int64(effectiveGCPDiskSizeGB(gw)) {
 		t.Errorf("diskSizeGB = %d, want %d", got, effectiveGCPDiskSizeGB(gw))
 	}
-	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "reservedIP"); got != effectiveGCPReservedIP(gw) {
-		t.Errorf("reservedIP = %v, want %v", got, effectiveGCPReservedIP(gw))
+	wantAddr := map[string]any{"type": "Reserved"}
+	gotAddr, found, err := unstructured.NestedMap(u.Object, "spec", "address")
+	if err != nil || !found {
+		t.Fatalf("read spec.address: found=%v err=%v", found, err)
+	}
+	if !reflect.DeepEqual(gotAddr, wantAddr) {
+		t.Errorf("spec.address = %#v, want %#v", gotAddr, wantAddr)
 	}
 	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "enableOsLogin"); got != cfg.EnableOSLogin {
 		t.Errorf("enableOsLogin = %v, want %v", got, cfg.EnableOSLogin)
@@ -261,6 +266,98 @@ func TestBuildXGatewayGCP(t *testing.T) {
 
 	if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "status"); found {
 		t.Errorf("buildXGatewayGCP must not set status; serviceAccountEmail is GCP-observed")
+	}
+}
+
+// TestBuildXGatewayGCPAddress pins the 1:1 mapping from spec.gcp.address to the composite's
+// spec.address for each form, including the zero block's Reserved default.
+func TestBuildXGatewayGCPAddress(t *testing.T) {
+	cfg := testConfig()
+	tests := []struct {
+		name string
+		addr wgnetv1alpha1.GatewayGCPAddressSpec
+		want map[string]any
+	}{
+		{
+			name: "zero block defaults to Reserved",
+			addr: wgnetv1alpha1.GatewayGCPAddressSpec{},
+			want: map[string]any{"type": "Reserved"},
+		},
+		{
+			name: "explicit reserved",
+			addr: wgnetv1alpha1.GatewayGCPAddressSpec{Type: wgnetv1alpha1.GatewayGCPAddressReserved},
+			want: map[string]any{"type": "Reserved"},
+		},
+		{
+			name: "ephemeral",
+			addr: wgnetv1alpha1.GatewayGCPAddressSpec{Type: wgnetv1alpha1.GatewayGCPAddressEphemeral},
+			want: map[string]any{"type": "Ephemeral"},
+		},
+		{
+			name: "external by name",
+			addr: wgnetv1alpha1.GatewayGCPAddressSpec{
+				Type:     wgnetv1alpha1.GatewayGCPAddressExternal,
+				External: &wgnetv1alpha1.GatewayGCPExternalAddress{Name: "prod-edge-ip"},
+			},
+			want: map[string]any{"type": "External", "external": map[string]any{"name": "prod-edge-ip"}},
+		},
+		{
+			name: "external by ip",
+			addr: wgnetv1alpha1.GatewayGCPAddressSpec{
+				Type:     wgnetv1alpha1.GatewayGCPAddressExternal,
+				External: &wgnetv1alpha1.GatewayGCPExternalAddress{IP: "34.76.10.20"},
+			},
+			want: map[string]any{"type": "External", "external": map[string]any{"ip": "34.76.10.20"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.GCP.Address = tt.addr
+
+			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+			if err != nil {
+				t.Fatalf("buildXGatewayGCP: %v", err)
+			}
+			got, found, err := unstructured.NestedMap(u.Object, "spec", "address")
+			if err != nil || !found {
+				t.Fatalf("read spec.address: found=%v err=%v", found, err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("spec.address = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBuildXGatewayGCPKeySet pins the composite's exact spec key set: a stray or
+// dropped field fails here even when no other test reads it.
+func TestBuildXGatewayGCPKeySet(t *testing.T) {
+	cfg := testConfig()
+	gw := newGateway("edge", "wg-system",
+		[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP}},
+		nil,
+	)
+
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	if err != nil {
+		t.Fatalf("buildXGatewayGCP: %v", err)
+	}
+	specMap, found, err := unstructured.NestedMap(u.Object, "spec")
+	if err != nil || !found {
+		t.Fatalf("read spec: found=%v err=%v", found, err)
+	}
+	got := slices.Sorted(maps.Keys(specMap))
+	want := []string{
+		"address", "allowedPorts", "crossplane", "diskSizeGB", "enableOsLogin", "image",
+		"machineType", "projectID", "providerConfigName", "region", "secretId",
+		"serviceAccountId", "sharedNetworkName", "spot", "trafficPolicy", "userData",
+		"wgGatewayAddress", "wgKeySecretRef", "wgLinkAddress", "wgListenPort", "wgMTU",
+		"wgSubnet", "zone",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("spec keys = %v, want %v", got, want)
 	}
 }
 

@@ -8,8 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,13 +40,28 @@ const (
 	// testRegion is the region every fixture XR requests.
 	testRegion = "us-central1"
 
-	// reservedAddr is the external IP the observed Address reports; the reservedIP
-	// case asserts it surfaces on the instance accessConfig natIp and the XR status.
+	// reservedAddr is the external IP the observed Address reports; the Reserved and
+	// External cases assert it surfaces on the instance accessConfig natIp and the XR status.
 	reservedAddr = "203.0.113.7"
 
 	// ephemeralNatIP is the external IP the provider writes back on the observed NIC
-	// when reservedIP is false; the no-reservation case reads the XR status from it.
+	// under type Ephemeral; the ephemeral cases read the XR status from it.
 	ephemeralNatIP = "198.51.100.22"
+
+	// externalAddrName is the name of a pre-existing GCP address the External + name
+	// form adopts through an observe-only composed Address.
+	externalAddrName = "prod-edge-ip"
+
+	// priorNatIP is the address an already-running instance reports back while the
+	// target address is still unknown; the VM must keep it rather than lose its IP.
+	priorNatIP = "203.0.113.99"
+
+	// targetNatIP is the address the composed Address reports once it is allocated.
+	targetNatIP = "203.0.113.100"
+
+	// priorSAEmail is the service-account email an already-running instance reports at
+	// status.atProvider, which it must keep while the composed service account is silent.
+	priorSAEmail = "prior@wgnet-test.iam.gserviceaccount.com"
 
 	// saEmail is the service-account email the observed service-account reports at
 	// status.atProvider.email, gating the instance, secret IAM member, and XR status.
@@ -92,9 +111,11 @@ func TestXGatewayGCPComposition(t *testing.T) {
 		spec     map[string]any
 		observed map[string]*fnv1.Resource
 		assert   func(t *testing.T, resp *fnv1.RunFunctionResponse)
+		// wantRenderErr, when set, expects the render to fail with an error containing it.
+		wantRenderErr string
 	}{
 		{
-			name: "reserved IP with mixed tcp/udp ports renders full stack",
+			name: "reserved with mixed tcp/udp ports renders full stack",
 			spec: map[string]any{
 				"region":             testRegion,
 				"zone":               testRegion + "-a",
@@ -103,7 +124,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				"diskSizeGB":         30,
 				"sharedNetworkName":  sharedNetworkName,
 				"providerConfigName": providerConfigName,
-				"reservedIP":         true,
+				"address":            map[string]any{"type": "Reserved"},
 				"userData":           "#cloud-config\n",
 				"wgListenPort":       51820,
 				"wgMTU":              1380,
@@ -124,19 +145,16 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				},
 			},
 			observed: map[string]*fnv1.Resource{
-				"service-account": observedResource(t, "service-account", map[string]any{
-					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
-					"kind":       "ServiceAccount",
-					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
-				"address": observedResource(t, "address", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Address",
-					"status":     map[string]any{"atProvider": map[string]any{"address": reservedAddr}},
-				}),
+				"service-account": observedServiceAccount(t),
+				"address":         observedAddress(t, "address", reservedAddr),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
+
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
 
 				fw := desiredResource(t, resp, "firewall")
 				if got := nestedString(t, fw, "spec", "forProvider", "direction"); got != "INGRESS" {
@@ -155,9 +173,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				assertSameSet(t, "firewall tcp ports", tcpPorts, []string{"443", "80"})
 				udpPorts := allowPorts(t, allow, "udp")
 				assertSameSet(t, "firewall udp ports", udpPorts, []string{"1194", "51820"})
-				if hasProtocol(allow, "icmp") {
-					t.Errorf("firewall allow must not open icmp to the internet, got %v", allow)
-				}
+				assertSameSet(t, "firewall protocols", allowProtocols(t, allow), []string{"tcp", "udp"})
 
 				// enableOsLogin is omitted from this spec, so the template's dig
 				// default governs and the IAP SSH firewall rule must be desired.
@@ -176,9 +192,10 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				assertSameSet(t, "firewall-iap tcp ports", allowPorts(t, iapAllow, "tcp"), []string{"22"})
 
 				addr := desiredResource(t, resp, "address")
-				if got := nestedString(t, addr, "spec", "forProvider", "addressType"); got != "EXTERNAL" {
-					t.Errorf("address addressType = %q, want EXTERNAL", got)
-				}
+				assertAddressForProvider(t, addr, map[string]any{
+					"addressType": "EXTERNAL",
+					"region":      testRegion,
+				})
 
 				secVer := desiredResource(t, resp, "secret-version")
 				if got := nestedString(t, secVer, "spec", "forProvider", "secretDataSecretRef", "name"); got != "gateway-wg-key" {
@@ -244,11 +261,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 					t.Errorf("instance providerConfigRef.name = %q, want %q", got, providerConfigName)
 				}
 
-				natIP := nestedString(t, inst,
-					"spec", "forProvider", "networkInterface", "0", "accessConfig", "0", "natIp")
-				if natIP != reservedAddr {
-					t.Errorf("instance natIp = %q, want reserved address %q", natIP, reservedAddr)
-				}
+				assertAccessConfig(t, inst, reservedAddr)
 
 				instRes := resp.GetDesired().GetResources()["instance"]
 				if instRes.GetReady() == fnv1.Ready_READY_FALSE {
@@ -256,12 +269,29 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				}
 
 				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
 				if got := digString(status, "address"); got != reservedAddr {
 					t.Errorf("XR status.address = %q, want reserved address %q", got, reservedAddr)
 				}
 				if got := digString(status, "serviceAccountEmail"); got != saEmail {
 					t.Errorf("XR status.serviceAccountEmail = %q, want %q", got, saEmail)
 				}
+			},
+		},
+		{
+			name: "reserved rendering, enableOsLogin false",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, map[string]any{"enableOsLogin": false}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"address":         observedAddress(t, "address", reservedAddr),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), reservedAddr)
 			},
 		},
 		{
@@ -273,7 +303,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				"zone":              testRegion + "-a",
 				"machineType":       "e2-small",
 				"sharedNetworkName": sharedNetworkName,
-				"reservedIP":        false,
+				"address":           map[string]any{"type": "Ephemeral"},
 				"wgListenPort":      51820,
 				"serviceAccountId":  "gateway",
 				"secretId":          gatewaySecretID,
@@ -283,95 +313,353 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				},
 			},
 			observed: map[string]*fnv1.Resource{
-				"service-account": observedResource(t, "service-account", map[string]any{
-					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
-					"kind":       "ServiceAccount",
-					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
-				"instance": observedResource(t, "instance", map[string]any{
-					"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
-					"kind":       "Instance",
-					"status": map[string]any{
-						"atProvider": map[string]any{
-							"networkInterface": []any{
-								map[string]any{
-									"accessConfig": []any{
-										map[string]any{"natIp": ephemeralNatIP},
-									},
-								},
-							},
-						},
-					},
-				}),
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, ephemeralNatIP),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
-				if _, ok := resp.GetDesired().GetResources()["address"]; ok {
-					t.Errorf("address must not be desired when reservedIP is false")
-				}
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
 
 				inst := desiredResource(t, resp, "instance")
 				assertSharedNetworkNIC(t, inst)
 				if got := nestedString(t, inst, "spec", "forProvider", "desiredStatus"); got != "RUNNING" {
 					t.Errorf("instance desiredStatus = %q, want RUNNING", got)
 				}
-				nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")
-				if len(nics) == 0 {
-					t.Fatalf("instance has no networkInterface")
-				}
-				nic0, ok := nics[0].(map[string]any)
-				if !ok {
-					t.Fatalf("networkInterface[0] is %T, want map", nics[0])
-				}
-				ac, ok := nic0["accessConfig"].([]any)
-				if !ok || len(ac) == 0 {
-					t.Fatalf("networkInterface[0].accessConfig is %T/%v, want non-empty slice", nic0["accessConfig"], nic0["accessConfig"])
-				}
-				ac0, ok := ac[0].(map[string]any)
-				if !ok {
-					t.Fatalf("accessConfig[0] is %T, want map", ac[0])
-				}
-				if _, ok := ac0["natIp"]; ok {
-					t.Errorf("ephemeral accessConfig must not pin a natIp, got %v", ac0["natIp"])
-				}
+				assertAccessConfig(t, inst, "")
 				if got := nestedString(t, inst, "spec", "providerConfigRef", "name"); got != "default" {
 					t.Errorf("instance providerConfigRef.name = %q, want default (providerConfigName omitted from spec)", got)
 				}
 
 				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
 				if got := digString(status, "address"); got != ephemeralNatIP {
 					t.Errorf("XR status.address = %q, want ephemeral natIp %q", got, ephemeralNatIP)
 				}
 			},
 		},
 		{
-			name: "spot emits SPOT scheduling block",
-			spec: map[string]any{
-				"region":             testRegion,
-				"zone":               testRegion + "-a",
-				"machineType":        "e2-small",
-				"sharedNetworkName":  sharedNetworkName,
-				"providerConfigName": providerConfigName,
-				"reservedIP":         false,
-				"spot":               true,
-				"enableOsLogin":      false,
-				"wgListenPort":       51820,
-				"serviceAccountId":   "gateway",
-				"secretId":           gatewaySecretID,
-				"wgKeySecretRef": map[string]any{
-					"name": "gateway-wg-key",
-					"key":  "private",
-				},
+			name: "ephemeral rendering, enableOsLogin false",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, map[string]any{"enableOsLogin": false}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, ephemeralNatIP),
 			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), "")
+			},
+		},
+		{
+			name: "external by ip renders no address",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"ip": reservedAddr},
+			}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), reservedAddr)
+
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != reservedAddr {
+					t.Errorf("XR status.address = %q, want the spec literal %q", got, reservedAddr)
+				}
+			},
+		},
+		{
+			name: "external by ip, enableOsLogin false",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"ip": reservedAddr},
+			}, map[string]any{"enableOsLogin": false}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), reservedAddr)
+			},
+		},
+		{
+			name: "external by name renders observe-only address",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"name": externalAddrName},
+			}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", reservedAddr),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+
+				addr := desiredResource(t, resp, "address-observed")
+				policies := nestedSlice(t, addr, "spec", "managementPolicies")
+				assertSameSet(t, "address-observed managementPolicies", toStrings(t, policies), []string{"Observe"})
+				if got := nestedString(t, addr, "metadata", "annotations", "crossplane.io/external-name"); got != externalAddrName {
+					t.Errorf("address-observed external-name = %q, want %q", got, externalAddrName)
+				}
+				assertAddressForProvider(t, addr, map[string]any{"region": testRegion})
+				if got := nestedString(t, addr, "spec", "providerConfigRef", "name"); got != providerConfigName {
+					t.Errorf("address-observed providerConfigRef.name = %q, want %q", got, providerConfigName)
+				}
+
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), reservedAddr)
+
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != reservedAddr {
+					t.Errorf("XR status.address = %q, want observed address %q", got, reservedAddr)
+				}
+			},
+		},
+		{
+			name: "first render withholds instance until address-observed reports an address",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"name": externalAddrName},
+			}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", ""),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall", "firewall-iap",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"serviceAccountEmail"})
+			},
+		},
+		{
+			name: "first render withholds instance, enableOsLogin false",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"name": externalAddrName},
+			}, map[string]any{"enableOsLogin": false}),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", ""),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"serviceAccountEmail"})
+			},
+		},
+		{
+			name: "external by name, enableOsLogin false, admits the instance",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"name": externalAddrName},
+			}, map[string]any{"enableOsLogin": false}),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", reservedAddr),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), reservedAddr)
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"address", "serviceAccountEmail"})
+			},
+		},
+		{
+			name: "observed instance keeps its own natIp until the target is known",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, priorNatIP),
+				"address":         observedAddress(t, "address", ""),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), priorNatIP)
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != priorNatIP {
+					t.Errorf("XR status.address = %q, want the observed natIp %q", got, priorNatIP)
+				}
+			},
+		},
+		{
+			name: "observed instance without a reported NIC stays rendered while the target is unknown",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, ""),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), "")
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"serviceAccountEmail"})
+			},
+		},
+		{
+			name: "observed instance keeps its own service-account email until the service account reports",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"instance": observedInstanceWithServiceAccount(t, priorNatIP, priorSAEmail),
+				"address":  observedAddress(t, "address", targetNatIP),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				inst := desiredResource(t, resp, "instance")
+				assertInstanceServiceAccount(t, inst, priorSAEmail)
+				assertAccessConfig(t, inst, targetNatIP)
+				assertSharedNetworkNIC(t, inst)
+				fwSAs := nestedSlice(t, desiredResource(t, resp, "firewall"), "spec", "forProvider", "targetServiceAccounts")
+				assertSameSet(t, "firewall targetServiceAccounts", toStrings(t, fwSAs), []string{priorSAEmail})
+				iapSAs := nestedSlice(t, desiredResource(t, resp, "firewall-iap"), "spec", "forProvider", "targetServiceAccounts")
+				assertSameSet(t, "firewall-iap targetServiceAccounts", toStrings(t, iapSAs), []string{priorSAEmail})
+				iam := desiredResource(t, resp, "secret-iam")
+				if got := nestedString(t, iam, "spec", "forProvider", "member"); got != "serviceAccount:"+priorSAEmail {
+					t.Errorf("secret-iam member = %q, want serviceAccount:%s", got, priorSAEmail)
+				}
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address"})
+				if got := digString(status, "address"); got != targetNatIP {
+					t.Errorf("XR status.address = %q, want reserved address %q", got, targetNatIP)
+				}
+			},
+		},
+		{
+			name: "observed instance adopts the reserved address once it reports",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, priorNatIP),
+				"address":         observedAddress(t, "address", targetNatIP),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address", "firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+				assertAccessConfig(t, desiredResource(t, resp, "instance"), targetNatIP)
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != targetNatIP {
+					t.Errorf("XR status.address = %q, want reserved address %q", got, targetNatIP)
+				}
+			},
+		},
+		{
+			name: "instance observed with no email source fails the render",
+			spec: gcpSpec(map[string]any{"type": "Reserved"}, nil),
 			observed: map[string]*fnv1.Resource{
 				"service-account": observedResource(t, "service-account", map[string]any{
 					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
 					"kind":       "ServiceAccount",
-					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
+					"status":     map[string]any{"atProvider": map[string]any{}},
 				}),
+				"instance": observedInstance(t, priorNatIP),
+				"address":  observedAddress(t, "address", targetNatIP),
+			},
+			wantRenderErr: "instance observed without a service-account email",
+		},
+		{
+			name:     "empty observed set renders the reserved pre-instance stack",
+			spec:     gcpSpec(map[string]any{"type": "Reserved"}, nil),
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{"address", "secret", "secret-version", "service-account"})
+			},
+		},
+		{
+			name:     "empty observed set renders the ephemeral pre-instance stack",
+			spec:     gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{"secret", "secret-version", "service-account"})
+			},
+		},
+		{
+			name: "empty observed set renders the external-by-ip pre-instance stack",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"ip": reservedAddr},
+			}, nil),
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{"secret", "secret-version", "service-account"})
+			},
+		},
+		{
+			name: "empty observed set renders the external-by-name pre-instance stack",
+			spec: gcpSpec(map[string]any{
+				"type":     "External",
+				"external": map[string]any{"name": externalAddrName},
+			}, nil),
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{"address-observed", "secret", "secret-version", "service-account"})
+			},
+		},
+		{
+			name: "spot emits SPOT scheduling block",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, map[string]any{
+				"spot":          true,
+				"enableOsLogin": false,
+			}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
+				// OS Login is disabled on this spec, so IAP SSH has no way in and the
+				// IAP firewall rule stays out of the desired set.
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+
 				inst := desiredResource(t, resp, "instance")
 				if got := nestedString(t, inst, "spec", "forProvider", "scheduling", "provisioningModel"); got != "SPOT" {
 					t.Errorf("instance scheduling.provisioningModel = %q, want SPOT", got)
@@ -392,74 +680,30 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "enable-oslogin"); got != "FALSE" {
 					t.Errorf("instance metadata enable-oslogin = %q, want FALSE (enableOsLogin=false)", got)
 				}
-				// OS Login is disabled on this spec, so IAP SSH has no way in and the
-				// IAP firewall rule must not be desired.
-				if _, ok := resp.GetDesired().GetResources()["firewall-iap"]; ok {
-					t.Errorf("firewall-iap must not be desired when enableOsLogin is false")
-				}
-			},
-		},
-		{
-			name: "instance and iam withheld until SA email is observed",
-			spec: map[string]any{
-				"region":             testRegion,
-				"zone":               testRegion + "-a",
-				"machineType":        "e2-small",
-				"sharedNetworkName":  sharedNetworkName,
-				"providerConfigName": providerConfigName,
-				"reservedIP":         false,
-				"wgListenPort":       51820,
-				"serviceAccountId":   "gateway",
-				"secretId":           gatewaySecretID,
-				"wgKeySecretRef": map[string]any{
-					"name": "gateway-wg-key",
-					"key":  "private",
-				},
-			},
-			observed: map[string]*fnv1.Resource{},
-			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
-				t.Helper()
-				if _, ok := resp.GetDesired().GetResources()["service-account"]; !ok {
-					t.Errorf("service-account must always be desired")
-				}
-				assertWithheld(t, resp, "firewall")
-				assertWithheld(t, resp, "instance")
-				assertWithheld(t, resp, "secret-iam")
 			},
 		},
 		{
 			// A non-default wgListenPort and projectID must flow verbatim onto the instance
 			// metadata, so keyfetch reads the per-Gateway value, not a chart-baked one.
 			name: "non-default wgListenPort and projectID reach instance metadata",
-			spec: map[string]any{
-				"region":             testRegion,
-				"zone":               testRegion + "-a",
-				"machineType":        "e2-small",
-				"sharedNetworkName":  sharedNetworkName,
-				"providerConfigName": providerConfigName,
-				"reservedIP":         false,
-				"wgListenPort":       51999,
-				"wgMTU":              1280,
-				"wgGatewayAddress":   "10.50.0.1",
-				"wgLinkAddress":      "10.50.0.2",
-				"wgSubnet":           "10.50.0.0/29",
-				"projectID":          "other-project",
-				"serviceAccountId":   "gateway",
-				"secretId":           gatewaySecretID,
-				"wgKeySecretRef": map[string]any{
-					"name": "gateway-wg-key",
-					"key":  "private",
-				},
-			},
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, map[string]any{
+				"wgListenPort":     51999,
+				"wgMTU":            1280,
+				"wgGatewayAddress": "10.50.0.1",
+				"wgLinkAddress":    "10.50.0.2",
+				"wgSubnet":         "10.50.0.0/29",
+				"projectID":        "other-project",
+			}),
 			observed: map[string]*fnv1.Resource{
-				"service-account": observedResource(t, "service-account", map[string]any{
-					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
-					"kind":       "ServiceAccount",
-					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
+				"service-account": observedServiceAccount(t),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
+
 				inst := desiredResource(t, resp, "instance")
 				wantMeta := map[string]string{
 					"wg-listen-port":     "51999",
@@ -493,51 +737,119 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			// keyfetch.sh turns traffic-policy=local into the postrouting return verdict, so
 			// the VM stops masquerading tunnel egress and the client source survives.
 			name: "trafficPolicy local reaches instance metadata",
-			spec: map[string]any{
-				"region":             testRegion,
-				"zone":               testRegion + "-a",
-				"machineType":        "e2-small",
-				"sharedNetworkName":  sharedNetworkName,
-				"providerConfigName": providerConfigName,
-				"reservedIP":         false,
-				"wgListenPort":       51820,
-				"wgMTU":              1380,
-				"wgGatewayAddress":   "10.99.0.1",
-				"wgLinkAddress":      "10.99.0.2",
-				"wgSubnet":           "10.99.0.0/29",
-				"projectID":          testProjectID,
-				"trafficPolicy":      "local",
-				"serviceAccountId":   "gateway",
-				"secretId":           gatewaySecretID,
-				"wgKeySecretRef": map[string]any{
-					"name": "gateway-wg-key",
-					"key":  "private",
-				},
-			},
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, map[string]any{
+				"wgGatewayAddress": "10.99.0.1",
+				"wgLinkAddress":    "10.99.0.2",
+				"wgSubnet":         "10.99.0.0/29",
+				"projectID":        testProjectID,
+				"trafficPolicy":    "local",
+			}),
 			observed: map[string]*fnv1.Resource{
-				"service-account": observedResource(t, "service-account", map[string]any{
-					"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
-					"kind":       "ServiceAccount",
-					"status":     map[string]any{"atProvider": map[string]any{"email": saEmail}},
-				}),
+				"service-account": observedServiceAccount(t),
 			},
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "firewall-iap", "instance",
+					"secret", "secret-iam", "secret-version", "service-account",
+				})
 				inst := desiredResource(t, resp, "instance")
 				if got := nestedString(t, inst, "spec", "forProvider", "metadata", "traffic-policy"); got != "local" {
 					t.Errorf("instance metadata traffic-policy = %q, want local", got)
 				}
 			},
 		},
+		{
+			name: "the first not-ready composed resource publishes its message",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+				"instance":        observedInstance(t, "", condition("Synced", "False", "ReconcileError", "boom")),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"message", "serviceAccountEmail"})
+				if got := digString(status, "message"); got != "instance: boom" {
+					t.Errorf("XR status.message = %q, want %q", got, "instance: boom")
+				}
+			},
+		},
+		{
+			name: "two not-ready composed resources publish the lexically first name",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"secret": observedSecret(t, condition("Synced", "False", "ReconcileError", "secret boom")),
+				"service-account": observedServiceAccount(t,
+					condition("Synced", "False", "ReconcileError", "sa boom")),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"message", "serviceAccountEmail"})
+				if got := digString(status, "message"); got != "secret: secret boom" {
+					t.Errorf("XR status.message = %q, want %q", got, "secret: secret boom")
+				}
+			},
+		},
+		{
+			name: "ready composed resources publish no message",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t, condition("Ready", "True", "Available", "")),
+				"instance":        observedInstance(t, ephemeralNatIP, condition("Ready", "True", "Available", "")),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"address", "serviceAccountEmail"})
+			},
+		},
+		{
+			name: "an empty-message condition is skipped for a later real message",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"secret": observedSecret(t, condition("Ready", "False", "Creating", "")),
+				"service-account": observedServiceAccount(t,
+					condition("Synced", "False", "ReconcileError", "M")),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"message", "serviceAccountEmail"})
+				if got := digString(status, "message"); got != "service-account: M" {
+					t.Errorf("XR status.message = %q, want %q", got, "service-account: M")
+				}
+			},
+		},
+		{
+			name: "only empty-message conditions publish no message",
+			spec: gcpSpec(map[string]any{"type": "Ephemeral"}, nil),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t, condition("Ready", "False", "Creating", "")),
+				"instance":        observedInstance(t, ephemeralNatIP, condition("Ready", "False", "Creating", "")),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"address", "serviceAccountEmail"})
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if (tt.assert == nil) == (tt.wantRenderErr == "") {
+				t.Fatalf("row %q must set exactly one of assert and wantRenderErr", tt.name)
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
 			req := rf.buildRequestFor(t, template, "XGatewayGCP", tt.spec, tt.observed)
 			resp, err := rf.client.RunFunction(ctx, req)
+			if tt.wantRenderErr != "" {
+				assertRenderFailed(t, resp, err, tt.wantRenderErr)
+				return
+			}
 			if err != nil {
 				t.Fatalf("RunFunction: %v", err)
 			}
@@ -817,16 +1129,24 @@ func desiredResource(t *testing.T, resp *fnv1.RunFunctionResponse, name string) 
 	return res.GetResource().AsMap()
 }
 
-// assertWithheld fails unless the named resource is absent from desired or marked
-// Ready=READY_FALSE: both encode "not yet actionable" under the auto-ready contract.
-func assertWithheld(t *testing.T, resp *fnv1.RunFunctionResponse, name string) {
+// assertRenderFailed fails unless the render reported an error whose text contains want,
+// either as the RPC error or as a fatal result.
+func assertRenderFailed(t *testing.T, resp *fnv1.RunFunctionResponse, err error, want string) {
 	t.Helper()
-	res, ok := resp.GetDesired().GetResources()[name]
-	if !ok {
-		return
+	got := ""
+	if err != nil {
+		got = err.Error()
 	}
-	if res.GetReady() != fnv1.Ready_READY_FALSE {
-		t.Errorf("resource %q is desired with Ready=%v, want absent or READY_FALSE", name, res.GetReady())
+	for _, res := range resp.GetResults() {
+		if res.GetSeverity() == fnv1.Severity_SEVERITY_FATAL {
+			got = res.GetMessage()
+		}
+	}
+	if got == "" {
+		t.Fatalf("render succeeded with desired resources %v, want an error containing %q", desiredKeys(resp), want)
+	}
+	if !strings.Contains(got, want) {
+		t.Fatalf("render error = %q, want it to contain %q", got, want)
 	}
 }
 
@@ -835,8 +1155,8 @@ func assertWithheld(t *testing.T, resp *fnv1.RunFunctionResponse, name string) {
 func assertSharedNetworkNIC(t *testing.T, inst map[string]any) {
 	t.Helper()
 	nics := nestedSlice(t, inst, "spec", "forProvider", "networkInterface")
-	if len(nics) == 0 {
-		t.Fatalf("instance has no networkInterface")
+	if len(nics) != 1 {
+		t.Fatalf("instance has %d networkInterface entries, want exactly 1", len(nics))
 	}
 	nic0, ok := nics[0].(map[string]any)
 	if !ok {
@@ -845,11 +1165,9 @@ func assertSharedNetworkNIC(t *testing.T, inst map[string]any) {
 	if got, _ := nic0["network"].(string); got != sharedNetworkName {
 		t.Errorf("instance networkInterface[0].network = %q, want shared network %q", got, sharedNetworkName)
 	}
-	if _, ok := nic0["subnetwork"]; ok {
-		t.Errorf("instance networkInterface[0] must not pin a subnetwork, got %v", nic0["subnetwork"])
-	}
-	if _, ok := nic0["subnetworkSelector"]; ok {
-		t.Errorf("instance networkInterface[0] must not pin a subnetworkSelector, got %v", nic0["subnetworkSelector"])
+	wantKeys := []string{"accessConfig", "network"}
+	if got := slices.Sorted(maps.Keys(nic0)); !slices.Equal(got, wantKeys) {
+		t.Errorf("instance networkInterface[0] keys = %v, want %v", got, wantKeys)
 	}
 }
 
@@ -865,6 +1183,187 @@ func compositeStatus(t *testing.T, resp *fnv1.RunFunctionResponse) map[string]an
 		t.Fatalf("desired composite has no status map; got %v", comp.GetResource().AsMap())
 	}
 	return status
+}
+
+// gcpSpec returns the XGatewayGCP spec the address cases share, carrying the given
+// address block with per-case overrides applied on top.
+func gcpSpec(address, overrides map[string]any) map[string]any {
+	spec := map[string]any{
+		"region":             testRegion,
+		"zone":               testRegion + "-a",
+		"machineType":        "e2-small",
+		"sharedNetworkName":  sharedNetworkName,
+		"providerConfigName": providerConfigName,
+		"wgListenPort":       51820,
+		"wgMTU":              1380,
+		"serviceAccountId":   "gateway",
+		"secretId":           gatewaySecretID,
+		"wgKeySecretRef": map[string]any{
+			"name": "gateway-wg-key",
+			"key":  "private",
+		},
+		"address": address,
+	}
+	for k, v := range overrides {
+		spec[k] = v
+	}
+	return spec
+}
+
+// condition builds a status.conditions entry. An empty message is omitted, the shape
+// Crossplane publishes for Creating and Unavailable.
+func condition(ctype, status, reason, message string) map[string]any {
+	c := map[string]any{"type": ctype, "status": status, "reason": reason}
+	if message != "" {
+		c["message"] = message
+	}
+	return c
+}
+
+// observedServiceAccount is the observed service-account carrying the email the
+// template gates the firewall, secret IAM member and instance on.
+func observedServiceAccount(t *testing.T, conditions ...map[string]any) *fnv1.Resource {
+	t.Helper()
+	return observedResource(t, "service-account", map[string]any{
+		"apiVersion": "cloudplatform.gcp.m.upbound.io/v1beta1",
+		"kind":       "ServiceAccount",
+		"status": withConditions(map[string]any{
+			"atProvider": map[string]any{"email": saEmail},
+		}, conditions),
+	})
+}
+
+func observedSecret(t *testing.T, conditions ...map[string]any) *fnv1.Resource {
+	t.Helper()
+	return observedResource(t, "secret", map[string]any{
+		"apiVersion": "secretmanager.gcp.m.upbound.io/v1beta1",
+		"kind":       "Secret",
+		"status":     withConditions(map[string]any{"atProvider": map[string]any{}}, conditions),
+	})
+}
+
+// observedAddress is the observed Address under composition-resource-name name. An empty
+// ip leaves status.atProvider without an address, the state before GCP allocates one.
+func observedAddress(t *testing.T, name, ip string, conditions ...map[string]any) *fnv1.Resource {
+	t.Helper()
+	atProvider := map[string]any{}
+	if ip != "" {
+		atProvider["address"] = ip
+	}
+	return observedResource(t, name, map[string]any{
+		"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
+		"kind":       "Address",
+		"status":     withConditions(map[string]any{"atProvider": atProvider}, conditions),
+	})
+}
+
+// observedInstance is the observed Instance. An empty natIP leaves status.atProvider
+// without a networkInterface, the state before the VM reports its NIC.
+func observedInstance(t *testing.T, natIP string, conditions ...map[string]any) *fnv1.Resource {
+	t.Helper()
+	atProvider := map[string]any{}
+	if natIP != "" {
+		atProvider["networkInterface"] = []any{
+			map[string]any{"accessConfig": []any{map[string]any{"natIp": natIP}}},
+		}
+	}
+	return observedResource(t, "instance", map[string]any{
+		"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
+		"kind":       "Instance",
+		"status":     withConditions(map[string]any{"atProvider": atProvider}, conditions),
+	})
+}
+
+// observedInstanceWithServiceAccount is the observed Instance reporting both a natIp and
+// the service-account email GCP attached to the running VM.
+func observedInstanceWithServiceAccount(t *testing.T, natIP, email string) *fnv1.Resource {
+	t.Helper()
+	return observedResource(t, "instance", map[string]any{
+		"apiVersion": "compute.gcp.m.upbound.io/v1beta1",
+		"kind":       "Instance",
+		"status": map[string]any{
+			"atProvider": map[string]any{
+				"networkInterface": []any{
+					map[string]any{"accessConfig": []any{map[string]any{"natIp": natIP}}},
+				},
+				"serviceAccount": map[string]any{"email": email},
+			},
+		},
+	})
+}
+
+// assertInstanceServiceAccount fails unless the rendered instance's serviceAccount block is
+// exactly the given email plus the cloud-platform scope.
+func assertInstanceServiceAccount(t *testing.T, inst map[string]any, email string) {
+	t.Helper()
+	got := nestedMap(t, inst, "spec", "forProvider", "serviceAccount")
+	want := map[string]any{
+		"email":  email,
+		"scopes": []any{"https://www.googleapis.com/auth/cloud-platform"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("instance serviceAccount = %v, want %v", got, want)
+	}
+}
+
+// assertAddressForProvider fails unless the rendered Address's spec.forProvider is exactly want.
+func assertAddressForProvider(t *testing.T, addr map[string]any, want map[string]any) {
+	t.Helper()
+	got := nestedMap(t, addr, "spec", "forProvider")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("address forProvider = %v, want %v", got, want)
+	}
+}
+
+func withConditions(status map[string]any, conditions []map[string]any) map[string]any {
+	if len(conditions) == 0 {
+		return status
+	}
+	entries := make([]any, 0, len(conditions))
+	for _, c := range conditions {
+		entries = append(entries, c)
+	}
+	status["conditions"] = entries
+	return status
+}
+
+// assertExactDesiredNames fails unless resp's desired resource names are exactly want,
+// compared as sets: an omission and a leak both fail the same way.
+func assertExactDesiredNames(t *testing.T, resp *fnv1.RunFunctionResponse, want []string) {
+	t.Helper()
+	assertSameSet(t, "desired resource names", desiredKeys(resp), want)
+}
+
+// assertExactStatusKeys fails unless the XR's desired status carries exactly want as its
+// top-level keys.
+func assertExactStatusKeys(t *testing.T, status map[string]any, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(status))
+	for k := range status {
+		got = append(got, k)
+	}
+	assertSameSet(t, "XR status keys", got, want)
+}
+
+// assertAccessConfig fails unless the instance's primary NIC carries exactly one
+// accessConfig entry, holding natIp want, or nothing at all when want is empty.
+func assertAccessConfig(t *testing.T, inst map[string]any, want string) {
+	t.Helper()
+	acs := nestedSlice(t, inst, "spec", "forProvider", "networkInterface", "0", "accessConfig")
+	if len(acs) != 1 {
+		t.Fatalf("instance accessConfig = %v, want exactly one entry", acs)
+	}
+	got, ok := acs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("instance accessConfig[0] is %T, want map", acs[0])
+	}
+	wantEntry := map[string]any{}
+	if want != "" {
+		wantEntry["natIp"] = want
+	}
+	if !reflect.DeepEqual(got, wantEntry) {
+		t.Errorf("instance accessConfig[0] = %v, want %v", got, wantEntry)
+	}
 }
 
 func desiredKeys(resp *fnv1.RunFunctionResponse) []string {
@@ -896,17 +1395,23 @@ func allowPorts(t *testing.T, allow []any, protocol string) []string {
 	return nil
 }
 
-func hasProtocol(allow []any, protocol string) bool {
+// allowProtocols returns the protocol of every firewall allow rule, so a case can
+// pin the exact rule set the template opens.
+func allowProtocols(t *testing.T, allow []any) []string {
+	t.Helper()
+	out := make([]string, 0, len(allow))
 	for _, raw := range allow {
 		rule, ok := raw.(map[string]any)
 		if !ok {
-			continue
+			t.Fatalf("allow rule is %T, want map", raw)
 		}
-		if rule["protocol"] == protocol {
-			return true
+		proto, ok := rule["protocol"].(string)
+		if !ok {
+			t.Fatalf("allow rule protocol is %T, want string", rule["protocol"])
 		}
+		out = append(out, proto)
 	}
-	return false
+	return out
 }
 
 // toStrings asserts every element is a string and returns them.
@@ -976,6 +1481,16 @@ func nestedSlice(t *testing.T, m map[string]any, path ...string) []any {
 		t.Fatalf("value at %v is %T, want slice", path, v)
 	}
 	return s
+}
+
+func nestedMap(t *testing.T, m map[string]any, path ...string) map[string]any {
+	t.Helper()
+	v := nested(t, m, path...)
+	mm, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("value at %v is %T, want map", path, v)
+	}
+	return mm
 }
 
 // nested walks m by path. A numeric segment indexes the current value as a

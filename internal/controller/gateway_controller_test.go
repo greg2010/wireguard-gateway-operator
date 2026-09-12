@@ -193,7 +193,7 @@ func TestReconcileLifecycle(t *testing.T) {
 	})
 
 	t.Run("status mirrored and endpoint rendered after composite reports address", func(t *testing.T) {
-		setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.9", "sa@example.iam.gserviceaccount.com")
+		setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.9", "sa@example.iam.gserviceaccount.com", "")
 		setLinkLeaseActive(ctx, t, cl, key, "edge-link-0", true, "node-a")
 		drainReconcile(ctx, t, r, key)
 
@@ -329,7 +329,7 @@ func TestReconcileIdempotent(t *testing.T) {
 
 			drainReconcile(ctx, t, r, key)
 			if tc.address != "" {
-				setXGatewayGCPStatus(ctx, t, cl, key, tc.address, tc.saEmail)
+				setXGatewayGCPStatus(ctx, t, cl, key, tc.address, tc.saEmail, "")
 				setLinkLeaseActive(ctx, t, cl, key, key.Name+"-link-0", true, "node-a")
 				drainReconcile(ctx, t, r, key)
 			}
@@ -594,24 +594,7 @@ func TestGatewayCELValidation(t *testing.T) {
 				typed.Spec.Link.Replicas = tt.linkReplicas
 				gw = typed
 			}
-			err := cl.Create(ctx, gw)
-
-			if tt.accept {
-				if err != nil {
-					t.Fatalf("create accepted Gateway: %v", err)
-				}
-				if delErr := cl.Delete(ctx, gw); delErr != nil {
-					t.Errorf("delete Gateway: %v", delErr)
-				}
-				return
-			}
-
-			if !apierrors.IsInvalid(err) {
-				t.Fatalf("create rejected Gateway: err = %v, want Invalid", err)
-			}
-			if tt.wantMessage != "" && !strings.Contains(err.Error(), tt.wantMessage) {
-				t.Errorf("rejection = %v, want it to mention %q", err, tt.wantMessage)
-			}
+			assertAdmission(ctx, t, cl, gw, cl.Create(ctx, gw), tt.accept, tt.wantMessage)
 		})
 	}
 }
@@ -1097,6 +1080,53 @@ func reconcileToClassification(ctx context.Context, t *testing.T, r *GatewayReco
 	return result
 }
 
+// TestGatewayReadyProvisioningMessage exercises the operator-side fold: the composite's
+// status.message is appended to the Provisioning Ready message, truncated like a link fault.
+func TestGatewayReadyProvisioningMessage(t *testing.T) {
+	const baseMsg = "waiting for gateway address and active link tunnel"
+	longM := strings.Repeat("m", 5000)
+	wantTruncated := baseMsg + ": " + longM[:maxFaultMessageBytes-len(faultMessageTruncationMarker)] + faultMessageTruncationMarker
+
+	tests := []struct {
+		name        string
+		address     string
+		saEmail     string
+		message     string
+		wantMessage string
+	}{
+		{name: "address empty, message empty", wantMessage: baseMsg},
+		{name: "address empty, message set", message: "address not found", wantMessage: baseMsg + ": address not found"},
+		{name: "address set, message empty", address: "203.0.113.60", wantMessage: baseMsg},
+		{name: "address set, message set", address: "203.0.113.60", message: "bind failed", wantMessage: baseMsg + ": bind failed"},
+		{name: "message over budget is truncated with the prefix kept", message: longM, wantMessage: wantTruncated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			te, r, _, key, _ := reconcileFixture(ctx, t)
+			cl := te.client
+
+			drainReconcile(ctx, t, r, key)
+			setXGatewayGCPStatus(ctx, t, cl, key, tt.address, tt.saEmail, tt.message)
+			drainReconcile(ctx, t, r, key)
+
+			var got wgnetv1alpha1.Gateway
+			mustGet(ctx, t, cl, key, &got)
+			c := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+			if c == nil {
+				t.Fatalf("Ready condition absent")
+			}
+			if c.Status != metav1.ConditionFalse || c.Reason != reasonProvisioning {
+				t.Fatalf("Ready = %s/%s, want False/Provisioning", c.Status, c.Reason)
+			}
+			if c.Message != tt.wantMessage {
+				t.Errorf("Ready message = %q, want %q", c.Message, tt.wantMessage)
+			}
+		})
+	}
+}
+
 func namespaceWithLabels(name string, labels map[string]string) *corev1.Namespace {
 	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 }
@@ -1117,9 +1147,9 @@ func mustGet(ctx context.Context, t *testing.T, cl client.Client, key client.Obj
 	}
 }
 
-// setXGatewayGCPStatus patches the composite's status subresource with an observed
-// address and serviceAccountEmail, simulating Crossplane's status write.
-func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, address, saEmail string) {
+// Simulates Crossplane's status write; an empty message leaves status.message unset, matching a
+// composite that never wrote it.
+func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, address, saEmail, message string) {
 	t.Helper()
 	xg := newXGatewayGCP()
 	mustGet(ctx, t, cl, key, xg)
@@ -1128,6 +1158,11 @@ func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, k
 	}
 	if err := unstructured.SetNestedField(xg.Object, saEmail, "status", "serviceAccountEmail"); err != nil {
 		t.Fatalf("set status.serviceAccountEmail: %v", err)
+	}
+	if message != "" {
+		if err := unstructured.SetNestedField(xg.Object, message, "status", "message"); err != nil {
+			t.Fatalf("set status.message: %v", err)
+		}
 	}
 	if err := cl.Status().Update(ctx, xg); err != nil {
 		t.Fatalf("update xgatewaygcp status: %v", err)
@@ -1488,7 +1523,7 @@ func TestLinkActiveReadyGate(t *testing.T) {
 			// Provision the Gateway, then give the composite an address so the address
 			// gate is satisfied and the Ready outcome turns solely on the active tunnel.
 			drainReconcile(ctx, t, r, key)
-			setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.30", "sa@example.iam.gserviceaccount.com")
+			setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.30", "sa@example.iam.gserviceaccount.com", "")
 
 			tt.arrange(t, ns, "gw-link-0")
 
@@ -1616,7 +1651,7 @@ func driveProvisionedReady(ctx context.Context, t *testing.T, direct client.Clie
 	// The lease and pod are not watched, so writing the watched composite status last lets its
 	// reconcile observe the address and the active tunnel together and flip Ready=True.
 	setLinkLeaseActive(ctx, t, direct, key, key.Name+"-link-0", true, "node-a")
-	setXGatewayGCPStatus(ctx, t, direct, key, "203.0.113.20", "sa@example.iam.gserviceaccount.com")
+	setXGatewayGCPStatus(ctx, t, direct, key, "203.0.113.20", "sa@example.iam.gserviceaccount.com", "")
 }
 
 // TestForwardValidationTransitions runs a real manager so the Service and Namespace watches
@@ -2020,13 +2055,7 @@ func TestGatewayTrafficPolicyImmutable(t *testing.T) {
 			}
 
 			got.Spec.TrafficPolicy = tt.update
-			err := cl.Update(ctx, &got)
-			if !apierrors.IsInvalid(err) {
-				t.Fatalf("update spec.trafficPolicy: err = %v, want Invalid", err)
-			}
-			if !strings.Contains(err.Error(), "spec.trafficPolicy is immutable") {
-				t.Errorf("rejection = %v, want it to mention the immutability rule", err)
-			}
+			assertAdmission(ctx, t, cl, &got, cl.Update(ctx, &got), false, "spec.trafficPolicy is immutable")
 		})
 	}
 }
@@ -2488,14 +2517,23 @@ func TestLinkReadyReasonPrecedence(t *testing.T) {
 		// holderReady drives the Lease holder pod's readiness gate.
 		holderReady bool
 		faultReason string
-		wantStatus  metav1.ConditionStatus
-		wantReason  string
+		// compositeMessage is the composite's status.message, which only the Provisioning
+		// arm folds in; a fault or an invalid forward must win the arm and drop it.
+		compositeMessage string
+		wantStatus       metav1.ConditionStatus
+		wantReason       string
+		// wantMessage, when non-nil, asserts the whole Ready message for a row's namespace.
+		wantMessage func(ns string) string
 	}{
 		{
-			name:        "no fault and a ready holder is Ready",
-			holderReady: true,
-			wantStatus:  metav1.ConditionTrue,
-			wantReason:  reasonReady,
+			name:             "no fault and a ready holder is Ready",
+			holderReady:      true,
+			compositeMessage: "address: cannot find address prod-edge",
+			wantStatus:       metav1.ConditionTrue,
+			wantReason:       reasonReady,
+			wantMessage: func(string) string {
+				return "gateway address provisioned and active link tunnel up"
+			},
 		},
 		{
 			name:        "fault outranks Ready",
@@ -2518,6 +2556,29 @@ func TestLinkReadyReasonPrecedence(t *testing.T) {
 			faultReason:  link.FaultApplyFailed,
 			wantStatus:   metav1.ConditionFalse,
 			wantReason:   reasonServiceNotFound,
+		},
+		{
+			name:             "fault outranks a composite message",
+			holderReady:      true,
+			faultReason:      link.FaultNoLocalEndpoint,
+			compositeMessage: "instance: quota exceeded",
+			wantStatus:       metav1.ConditionFalse,
+			wantReason:       link.FaultNoLocalEndpoint,
+			wantMessage: func(string) string {
+				return "link on node-a reported " + link.FaultNoLocalEndpoint
+			},
+		},
+		{
+			name:             "invalid forward outranks a composite message",
+			breakForward:     true,
+			holderReady:      true,
+			faultReason:      link.FaultApplyFailed,
+			compositeMessage: "instance: quota exceeded",
+			wantStatus:       metav1.ConditionFalse,
+			wantReason:       reasonServiceNotFound,
+			wantMessage: func(ns string) string {
+				return fmt.Sprintf("1 forward(s) invalid: forward backend Service %q in namespace %q not found yet", "web", ns)
+			},
 		},
 		{
 			name:        "unrecognised fault value is ignored",
@@ -2545,7 +2606,7 @@ func TestLinkReadyReasonPrecedence(t *testing.T) {
 			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 			drainReconcile(ctx, t, r, key)
-			setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.40", "sa@example.iam.gserviceaccount.com")
+			setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.40", "sa@example.iam.gserviceaccount.com", tt.compositeMessage)
 			setLinkLeaseActive(ctx, t, cl, key, "gw-link-0", tt.holderReady, "node-a")
 			setLinkLeaseFault(ctx, t, cl, key, tt.faultReason, "link on node-a reported "+tt.faultReason)
 
@@ -2568,6 +2629,11 @@ func TestLinkReadyReasonPrecedence(t *testing.T) {
 			if cond.Status != tt.wantStatus || cond.Reason != tt.wantReason {
 				t.Fatalf("Ready = %s/%s, want %s/%s (message %q)",
 					cond.Status, cond.Reason, tt.wantStatus, tt.wantReason, cond.Message)
+			}
+			if tt.wantMessage != nil {
+				if want := tt.wantMessage(ns); cond.Message != want {
+					t.Errorf("Ready message = %q, want %q", cond.Message, want)
+				}
 			}
 
 			if tt.wantReason != link.FaultRPFilterStrict {
@@ -2608,7 +2674,7 @@ func TestLinkStatusActiveNode(t *testing.T) {
 	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
 
 	drainReconcile(ctx, t, r, key)
-	setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.50", "sa@example.iam.gserviceaccount.com")
+	setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.50", "sa@example.iam.gserviceaccount.com", "")
 	setLinkLeaseActive(ctx, t, cl, key, "gw-link-0", true, "node-a")
 
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
