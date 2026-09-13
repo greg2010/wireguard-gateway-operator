@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -1003,6 +1004,61 @@ func (c *Client) WaitDeploymentAvailable(ctx context.Context, ns, name string, t
 		}
 		return false, nil
 	})
+}
+
+// WaitDeploymentRolledOut polls until the named Deployment's rollout is complete by the
+// kubectl rollout status rule, or the timeout elapses; the error then carries the last counters.
+func (c *Client) WaitDeploymentRolledOut(ctx context.Context, ns, name string, timeout time.Duration) error {
+	c.log.Info("waiting for deployment rollout",
+		zap.String("namespace", ns), zap.String("name", name))
+	var last *appsv1.Deployment
+	err := c.poll(ctx, timeout, 2*time.Second, func(ctx context.Context) (bool, error) {
+		dep, err := c.typed.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("get deployment %s/%s: %w", ns, name, err)
+		}
+		last = dep
+		return deploymentRolledOut(dep)
+	})
+	if err == nil {
+		return nil
+	}
+	if last == nil {
+		return fmt.Errorf("deployment %s/%s rollout: %w", ns, name, err)
+	}
+	want := int32(1)
+	if last.Spec.Replicas != nil {
+		want = *last.Spec.Replicas
+	}
+	return fmt.Errorf("deployment %s/%s rollout (generation %d observed %d; replicas %d updated %d available %d, want %d): %w",
+		ns, name, last.Generation, last.Status.ObservedGeneration,
+		last.Status.Replicas, last.Status.UpdatedReplicas, last.Status.AvailableReplicas, want, err)
+}
+
+// deploymentRolledOut reports whether dep's rollout is complete, mirroring
+// kubectl rollout status's DeploymentStatusViewer.Status logic.
+func deploymentRolledOut(dep *appsv1.Deployment) (bool, error) {
+	if dep.Generation > dep.Status.ObservedGeneration {
+		return false, nil
+	}
+	for _, cond := range dep.Status.Conditions {
+		if cond.Type == appsv1.DeploymentProgressing && cond.Reason == "ProgressDeadlineExceeded" {
+			return false, fmt.Errorf("deployment %s/%s exceeded its progress deadline", dep.Namespace, dep.Name)
+		}
+	}
+	if dep.Spec.Replicas != nil && dep.Status.UpdatedReplicas < *dep.Spec.Replicas {
+		return false, nil
+	}
+	if dep.Status.Replicas > dep.Status.UpdatedReplicas {
+		return false, nil
+	}
+	if dep.Status.AvailableReplicas < dep.Status.UpdatedReplicas {
+		return false, nil
+	}
+	return true, nil
 }
 
 // WorkerNodes returns the names of the cluster's schedulable worker nodes, sorted, so a

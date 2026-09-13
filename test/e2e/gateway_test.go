@@ -977,7 +977,11 @@ func TestGatewayLinkHA(t *testing.T) {
 				continue
 			}
 			standbys++
-			if podHasIface(ctx, t, client, stack.Namespace, pod, clusterLinkIface) {
+			hasIface, err := podHasIface(ctx, client, stack.Namespace, pod, clusterLinkIface)
+			if err != nil {
+				t.Fatalf("check %s for wg0: %v", pod, err)
+			}
+			if hasIface {
 				t.Errorf("standby %s has wg0; a demoted replica must not carry the interface", pod)
 			}
 			if podHasGatewayTable(ctx, t, client, stack.Namespace, pod) {
@@ -1040,8 +1044,8 @@ func TestGatewayLinkHA(t *testing.T) {
 		}
 		assertBackendMarker(t, during, stack.TCPBackendName)
 
-		if err := client.WaitDeploymentAvailable(ctx, stack.Namespace, leaseName, lifecycleReadyTimeout); err != nil {
-			t.Fatalf("link deployment not available after rolling update: %v", err)
+		if err := client.WaitDeploymentRolledOut(ctx, stack.Namespace, leaseName, lifecycleReadyTimeout); err != nil {
+			t.Fatalf("link deployment rollout not complete after restart: %v", err)
 		}
 
 		// The single-active invariant must survive the roll.
@@ -1112,7 +1116,11 @@ func assertSingleIfaceOwner(ctx context.Context, t *testing.T, client *hk8s.Clie
 		}
 		owners = nil
 		for _, pod := range pods {
-			if podHasIface(ctx, t, client, ns, pod, iface) {
+			has, err := podHasIface(ctx, client, ns, pod, iface)
+			if err != nil {
+				return err
+			}
+			if has {
 				owners = append(owners, pod)
 			}
 		}
@@ -1126,19 +1134,17 @@ func assertSingleIfaceOwner(ctx context.Context, t *testing.T, client *hk8s.Clie
 	return holder, owners
 }
 
-// podHasIface answers for the pod's node, since link pods run hostNetwork: only the active
-// replica carries the link's iface. An exec failure fails the test rather than reading false.
-func podHasIface(ctx context.Context, t *testing.T, client *hk8s.Client, ns, pod, iface string) bool {
-	t.Helper()
+// podHasIface reports whether the pod's node carries iface; link pods run hostNetwork.
+// A non-exit exec error (container not running yet, or gone) is returned so the caller retries.
+func podHasIface(ctx context.Context, client *hk8s.Client, ns, pod, iface string) (bool, error) {
 	_, stderr, err := client.ExecInPod(ctx, ns, pod, []string{"ip", "link", "show", iface})
 	if err == nil {
-		return true
+		return true, nil
 	}
 	if _, ok := errors.AsType[utilexec.CodeExitError](err); ok {
-		return false
+		return false, nil
 	}
-	t.Fatalf("ip link show %s in %s/%s: %v (stderr: %s)", iface, ns, pod, err, strings.TrimSpace(stderr))
-	return false
+	return false, fmt.Errorf("ip link show %s in %s/%s: %w (stderr: %s)", iface, ns, pod, err, strings.TrimSpace(stderr))
 }
 
 // podHasGatewayTable reports whether the inet gateway table is present. Only the active
@@ -1158,7 +1164,11 @@ func waitPodHasWG0(ctx context.Context, t *testing.T, client *hk8s.Client, ns, p
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
-		if podHasIface(dctx, t, client, ns, pod, clusterLinkIface) {
+		has, err := podHasIface(dctx, client, ns, pod, clusterLinkIface)
+		if err != nil {
+			t.Fatalf("check %s/%s for wg0: %v", ns, pod, err)
+		}
+		if has {
 			return nil
 		}
 		select {
