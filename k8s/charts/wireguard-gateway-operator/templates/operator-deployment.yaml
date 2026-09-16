@@ -59,6 +59,14 @@ spec:
               value: {{ .Values.operator.enableOsLogin | quote }}
             - name: GATEWAY_PROVIDER_CONFIG_NAME
               value: {{ .Values.operator.providerConfigName | quote }}
+            - name: GATEWAY_GCP_CREDENTIALS_SECRET
+              value: {{ printf "%s/%s" .Values.gcp.credentialsSecret.namespace .Values.gcp.credentialsSecret.name | quote }}
+            - name: GATEWAY_GCP_CREDENTIALS_KEY
+              value: {{ .Values.gcp.credentialsSecret.key | quote }}
+            - name: GATEWAY_GCP_DISCOVERY_INTERVAL
+              value: {{ .Values.gcp.discoveryInterval | quote }}
+            - name: GATEWAY_GCP_ADDRESS_REFRESH_INTERVAL
+              value: {{ .Values.gcp.addressRefreshInterval | quote }}
           ports:
             - name: health
               containerPort: {{ $healthPort }}

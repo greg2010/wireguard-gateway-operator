@@ -10,15 +10,18 @@ umask 077
 NETDEV_PATH=/etc/systemd/network/10-wg0.netdev
 NETWORK_PATH=/etc/systemd/network/20-wg0.network
 NFT_PATH=/etc/nftables/gateway.nft
-METADATA_BASE="http://metadata.google.internal/computeMetadata/v1/instance"
+# Overridable only so the integration proof can point at a controlled HTTP double;
+# unset in production, where these resolve to the values below.
+METADATA_BASE="${GATEWAY_KEYFETCH_METADATA_BASE:-http://metadata.google.internal/computeMetadata/v1/instance}"
+SECRETMANAGER_BASE="${GATEWAY_KEYFETCH_SECRETMANAGER_BASE:-https://secretmanager.googleapis.com}"
 METADATA_TOKEN_URL="$METADATA_BASE/service-accounts/default/token"
 METADATA_ATTR_BASE="$METADATA_BASE/attributes"
 
 modprobe wireguard 2>&1 || echo "gateway-keyfetch: modprobe wireguard returned nonzero (may be builtin)"
 
 extract_json_string() {
-	# Sufficient for the flat metadata token and Secret Manager responses, which
-	# carry no nested quotes in these fields.
+	# Sufficient for the flat metadata token, Secret Manager and bundle responses,
+	# which carry no nested quotes in these fields.
 	sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
@@ -46,9 +49,31 @@ fetch_metadata_attr() {
 	done
 }
 
+fetch_instance_attr() {
+	# Same polling shape as fetch_metadata_attr, but queries the instance resource
+	# directly ($METADATA_BASE/<attr>) rather than under attributes/.
+	attr="$1"
+	body_file="/tmp/gateway-instance-attr.json"
+	attempt=0
+	while true; do
+		attempt=$((attempt + 1))
+		http="$(curl -s --connect-timeout 5 --max-time 10 -o "$body_file" -w '%{http_code}' -H "Metadata-Flavor: Google" "$METADATA_BASE/$attr" || echo 000)"
+		echo "gateway-keyfetch: instance_attr=$attr attempt=$attempt http=$http" >&2
+		if [ "$http" = "200" ]; then
+			value="$(cat "$body_file")"
+			rm -f "$body_file" 2>/dev/null || true
+			printf '%s' "$value"
+			return 0
+		fi
+		rm -f "$body_file" 2>/dev/null || true
+		sleep 5
+	done
+}
+
 write_netdev() {
 	priv="$1"
 	peer_pub="$2"
+	peer_allowed_ips="$3"
 	cat > "$NETDEV_PATH.tmp" <<EOF
 [NetDev]
 Name=wg0
@@ -61,7 +86,7 @@ ListenPort=$wg_listen_port
 
 [WireGuardPeer]
 PublicKey=$peer_pub
-AllowedIPs=$wg_link_address/32
+AllowedIPs=$peer_allowed_ips
 EOF
 	chmod 0640 "$NETDEV_PATH.tmp"
 	chown root:systemd-network "$NETDEV_PATH.tmp"
@@ -69,23 +94,15 @@ EOF
 }
 
 write_network() {
-	# The wg0 address reuses the tunnel subnet's prefix length. A subnet without a
-	# '/' would make "${var##*/}" yield the whole string and emit a malformed
-	# Address= line, so reject it.
-	case "$wg_subnet" in
-		*/*) ;;
-		*)
-			echo "gateway-keyfetch: ERROR wg-subnet '$wg_subnet' has no '/' prefix length" >&2
-			exit 1
-			;;
-	esac
-	suffix="${wg_subnet##*/}"
+	# member_address is already CIDR (the bundle's "address" field), so no suffix
+	# computation is needed here.
+	member_address="$1"
 	cat > "$NETWORK_PATH.tmp" <<EOF
 [Match]
 Name=wg0
 
 [Network]
-Address=$wg_gateway_address/$suffix
+Address=$member_address
 EOF
 	chmod 0644 "$NETWORK_PATH.tmp"
 	mv "$NETWORK_PATH.tmp" "$NETWORK_PATH"
@@ -116,19 +133,18 @@ render_nft() {
 
 wg_listen_port="$(fetch_metadata_attr wg-listen-port)"
 wg_mtu="$(fetch_metadata_attr wg-mtu)"
-wg_gateway_address="$(fetch_metadata_attr wg-gateway-address)"
 wg_link_address="$(fetch_metadata_attr wg-link-address)"
-wg_subnet="$(fetch_metadata_attr wg-subnet)"
 traffic_policy="$(fetch_metadata_attr traffic-policy)"
 project_id="$(fetch_metadata_attr project-id)"
-secret_id="$(fetch_metadata_attr secret-id)"
+secret_id_base="$(fetch_metadata_attr secret-id)"
+own_name="$(fetch_instance_attr name)"
+secret_id="${secret_id_base}-${own_name}"
 
 wg_postrouting_verdict="$(postrouting_verdict "$traffic_policy")"
 
-write_network
 render_nft
 
-secret_url="https://secretmanager.googleapis.com/v1/projects/$project_id/secrets/$secret_id/versions/latest:access"
+secret_url="$SECRETMANAGER_BASE/v1/projects/$project_id/secrets/$secret_id/versions/latest:access"
 
 attempt=0
 while true; do
@@ -150,16 +166,20 @@ while true; do
 	fi
 
 	bundle="$(printf '%s' "$payload" | base64 -d 2>/dev/null)" || { echo "gateway-keyfetch: base64 decode failed"; sleep 5; continue; }
-	gateway_priv="$(printf '%s\n' "$bundle" | sed -n '1p')"
-	link_pub="$(printf '%s\n' "$bundle" | sed -n '2p')"
-	if [ -z "$gateway_priv" ] || [ -z "$link_pub" ]; then
-		echo "gateway-keyfetch: bundle parse empty (priv_empty=$([ -z "$gateway_priv" ] && echo yes || echo no) pub_empty=$([ -z "$link_pub" ] && echo yes || echo no))"
+	member_priv="$(printf '%s' "$bundle" | extract_json_string privateKey)"
+	member_address="$(printf '%s' "$bundle" | extract_json_string address)"
+	member_slot="$(printf '%s' "$bundle" | extract_json_string slot)"
+	member_peer_pub="$(printf '%s' "$bundle" | extract_json_string peerPublicKey)"
+	member_peer_allowed_ips="$(printf '%s' "$bundle" | extract_json_string peerAllowedIPs)"
+	if [ -z "$member_priv" ] || [ -z "$member_address" ] || [ -z "$member_peer_pub" ] || [ -z "$member_peer_allowed_ips" ]; then
+		echo "gateway-keyfetch: bundle parse empty (priv_empty=$([ -z "$member_priv" ] && echo yes || echo no) address_empty=$([ -z "$member_address" ] && echo yes || echo no) peer_pub_empty=$([ -z "$member_peer_pub" ] && echo yes || echo no) peer_allowed_ips_empty=$([ -z "$member_peer_allowed_ips" ] && echo yes || echo no))"
 		sleep 5
 		continue
 	fi
 
-	echo "gateway-keyfetch: bundle obtained on attempt=$attempt"
-	write_netdev "$gateway_priv" "$link_pub"
+	echo "gateway-keyfetch: bundle obtained on attempt=$attempt slot=${member_slot:-unknown}"
+	write_network "$member_address"
+	write_netdev "$member_priv" "$member_peer_pub" "$member_peer_allowed_ips"
 	break
 done
 rm -f /tmp/gateway-token.json /tmp/gateway-sm.json 2>/dev/null || true

@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - secrets
   - serviceaccounts
   verbs:
   - create
@@ -33,17 +34,6 @@ rules:
   verbs:
   - get
   - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - apps
@@ -145,6 +135,14 @@ rules:
   - clusterroles
   verbs:
   - bind
+- apiGroups:
+  - secretmanager.gcp.m.upbound.io
+  resources:
+  - secretiammembers
+  - secrets
+  - secretversions
+  verbs:
+  - get
 - apiGroups:
   - wgnet.dev
   resources:

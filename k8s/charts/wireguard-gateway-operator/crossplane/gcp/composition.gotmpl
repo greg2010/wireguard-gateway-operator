@@ -1,7 +1,18 @@
-{{- /* The WireGuard-key Secret named by spec.wgKeySecretRef must live in the XGatewayGCP's namespace; secretDataSecretRef resolves there. */ -}}
 {{- $xr := .observed.composite.resource -}}
 {{- $spec := $xr.spec -}}
 {{- $region := $spec.region -}}
+{{- $compositeName := dig "metadata" "name" "" $xr -}}
+{{- $loadBalanced := dig "loadBalanced" false $spec -}}
+{{- $zones := dig "zones" (list) $spec -}}
+{{- $targetSize := dig "targetSize" 0 $spec -}}
+{{- $healthPort := dig "healthPort" 0 $spec -}}
+{{- $sessionAffinity := dig "sessionAffinity" "NONE" $spec -}}
+{{- $members := dig "members" (list) $spec -}}
+{{- $templateRevision := dig "templateRevision" "" $spec -}}
+{{- $templateResourceName := printf "template-%s" $templateRevision -}}
+{{- $templateExternalName := printf "%s-%s" $compositeName $templateRevision -}}
+{{- $metadataStartupScript := printf "# gateway-bootstrap-revision: %s" $templateRevision -}}
+{{- $probeFirewallCIDRs := list "35.191.0.0/16" "209.85.204.0/22" "130.211.0.0/22" "209.85.152.0/22" -}}
 {{- $addrBlock := dig "address" (dict) $spec -}}
 {{- $addrType := dig "type" "Reserved" $addrBlock -}}
 {{- $external := dig "external" (dict) $addrBlock -}}
@@ -62,6 +73,58 @@
 {{- if and (not $isEphemeral) $targetIPKnown -}}{{- $boundIP = $targetIP -}}{{- end -}}
 {{- /* An observed Instance always re-renders: withholding it deletes the running VM. */ -}}
 {{- $instanceReady := or $instanceObserved (and (ne $saEmail "") $targetIPKnown) -}}
+{{- $templateObserved := hasKey (dig "resources" (dict) .observed) $templateResourceName -}}
+{{- $currentTemplateSelfLink := dig "status" "atProvider" "selfLink" "" (getComposedResource . $templateResourceName) -}}
+{{- $migObserved := hasKey (dig "resources" (dict) .observed) "mig" -}}
+{{- $migTemplateSelfLink := $currentTemplateSelfLink -}}
+{{- if and (eq $migTemplateSelfLink "") $migObserved -}}
+{{- $migVersions := dig "spec" "forProvider" "version" (list) (getComposedResource . "mig") -}}
+{{- if eq (len $migVersions) 0 -}}
+{{- fail "observed MIG has no version entry" -}}
+{{- end -}}
+{{- $migTemplateSelfLink = dig "instanceTemplate" "" (index $migVersions 0) -}}
+{{- end -}}
+{{- $loadBalancedReady := or (ne $saEmail "") $templateObserved $migObserved -}}
+{{- /* The forwarding rule's own IP mirrors the same address-resource pattern:
+      Reserved/External binds it directly, Ephemeral reads back whatever GCP assigned. */ -}}
+{{- $observedForwardingRuleIP := dig "status" "atProvider" "ipAddress" "" (getComposedResource . "forwarding-rule") -}}
+{{- $forwardingRuleBoundIP := $observedForwardingRuleIP -}}
+{{- if and (not $isEphemeral) $targetIPKnown -}}{{- $forwardingRuleBoundIP = $targetIP -}}{{- end -}}
+{{- $healthCheckMigSelfLink := dig "status" "atProvider" "selfLink" "" (getComposedResource . "health-check-mig") -}}
+{{- $migName := dig "status" "atProvider" "name" "" (getComposedResource . "mig") -}}
+{{- $migInstanceGroup := dig "status" "atProvider" "instanceGroup" "" (getComposedResource . "mig") -}}
+{{- $backendObserved := hasKey (dig "resources" (dict) .observed) "backend-service" -}}
+{{- $forwardingRuleObserved := hasKey (dig "resources" (dict) .observed) "forwarding-rule" -}}
+{{- $migObservedTemplateSelfLink := "" -}}
+{{- if $migObserved -}}
+{{- $migObservedVersions := dig "status" "atProvider" "version" (list) (getComposedResource . "mig") -}}
+{{- if gt (len $migObservedVersions) 0 -}}
+{{- $migObservedTemplateSelfLink = dig "instanceTemplate" "" (index $migObservedVersions 0) -}}
+{{- end -}}
+{{- end -}}
+{{- $migVersionTargets := list -}}
+{{- range dig "status" "atProvider" "status" (list) (getComposedResource . "mig") -}}
+{{- range dig "versionTarget" (list) . -}}
+{{- $migVersionTargets = append $migVersionTargets . -}}
+{{- end -}}
+{{- end -}}
+{{- $migRolloutReached := false -}}
+{{- if gt (len $migVersionTargets) 0 -}}
+{{- $migRolloutReached = true -}}
+{{- range $migVersionTargets -}}
+{{- if not (dig "isReached" false .) -}}
+{{- $migRolloutReached = false -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $migRolloutComplete := and $migObserved (ne $currentTemplateSelfLink "") (eq $migObservedTemplateSelfLink $currentTemplateSelfLink) $migRolloutReached -}}
+{{- /* Older templates remain until the observed MIG targets the current template and reaches it. */ -}}
+{{- $oldTemplateNames := list -}}
+{{- range $name, $res := dig "resources" (dict) .observed -}}
+{{- if and (hasPrefix "template-" $name) (ne $name $templateResourceName) (not $migRolloutComplete) -}}
+{{- $oldTemplateNames = append $oldTemplateNames $name -}}
+{{- end -}}
+{{- end -}}
 {{- $message := "" -}}
 {{- range $name, $res := dig "resources" (dict) .observed -}}
 {{- if eq $message "" -}}
@@ -173,54 +236,7 @@ spec:
   providerConfigRef:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
----
-apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
-kind: Secret
-metadata:
-  annotations:
-    gotemplating.fn.crossplane.io/composition-resource-name: secret
-    crossplane.io/external-name: {{ $spec.secretId | quote }}
-spec:
-  forProvider:
-    replication:
-      auto: {}
-  providerConfigRef:
-    name: {{ $providerConfig | quote }}
-    kind: ClusterProviderConfig
----
-apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
-kind: SecretVersion
-metadata:
-  annotations:
-    gotemplating.fn.crossplane.io/composition-resource-name: secret-version
-spec:
-  forProvider:
-    secretSelector:
-      matchControllerRef: true
-    secretDataSecretRef:
-      name: {{ $spec.wgKeySecretRef.name | quote }}
-      key: {{ $spec.wgKeySecretRef.key | quote }}
-  providerConfigRef:
-    name: {{ $providerConfig | quote }}
-    kind: ClusterProviderConfig
-{{- if ne $instanceSAEmail "" }}
----
-apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
-kind: SecretIAMMember
-metadata:
-  annotations:
-    gotemplating.fn.crossplane.io/composition-resource-name: secret-iam
-spec:
-  forProvider:
-    role: roles/secretmanager.secretAccessor
-    member: {{ printf "serviceAccount:%s" $instanceSAEmail | quote }}
-    secretIdSelector:
-      matchControllerRef: true
-  providerConfigRef:
-    name: {{ $providerConfig | quote }}
-    kind: ClusterProviderConfig
-{{- end }}
-{{- if $instanceReady }}
+{{- if and (not $loadBalanced) $instanceReady }}
 ---
 apiVersion: compute.gcp.m.upbound.io/v1beta1
 kind: Instance
@@ -231,6 +247,7 @@ spec:
   forProvider:
     machineType: {{ $spec.machineType | quote }}
     zone: {{ $spec.zone | quote }}
+    metadataStartupScript: {{ $metadataStartupScript | quote }}
     bootDisk:
       initializeParams:
         {{- if ne (dig "image" "" $spec) "" }}
@@ -241,19 +258,11 @@ spec:
       {{- if ne (dig "userData" "" $spec) "" }}
       user-data: {{ $spec.userData | quote }}
       {{- end }}
-      {{- if ne (dig "secretId" "" $spec) "" }}
       secret-id: {{ $spec.secretId | quote }}
-      {{- end }}
       wg-listen-port: {{ $spec.wgListenPort | toString | quote }}
       wg-mtu: {{ $spec.wgMTU | toString | quote }}
-      {{- if ne (dig "wgGatewayAddress" "" $spec) "" }}
-      wg-gateway-address: {{ $spec.wgGatewayAddress | quote }}
-      {{- end }}
       {{- if ne (dig "wgLinkAddress" "" $spec) "" }}
       wg-link-address: {{ $spec.wgLinkAddress | quote }}
-      {{- end }}
-      {{- if ne (dig "wgSubnet" "" $spec) "" }}
-      wg-subnet: {{ $spec.wgSubnet | quote }}
       {{- end }}
       traffic-policy: {{ dig "trafficPolicy" "cluster" $spec | quote }}
       {{- if ne (dig "projectID" "" $spec) "" }}
@@ -290,12 +299,325 @@ spec:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
 {{- end }}
+{{- if and $loadBalanced $loadBalancedReady }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: InstanceTemplate
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: {{ $templateResourceName }}
+    crossplane.io/external-name: {{ $templateExternalName | quote }}
+spec:
+  forProvider:
+    namePrefix: {{ $templateExternalName | quote }}
+    machineType: {{ $spec.machineType | quote }}
+    metadataStartupScript: {{ $metadataStartupScript | quote }}
+    disk:
+      - boot: true
+        autoDelete: true
+        {{- if ne (dig "image" "" $spec) "" }}
+        sourceImage: {{ $spec.image | quote }}
+        {{- end }}
+        diskSizeGb: {{ dig "diskSizeGB" 20 $spec }}
+    metadata:
+      {{- if ne (dig "userData" "" $spec) "" }}
+      user-data: {{ $spec.userData | quote }}
+      {{- end }}
+      secret-id: {{ dig "secretId" "" $spec | quote }}
+      wg-listen-port: {{ $spec.wgListenPort | toString | quote }}
+      wg-mtu: {{ $spec.wgMTU | toString | quote }}
+      {{- if ne (dig "wgLinkAddress" "" $spec) "" }}
+      wg-link-address: {{ $spec.wgLinkAddress | quote }}
+      {{- end }}
+      traffic-policy: {{ dig "trafficPolicy" "cluster" $spec | quote }}
+      {{- if ne (dig "projectID" "" $spec) "" }}
+      project-id: {{ $spec.projectID | quote }}
+      {{- end }}
+      disable-legacy-endpoints: "true"
+      block-project-ssh-keys: "true"
+      {{- if dig "enableOsLogin" true $spec }}
+      enable-oslogin: "TRUE"
+      {{- else }}
+      enable-oslogin: "FALSE"
+      {{- end }}
+    networkInterface:
+      - network: {{ $spec.sharedNetworkName | quote }}
+        accessConfig:
+          - {}
+    serviceAccount:
+      email: {{ $instanceSAEmail | quote }}
+      scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+    {{- if dig "spot" false $spec }}
+    scheduling:
+      provisioningModel: SPOT
+      preemptible: true
+      automaticRestart: false
+      onHostMaintenance: TERMINATE
+    {{- end }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- range $oldTemplateNames }}
+{{- $oldRes := getComposedResource $ . }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: InstanceTemplate
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: {{ . }}
+    crossplane.io/external-name: {{ dig "metadata" "annotations" "crossplane.io/external-name" "" $oldRes | quote }}
+spec:
+  forProvider: {{ dig "spec" "forProvider" (dict) $oldRes | toYaml | nindent 4 }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if ne $migTemplateSelfLink "" }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: RegionInstanceGroupManager
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: mig
+spec:
+  forProvider:
+    name: {{ printf "%s-mig" $compositeName | quote }}
+    region: {{ $region | quote }}
+    baseInstanceName: {{ $compositeName | quote }}
+    distributionPolicyZones:
+      {{- range $zones }}
+      - {{ . | quote }}
+      {{- end }}
+    targetSize: {{ $targetSize }}
+    listManagedInstancesResults: PAGINATED
+    version:
+      - instanceTemplate: {{ $migTemplateSelfLink | quote }}
+    updatePolicy:
+      type: PROACTIVE
+      replacementMethod: RECREATE
+      maxSurgeFixed: 0
+      maxUnavailableFixed: {{ len $zones }}
+      instanceRedistributionType: NONE
+    statefulExternalIp:
+      - interfaceName: nic0
+        deleteRule: ON_PERMANENT_INSTANCE_DELETION
+    instanceLifecyclePolicy:
+      defaultActionOnFailure: REPAIR
+    {{- if ne $healthCheckMigSelfLink "" }}
+    autoHealingPolicies:
+      healthCheck: {{ $healthCheckMigSelfLink | quote }}
+      initialDelaySec: 900
+    {{- end }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: RegionHealthCheck
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: health-check-lb
+    crossplane.io/external-name: {{ printf "%s-health-check-lb" $compositeName | quote }}
+  labels:
+    wgnet.dev/component: health-check-lb
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    httpHealthCheck:
+      port: {{ $healthPort }}
+      requestPath: /forwarded-healthz
+    checkIntervalSec: 5
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 2
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: RegionHealthCheck
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: health-check-mig
+    crossplane.io/external-name: {{ printf "%s-health-check-mig" $compositeName | quote }}
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    httpHealthCheck:
+      port: {{ $healthPort }}
+      requestPath: /forwarded-healthz
+    checkIntervalSec: 30
+    timeoutSec: 10
+    healthyThreshold: 2
+    unhealthyThreshold: 10
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- if or $backendObserved (ne $migInstanceGroup "") }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: RegionBackendService
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: backend-service
+    crossplane.io/external-name: {{ printf "%s-backend-service" $compositeName | quote }}
+  labels:
+    wgnet.dev/component: backend-service
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    loadBalancingScheme: EXTERNAL
+    protocol: UNSPECIFIED
+    sessionAffinity: {{ $sessionAffinity | quote }}
+    backend:
+      - balancingMode: CONNECTION
+        group: {{ $migInstanceGroup | quote }}
+    healthChecksSelector:
+      matchControllerRef: true
+      matchLabels:
+        wgnet.dev/component: health-check-lb
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if or $forwardingRuleObserved (ne $forwardingRuleBoundIP "") }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: ForwardingRule
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: forwarding-rule
+    crossplane.io/external-name: {{ printf "%s-forwarding-rule" $compositeName | quote }}
+spec:
+  forProvider:
+    region: {{ $region | quote }}
+    loadBalancingScheme: EXTERNAL
+    ipProtocol: L3_DEFAULT
+    allPorts: true
+    {{- if and (not $isEphemeral) (ne $forwardingRuleBoundIP "") }}
+    ipAddress: {{ $forwardingRuleBoundIP | quote }}
+    {{- end }}
+    backendServiceSelector:
+      matchControllerRef: true
+      matchLabels:
+        wgnet.dev/component: backend-service
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- if ne $instanceSAEmail "" }}
+---
+apiVersion: compute.gcp.m.upbound.io/v1beta1
+kind: Firewall
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: firewall-probe
+    crossplane.io/external-name: {{ printf "%s-firewall-probe" $compositeName | quote }}
+spec:
+  forProvider:
+    direction: INGRESS
+    sourceRanges:
+      {{- range $probeFirewallCIDRs }}
+      - {{ . | quote }}
+      {{- end }}
+    network: {{ $spec.sharedNetworkName | quote }}
+    targetServiceAccounts:
+      - {{ $instanceSAEmail | quote }}
+    allow:
+      - protocol: tcp
+        ports:
+          - {{ toString $healthPort | quote }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- end }}
+{{- range $members }}
+{{- $memberName := dig "name" "" . -}}
+{{- $cloudSecretName := dig "cloudSecretName" "" . -}}
+{{- $cloudSecretVersionName := dig "cloudSecretVersionName" "" . -}}
+{{- $cloudSecretIAMMemberName := dig "cloudSecretIamMemberName" "" . -}}
+{{- $kubernetesSecretName := dig "kubernetesSecretName" "" . }}
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: Secret
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: {{ $cloudSecretName }}
+    crossplane.io/external-name: {{ $cloudSecretName | quote }}
+  labels:
+    wgnet.dev/member: {{ $memberName | quote }}
+spec:
+  forProvider:
+    replication:
+      auto: {}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: SecretVersion
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: {{ $cloudSecretVersionName }}
+spec:
+  forProvider:
+    secretSelector:
+      matchControllerRef: true
+      matchLabels:
+        wgnet.dev/member: {{ $memberName | quote }}
+    secretDataSecretRef:
+      name: {{ $kubernetesSecretName | quote }}
+      key: "bundle"
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- if ne $instanceSAEmail "" }}
+---
+apiVersion: secretmanager.gcp.m.upbound.io/v1beta1
+kind: SecretIAMMember
+metadata:
+  annotations:
+    gotemplating.fn.crossplane.io/composition-resource-name: {{ $cloudSecretIAMMemberName }}
+spec:
+  forProvider:
+    role: roles/secretmanager.secretAccessor
+    member: {{ printf "serviceAccount:%s" $instanceSAEmail | quote }}
+    secretIdSelector:
+      matchControllerRef: true
+      matchLabels:
+        wgnet.dev/member: {{ $memberName | quote }}
+  providerConfigRef:
+    name: {{ $providerConfig | quote }}
+    kind: ClusterProviderConfig
+{{- end }}
+{{- end }}
 ---
 apiVersion: infra.wgnet.dev/v1alpha1
 kind: XGatewayGCP
 status:
+  {{- if $loadBalanced }}
+  {{- if ne $forwardingRuleBoundIP "" }}
+  address: {{ $forwardingRuleBoundIP | quote }}
+  {{- end }}
+  {{- if ne $migName "" }}
+  migName: {{ $migName | quote }}
+  {{- end }}
+  {{- else }}
   {{- if ne $boundIP "" }}
   address: {{ $boundIP | quote }}
+  {{- end }}
+  {{- if $instanceObserved }}
+  {{- $instanceID := dig "status" "atProvider" "id" "" (getComposedResource . "instance") -}}
+  {{- if ne $instanceID "" }}
+  {{- $instanceName := dig "metadata" "annotations" "crossplane.io/external-name" "" (getComposedResource . "instance") -}}
+  {{- if ne $instanceName "" }}
+  instanceName: {{ $instanceName | quote }}
+  {{- end }}
+  {{- end }}
+  {{- end }}
   {{- end }}
   {{- if ne $saEmail "" }}
   serviceAccountEmail: {{ $saEmail | quote }}

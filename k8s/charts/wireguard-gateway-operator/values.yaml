@@ -1,30 +1,12 @@
-# wireguard-gateway-operator chart configuration contract.
-#
-# The operator owns per-Gateway resource creation at runtime; this chart installs
-# the operator, its RBAC and CRDs, the static Flatcar Ignition userData, the
-# XGatewayGCP XRD/Composition, and the XGatewayNetwork XRD/Composition that backs
-# the shared auto-mode VPC. Every per-Gateway value (the GCP placement and
-# projectID, the WireGuard tunnel parameters, forwards, dnsHostnames) is expressed
-# on the Gateway CR, not here.
-#
-# Required before deploy: operator.image, link.image. Everything else has a
-# working default.
+# Required: operator.image and link.image. Other settings have defaults.
 
-# Gates only the user-facing platform prerequisite documentation knob: the
-# Crossplane provider, fabric MRs, and ProviderConfig the Compositions resolve
-# against must exist before any Gateway provisions. The operator hard-requires the
-# XGatewayGCP and XGatewayNetwork CRDs at startup, so the XRDs and Compositions
-# install unconditionally.
-crossplane:
-  enabled: false
 
 operator:
   image:
     repository: ""
     tag: ""
   pullPolicy: IfNotPresent
-  # Single active replica; leader election guards against split-brain across the
-  # replica count, so this can be raised for warm standby.
+  # Leader election permits warm-standby replicas while retaining a single active replica.
   replicas: 1
   # Single-active-replica reconciliation via a Lease. Maps GATEWAY_OPERATOR_LEADER_ELECTION.
   leaderElection: true
@@ -32,10 +14,7 @@ operator:
   metricsAddr: ":8080"
   # healthz/readyz bind address; the probes target it. Maps GATEWAY_OPERATOR_HEALTH_ADDR.
   healthAddr: ":8081"
-  # GCP VPC shared by all gateways this operator manages. Empty derives the name
-  # from the release as wgnet-<release>, so separate releases (including clusters
-  # that share one GCP project) get distinct VPCs with no manual coordination.
-  # Set a value only to pin a specific VPC name. Maps GATEWAY_SHARED_NETWORK_NAME.
+  # Empty derives wgnet-<release>; set only to pin a VPC name. Maps GATEWAY_SHARED_NETWORK_NAME.
   sharedNetworkName: ""
   # zap level name (debug, info, warn, error). Maps LOG_LEVEL.
   logLevel: info
@@ -43,9 +22,7 @@ operator:
   jsonLog: true
   # Enable GCP OS Login on gateway VMs (SSH access governed by IAM). Maps GATEWAY_ENABLE_OSLOGIN.
   enableOsLogin: true
-  # Crossplane ClusterProviderConfig that composed GCP resources reference.
-  # Maps GATEWAY_PROVIDER_CONFIG_NAME. "default" matches the conventional config;
-  # set a distinct value to isolate this install's credentials/project.
+  # Set a distinct config to isolate credentials/project. Maps GATEWAY_PROVIDER_CONFIG_NAME.
   providerConfigName: default
   resources:
     requests:
@@ -55,10 +32,21 @@ operator:
       memory: 128Mi
 
 link:
-  # The gateway-link image the operator stamps onto each per-Gateway link
-  # Deployment via GATEWAY_LINK_IMAGE. Built from the Dockerfile "link" target.
+  # Stamped onto each link Deployment. Maps GATEWAY_LINK_IMAGE.
   image:
     repository: ""
     tag: ""
   # imagePullPolicy for the link container. Maps GATEWAY_LINK_IMAGE_PULL_POLICY.
   pullPolicy: IfNotPresent
+
+gcp:
+  # Membership discovery reads this existing Secret.
+  # Maps GATEWAY_GCP_CREDENTIALS_SECRET/GATEWAY_GCP_CREDENTIALS_KEY.
+  credentialsSecret:
+    namespace: crossplane-system
+    name: gcp-creds
+    key: credentials.json
+  # Requeue floor for load-balanced Gateway discovery. Maps GATEWAY_GCP_DISCOVERY_INTERVAL.
+  discoveryInterval: "30s"
+  # Bound on periodic instances.get refresh. Maps GATEWAY_GCP_ADDRESS_REFRESH_INTERVAL.
+  addressRefreshInterval: "10m"
