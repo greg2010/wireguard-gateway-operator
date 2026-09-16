@@ -2,8 +2,10 @@ package link
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -125,4 +127,80 @@ func publishFault(ctx context.Context, cs kubernetes.Interface, namespace, name,
 		}
 		return nil
 	})
+}
+
+// LeaseSlotStateAnnotation carries the per-slot apply state, distinct from the Gateway-wide fault
+// annotation.
+const LeaseSlotStateAnnotation = "wgnet.dev/link-slot-state"
+
+// SlotState is one slot's published apply state.
+type SlotState struct {
+	State   string `json:"state"`             // "applied" or "down"
+	Message string `json:"message,omitempty"` // set only when State is "down"
+}
+
+const (
+	slotStateApplied = "applied"
+	slotStateDown    = "down"
+)
+
+// publishSlotState publishes per-slot outcomes without changing the Gateway fault.
+func publishSlotState(ctx context.Context, cs kubernetes.Interface, namespace, name, self string, results []SlotResult, log *zap.SugaredLogger) error {
+	value, err := slotStateJSON(results)
+	if err != nil {
+		return fmt.Errorf("marshal slot state: %w", err)
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		lease, err := cs.CoordinationV1().Leases(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get lease %s/%s: %w", namespace, name, err)
+		}
+		holder := ""
+		if lease.Spec.HolderIdentity != nil {
+			holder = *lease.Spec.HolderIdentity
+		}
+		if holder != "" && holder != self {
+			log.Infow("lease already held elsewhere, not writing its slot state", "holder", holder, "self", self)
+			return nil
+		}
+		if lease.Annotations == nil {
+			lease.Annotations = map[string]string{}
+		}
+		if len(results) == 0 {
+			if _, has := lease.Annotations[LeaseSlotStateAnnotation]; !has {
+				return nil
+			}
+			delete(lease.Annotations, LeaseSlotStateAnnotation)
+		} else {
+			if lease.Annotations[LeaseSlotStateAnnotation] == value {
+				return nil
+			}
+			lease.Annotations[LeaseSlotStateAnnotation] = value
+		}
+		if _, err := cs.CoordinationV1().Leases(namespace).Update(ctx, lease, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update lease %s/%s: %w", namespace, name, err)
+		}
+		return nil
+	})
+}
+
+// slotStateJSON renders results as LeaseSlotStateAnnotation's value: one entry per slot, keyed by
+// decimal slot number, since Lease annotation values are strings.
+func slotStateJSON(results []SlotResult) (string, error) {
+	states := make(map[string]SlotState, len(results))
+	for _, r := range results {
+		s := SlotState{State: slotStateApplied}
+		if !r.Applied {
+			s.State = slotStateDown
+			if r.Err != nil {
+				s.Message = r.Err.Error()
+			}
+		}
+		states[strconv.Itoa(r.Slot)] = s
+	}
+	data, err := json.Marshal(states)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }

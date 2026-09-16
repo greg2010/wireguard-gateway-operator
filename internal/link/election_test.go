@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,8 +15,10 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
@@ -25,7 +28,7 @@ import (
 )
 
 // TestElectionDecisions exercises entryDecision and handoffDecision, the pure functions behind
-// the election loops, against spec 7's gating table.
+// the election loops.
 func TestElectionDecisions(t *testing.T) {
 	const forwardCount = 2
 	now := time.Unix(1700001000, 0)
@@ -202,8 +205,8 @@ func TestElectionDecisions(t *testing.T) {
 	})
 }
 
-// TestTeardownDecision covers the step-down, SIGTERM, forced-end and fail-static choice against
-// spec 7's Lease-loss row and the three exit paths that always fence.
+// TestTeardownDecision covers the step-down, SIGTERM, forced-end and fail-static choice on
+// Lease loss and the three exit paths that always fence.
 func TestTeardownDecision(t *testing.T) {
 	const self = "pod-a"
 
@@ -549,8 +552,8 @@ func TestWaitForEntryEligible(t *testing.T) {
 	}
 }
 
-// TestWaitForEntryEligibleLease drives rule 2's Lease precondition: a less-fit candidate enters
-// only after the hold with the Lease free, so a release keeps the tunnel served.
+// TestWaitForEntryEligibleLease drives the Lease precondition of less-fit entry: a candidate
+// enters only after the hold with the Lease free, so a release keeps the tunnel served.
 func TestWaitForEntryEligibleLease(t *testing.T) {
 	const node, peer = "node-a", "node-b"
 
@@ -632,7 +635,7 @@ func TestWaitForEntryEligibleLease(t *testing.T) {
 }
 
 // TestLeaseHeld pins what counts as a Lease another replica still holds, the state that keeps
-// a candidate out under rule 2: only a named holder whose renewal has not lapsed.
+// a less-fit candidate out: only a named holder whose renewal has not lapsed.
 func TestLeaseHeld(t *testing.T) {
 	now := time.Unix(1700001000, 0)
 
@@ -1007,19 +1010,16 @@ func newRunElectionFixture(t *testing.T, namespace, leaseName, podName string) *
 	f := &runElectionFixture{}
 	cs := fake.NewClientset(&coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        leaseName,
-			Namespace:   namespace,
-			Annotations: map[string]string{LeaseFaultAnnotation: FaultApplyFailed, LeaseFaultMessageAnnotation: "seeded"},
+			Name:            leaseName,
+			Namespace:       namespace,
+			ResourceVersion: "1",
+			Annotations:     map[string]string{LeaseFaultAnnotation: FaultApplyFailed, LeaseFaultMessageAnnotation: "seeded"},
 		},
 	})
-	cs.PrependReactor("update", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
-		lease, ok := action.(k8stesting.UpdateAction).GetObject().(*coordinationv1.Lease)
-		if ok {
-			if _, faulted := lease.Annotations[LeaseFaultAnnotation]; !faulted {
-				f.clearedFault.Store(true)
-			}
+	prependLeaseResourceVersions(cs, func(lease *coordinationv1.Lease) {
+		if _, faulted := lease.Annotations[LeaseFaultAnnotation]; !faulted {
+			f.clearedFault.Store(true)
 		}
-		return false, nil, nil
 	})
 	lock, err := resourcelock.New(
 		resourcelock.LeasesResourceLock,
@@ -1041,7 +1041,7 @@ func newRunElectionFixture(t *testing.T, namespace, leaseName, podName string) *
 			LeaseName:         leaseName,
 		},
 		lock: lock,
-		rd:   newReadiness(interfaceName(rc), 0, time.Now, func(context.Context, string) (string, error) { return "", nil }),
+		rd:   newReadiness(rc.isLocal(), gatewayIDOf(rc), time.Now, func(context.Context, string) (string, error) { return "", nil }, testLogger(t)),
 		cs:   cs,
 		fence: func(context.Context) error {
 			f.teardowns.Add(1)
@@ -1051,6 +1051,152 @@ func newRunElectionFixture(t *testing.T, namespace, leaseName, podName string) *
 		log:    testLogger(t),
 	}
 	return f
+}
+
+// prependLeaseResourceVersions gives cs the apiserver's optimistic concurrency for Leases: an
+// update from a stale copy conflicts, an accepted one advances the version. accepted sees each one.
+func prependLeaseResourceVersions(cs *fake.Clientset, accepted func(*coordinationv1.Lease)) {
+	var mu sync.Mutex
+	leases := schema.GroupResource{Group: coordinationv1.GroupName, Resource: "leases"}
+
+	cs.PrependReactor("create", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		create, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		lease, ok := create.GetObject().(*coordinationv1.Lease)
+		if !ok {
+			return false, nil, nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		stored := lease.DeepCopy()
+		stored.ResourceVersion = "1"
+		if err := cs.Tracker().Create(action.GetResource(), stored, action.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		if accepted != nil {
+			accepted(stored)
+		}
+		return true, stored.DeepCopy(), nil
+	})
+
+	cs.PrependReactor("update", "leases", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		update, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		incoming, ok := update.GetObject().(*coordinationv1.Lease)
+		if !ok {
+			return false, nil, nil
+		}
+		incoming = incoming.DeepCopy()
+
+		mu.Lock()
+		defer mu.Unlock()
+		current, err := cs.Tracker().Get(action.GetResource(), action.GetNamespace(), incoming.Name)
+		if err != nil {
+			return true, nil, err
+		}
+		stored, ok := current.(*coordinationv1.Lease)
+		if !ok {
+			return true, nil, fmt.Errorf("tracker holds %T for lease %s, want a Lease", current, incoming.Name)
+		}
+		if incoming.ResourceVersion != "" && incoming.ResourceVersion != stored.ResourceVersion {
+			return true, nil, apierrors.NewConflict(leases, incoming.Name, fmt.Errorf(
+				"the lease has been modified: resourceVersion %q is not the stored %q",
+				incoming.ResourceVersion, stored.ResourceVersion))
+		}
+		version, err := strconv.ParseInt(stored.ResourceVersion, 10, 64)
+		if err != nil {
+			return true, nil, fmt.Errorf("stored resourceVersion %q of lease %s: %w", stored.ResourceVersion, incoming.Name, err)
+		}
+		incoming.ResourceVersion = strconv.FormatInt(version+1, 10)
+		if err := cs.Tracker().Update(action.GetResource(), incoming, action.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		if accepted != nil {
+			accepted(incoming)
+		}
+		return true, incoming.DeepCopy(), nil
+	})
+}
+
+// TestPrependLeaseResourceVersions covers the Lease fake's optimistic concurrency: the fake
+// clientset's tracker overwrites blindly, which hides the Conflict a real apiserver returns.
+func TestPrependLeaseResourceVersions(t *testing.T) {
+	const namespace, leaseName = "gw-ns", "gw-link"
+
+	tcs := []struct {
+		name            string
+		resourceVersion string
+		wantConflict    bool
+		wantStored      string
+	}{
+		{name: "current_version_accepted", resourceVersion: "2", wantStored: "3"},
+		{name: "stale_version_rejected", resourceVersion: "1", wantConflict: true, wantStored: "2"},
+		{name: "empty_version_accepted", resourceVersion: "", wantStored: "3"},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			cs := fake.NewClientset()
+			prependLeaseResourceVersions(cs, nil)
+
+			created, err := cs.CoordinationV1().Leases(namespace).Create(ctx, &coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{Name: leaseName, Namespace: namespace},
+			}, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("create lease: %v", err)
+			}
+			if created.ResourceVersion != "1" {
+				t.Fatalf("created resourceVersion = %q, want %q", created.ResourceVersion, "1")
+			}
+			// The accepted update makes version 1 genuinely stale: the store now holds 2.
+			settled := created.DeepCopy()
+			settled.Annotations = map[string]string{"round": "settled"}
+			settled, err = cs.CoordinationV1().Leases(namespace).Update(ctx, settled, metav1.UpdateOptions{})
+			if err != nil {
+				t.Fatalf("settle lease: %v", err)
+			}
+			if settled.ResourceVersion != "2" {
+				t.Fatalf("settled resourceVersion = %q, want %q", settled.ResourceVersion, "2")
+			}
+
+			write := settled.DeepCopy()
+			write.ResourceVersion = tc.resourceVersion
+			write.Annotations = map[string]string{"round": "written"}
+			got, err := cs.CoordinationV1().Leases(namespace).Update(ctx, write, metav1.UpdateOptions{})
+			switch {
+			case tc.wantConflict:
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("update error = %v, want a conflict", err)
+				}
+			case err != nil:
+				t.Fatalf("update: %v", err)
+			default:
+				if got.ResourceVersion != tc.wantStored {
+					t.Errorf("returned resourceVersion = %q, want %q", got.ResourceVersion, tc.wantStored)
+				}
+			}
+
+			stored, err := cs.CoordinationV1().Leases(namespace).Get(ctx, leaseName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get lease: %v", err)
+			}
+			if stored.ResourceVersion != tc.wantStored {
+				t.Errorf("stored resourceVersion = %q, want %q", stored.ResourceVersion, tc.wantStored)
+			}
+			wantRound := "written"
+			if tc.wantConflict {
+				wantRound = "settled"
+			}
+			if got := stored.Annotations["round"]; got != wantRound {
+				t.Errorf("stored round = %q, want %q", got, wantRound)
+			}
+		})
+	}
 }
 
 // leaseFault reports the fault reason currently annotated on the Lease.
@@ -1100,9 +1246,9 @@ func TestRunElection(t *testing.T) {
 			for cycle := range tc.cycles {
 				applied := make(chan struct{})
 				var appliedOnce sync.Once
-				f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+				f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 					appliedOnce.Do(func() { close(applied) })
-					return nil
+					return nil, nil
 				}
 
 				outerCtx, cancelOuter := context.WithCancel(context.Background())
@@ -1151,27 +1297,25 @@ func TestRunElection(t *testing.T) {
 	}
 }
 
-// TestObservedHolderFences pins the rule that turns an observed Lease holder into the
-// fence of a data plane an earlier cycle kept: only a named other replica is evidence.
-func TestObservedHolderFences(t *testing.T) {
+// TestHolderIsAnother pins the identity half of the rule that turns an observed Lease holder
+// into evidence another replica took over: only a named other replica is.
+func TestHolderIsAnother(t *testing.T) {
 	const self = "pod-a"
 
 	tcs := []struct {
-		name    string
-		pending bool
-		holder  string
-		want    bool
+		name   string
+		holder string
+		want   bool
 	}{
-		{name: "pending_and_another_holder_fences", pending: true, holder: "pod-b", want: true},
-		{name: "pending_and_self_is_not_evidence", pending: true, holder: self},
-		{name: "pending_and_free_lease_is_not_evidence", pending: true},
-		{name: "not_pending_never_fences", holder: "pod-b"},
+		{name: "another_replica_is_evidence", holder: "pod-b", want: true},
+		{name: "self_is_not_evidence", holder: self},
+		{name: "free_lease_is_not_evidence"},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := observedHolderFences(tc.pending, self, tc.holder); got != tc.want {
-				t.Errorf("observedHolderFences(%v, %q, %q) = %v, want %v", tc.pending, self, tc.holder, got, tc.want)
+			if got := holderIsAnother(self, tc.holder); got != tc.want {
+				t.Errorf("holderIsAnother(%q, %q) = %v, want %v", self, tc.holder, got, tc.want)
 			}
 		})
 	}
@@ -1240,8 +1384,8 @@ func TestFencePendingOnPoll(t *testing.T) {
 	}
 }
 
-// TestFencePendingHolderNode covers the Local-mode exception: only a holder the pod informer
-// places on another node is evidence, while Cluster mode fences on the identity alone.
+// TestFencePendingHolderNode pins that Local mode needs a holder pod on another node, while Cluster
+// mode fences on identity alone; both signals let standby tear down held slots.
 func TestFencePendingHolderNode(t *testing.T) {
 	const namespace, leaseName, self, node = "gw-ns", "gw-link", "link-node-a", "node-a"
 
@@ -1250,27 +1394,43 @@ func TestFencePendingHolderNode(t *testing.T) {
 		// clusterMode drops the endpoint watcher, as a Cluster-mode link has none.
 		clusterMode bool
 		// extraPod joins the pod informer before the holder is observed.
-		extraPod   *corev1.Pod
-		holder     string
-		wantFences int32
+		extraPod *corev1.Pod
+		// notPending observes the holder with no data plane kept by an earlier cycle.
+		notPending   bool
+		holder       string
+		wantFences   int32
+		wantObserved int32
+		wantPending  bool
 	}{
-		{name: "holder_on_another_node_fences", holder: "link-node-b", wantFences: 1},
-		{name: "holder_on_this_node_keeps_the_data_plane", extraPod: makePod("link-old-node-a", node, true), holder: "link-old-node-a"},
-		{name: "holder_unknown_to_the_informer_keeps_the_data_plane", holder: "link-node-c"},
-		{name: "cluster_mode_fences_on_the_identity_alone", clusterMode: true, holder: "pod-b", wantFences: 1},
+		{name: "holder_on_another_node_fences", holder: "link-node-b", wantFences: 1, wantObserved: 1},
+		{
+			name:        "holder_on_this_node_keeps_the_data_plane",
+			extraPod:    makePod("link-old-node-a", node, true),
+			holder:      "link-old-node-a",
+			wantPending: true,
+		},
+		{name: "holder_unknown_to_the_informer_keeps_the_data_plane", holder: "link-node-c", wantPending: true},
+		{name: "cluster_mode_fences_on_the_identity_alone", clusterMode: true, holder: "pod-b", wantFences: 1, wantObserved: 1},
+		{
+			name:         "nothing_pending_records_the_holder_and_tears_nothing_down",
+			notPending:   true,
+			holder:       "link-node-b",
+			wantObserved: 1,
+		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			var fences atomic.Int32
+			var fences, observed atomic.Int32
 			deps := electionDeps{
 				cfg: Config{PodNamespace: namespace, PodName: self, LeaseName: leaseName, NodeName: node},
 				fence: func(context.Context) error {
 					fences.Add(1)
 					return nil
 				},
-				timing: fastElectionTiming,
-				log:    testLogger(t),
+				onOtherHolder: func() { observed.Add(1) },
+				timing:        fastElectionTiming,
+				log:           testLogger(t),
 			}
 			if !tc.clusterMode {
 				ef := newElectionFixture(t, node, []string{"web"}, []string{node, "node-b"})
@@ -1281,14 +1441,17 @@ func TestFencePendingHolderNode(t *testing.T) {
 			}
 
 			var pending atomic.Bool
-			pending.Store(true)
+			pending.Store(!tc.notPending)
 			deps.fencePendingOnHolder(context.Background(), &pending, tc.holder)
 
 			if got := fences.Load(); got != tc.wantFences {
 				t.Errorf("fences = %d, want %d", got, tc.wantFences)
 			}
-			if got := pending.Load(); got != (tc.wantFences == 0) {
-				t.Errorf("pending = %v, want %v", got, tc.wantFences == 0)
+			if got := observed.Load(); got != tc.wantObserved {
+				t.Errorf("observed other holders = %d, want %d", got, tc.wantObserved)
+			}
+			if got := pending.Load(); got != tc.wantPending {
+				t.Errorf("pending = %v, want %v", got, tc.wantPending)
 			}
 		})
 	}
@@ -1388,9 +1551,9 @@ func TestRunElectionNeverAcquired(t *testing.T) {
 	f := newRunElectionFixture(t, namespace, leaseName, podName)
 	seedHeldLease(t, f, namespace, leaseName, "pod-b", 3600)
 
-	f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+	f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 		t.Error("the reload loop ran although the lease was held elsewhere")
-		return nil
+		return nil, nil
 	}
 
 	outerCtx, cancelOuter := context.WithCancel(context.Background())
@@ -1564,10 +1727,10 @@ func TestRunElectionPendingFence(t *testing.T) {
 			applied := make(chan struct{})
 			var applies atomic.Int32
 			var appliedOnce sync.Once
-			f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+			f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 				applies.Add(1)
 				appliedOnce.Do(func() { close(applied) })
-				return nil
+				return nil, nil
 			}
 
 			outerCtx, cancelOuter := context.WithCancel(context.Background())
@@ -1587,10 +1750,22 @@ func TestRunElectionPendingFence(t *testing.T) {
 			}
 
 			if !tc.noRecovery {
-				// The tracker is written behind the failing reactor so the recovered
-				// Lease is visible in the same instant the reads start succeeding.
+				// Written behind the failing reactor, so the recovered Lease is visible
+				// the instant reads succeed. Its version carries over, so writes are current.
+				current, err := f.cs.Tracker().Get(leaseGVR, namespace, leaseName)
+				if err != nil {
+					t.Fatalf("get stored lease: %v", err)
+				}
+				stored, ok := current.(*coordinationv1.Lease)
+				if !ok {
+					t.Fatalf("tracker holds %T, want a Lease", current)
+				}
 				recovered := &coordinationv1.Lease{
-					ObjectMeta: metav1.ObjectMeta{Name: leaseName, Namespace: namespace},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            leaseName,
+						Namespace:       namespace,
+						ResourceVersion: stored.ResourceVersion,
+					},
 					Spec: coordinationv1.LeaseSpec{
 						HolderIdentity:       new(tc.recoveredHolder),
 						LeaseDurationSeconds: new(int32(60)),
@@ -1728,9 +1903,9 @@ func TestRunElectionInheritedDataPlane(t *testing.T) {
 			seedHeldLease(t, f, namespace, leaseName, tc.holder, 60)
 
 			var applies atomic.Int32
-			f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+			f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 				applies.Add(1)
-				return nil
+				return nil, nil
 			}
 
 			outerCtx, cancelOuter := context.WithCancel(context.Background())
@@ -1779,7 +1954,7 @@ func TestRunElectionLeavesAcquireWhenOutranked(t *testing.T) {
 
 	tcs := []struct {
 		name string
-		// fullyEligible keeps this node's endpoint, so it enters under rule 1.
+		// fullyEligible keeps this node's endpoint, so it enters as a fully fit candidate.
 		fullyEligible bool
 	}{
 		{name: "another_holder_sends_a_less_fit_candidate_back"},
@@ -1790,7 +1965,7 @@ func TestRunElectionLeavesAcquireWhenOutranked(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f, ef := newLocalRunElectionFixture(t, namespace, leaseName, []string{"node-a", "node-b"})
 			if !tc.fullyEligible {
-				// No node serves the forward, so this candidate enters under rule 2.
+				// No node serves the forward, so this candidate enters as a less-fit one.
 				ef.dropEndpointOn(t, "web", "node-a")
 			}
 			seedHeldLease(t, f, namespace, leaseName, "link-node-b", 60)
@@ -1804,9 +1979,9 @@ func TestRunElectionLeavesAcquireWhenOutranked(t *testing.T) {
 
 			applied := make(chan struct{})
 			var appliedOnce sync.Once
-			f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+			f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 				appliedOnce.Do(func() { close(applied) })
-				return nil
+				return nil, nil
 			}
 
 			outerCtx, cancelOuter := context.WithCancel(context.Background())
@@ -2067,14 +2242,14 @@ func TestRunElectionFencesBeforeRelease(t *testing.T) {
 
 			applied := make(chan struct{})
 			var appliedOnce sync.Once
-			f.deps.reconcile = func(ctx context.Context, _ RuntimeConfig, _, _ string, _ []ResolvedForward, _ []unsatisfiedForward) error {
+			f.deps.reconcile = func(ctx context.Context, _ RuntimeConfig, _ string, _ []ResolvedForward, _ []unsatisfiedForward) ([]SlotResult, error) {
 				appliesInFlight.Add(1)
 				defer appliesInFlight.Add(-1)
 				mu.Lock()
 				reloadCtx = ctx
 				mu.Unlock()
 				appliedOnce.Do(func() { close(applied) })
-				return nil
+				return nil, nil
 			}
 			// loopStopped reports whether the reload loop's context has been cancelled,
 			// which is the only thing that ends the loop on a voluntary path.
@@ -2170,9 +2345,9 @@ func TestRunElectionReloadLoopFailure(t *testing.T) {
 	f.deps.cfg.ConfigPath = filepath.Join(t.TempDir(), "missing", "config.json")
 
 	var applied atomic.Bool
-	f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+	f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 		applied.Store(true)
-		return nil
+		return nil, nil
 	}
 
 	outerCtx := t.Context()
@@ -2264,9 +2439,9 @@ func TestRunElectionClearSurvivesFenceDeadline(t *testing.T) {
 
 	applied := make(chan struct{})
 	var appliedOnce sync.Once
-	f.deps.reconcile = func(context.Context, RuntimeConfig, string, string, []ResolvedForward, []unsatisfiedForward) error {
+	f.deps.reconcile = func(context.Context, RuntimeConfig, string, []ResolvedForward, []unsatisfiedForward) ([]SlotResult, error) {
 		appliedOnce.Do(func() { close(applied) })
-		return nil
+		return nil, nil
 	}
 
 	outerCtx, cancelOuter := context.WithCancel(context.Background())

@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// TestTeardownCommandPlan pins the exported fence plan in both modes and Teardown's best-effort
-// contract: it runs exactly those steps in order, continues past a failing one and joins failures.
+// TestTeardownCommandPlan pins the exported fence plan in both modes, which an out-of-process
+// harness replays step by step.
 func TestTeardownCommandPlan(t *testing.T) {
+	gwIdent := NewGatewayIdentity(3)
 	tcs := []struct {
 		name     string
 		rc       RuntimeConfig
@@ -24,8 +25,12 @@ func TestTeardownCommandPlan(t *testing.T) {
 			},
 		},
 		{
-			name: "local",
-			rc:   RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: new(NewIdentity(3))},
+			name: "local_single_slot",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      &gwIdent,
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+			},
 			wantPlan: [][]string{
 				{"nft", "delete", "table", "inet", "gw3"},
 				{"ip", "rule", "del", "fwmark", "0x00030000/0xffff0000", "lookup", "100003", "priority", "10000"},
@@ -33,55 +38,28 @@ func TestTeardownCommandPlan(t *testing.T) {
 				{"ip", "link", "del", "wg-gw3"},
 			},
 		},
+		{
+			name: "local_two_slots",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      &gwIdent,
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB0="}, {Slot: 2, PublicKey: "PUB2="}}},
+			},
+			wantPlan: [][]string{
+				{"nft", "delete", "table", "inet", "gw3"},
+				{"ip", "rule", "del", "fwmark", "0x00030000/0xffff0000", "lookup", "100003", "priority", "10000"},
+				{"ip", "route", "flush", "table", "100003"},
+				{"ip", "link", "del", "wg-gw3"},
+				{"ip", "rule", "del", "fwmark", "0x02030000/0xffff0000", "lookup", "100515", "priority", "10000"},
+				{"ip", "route", "flush", "table", "100515"},
+				{"ip", "link", "del", "wg-gw3-2"},
+			},
+		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Run("exported_plan", func(t *testing.T) {
-				assertSteps(t, TeardownCommands(tc.rc), tc.wantPlan)
-			})
-
-			t.Run("teardown_runs_the_plan", func(t *testing.T) {
-				rec := &runRecorder{}
-				if err := Teardown(context.Background(), rec.run, tc.rc); err != nil {
-					t.Fatalf("Teardown: %v", err)
-				}
-				assertRanPlan(t, rec.snapshot(), tc.wantPlan)
-			})
-
-			t.Run("every_step_fails_error_joins_all", func(t *testing.T) {
-				rec := &runRecorder{hook: func(c command) error { return &teardownStepError{cmd: c} }}
-				err := Teardown(context.Background(), rec.run, tc.rc)
-				if err == nil {
-					t.Fatal("expected joined error when every step fails")
-				}
-				for _, want := range tc.wantPlan {
-					name := strings.Join(want, " ")
-					if !strings.Contains(err.Error(), name) {
-						t.Errorf("joined error missing step %q: %v", name, err)
-					}
-				}
-				assertRanPlan(t, rec.snapshot(), tc.wantPlan)
-			})
-
-			t.Run("first_step_failure_does_not_abort", func(t *testing.T) {
-				rec := &runRecorder{hook: func(c command) error {
-					if c.name == "nft" {
-						return &teardownStepError{cmd: c}
-					}
-					return nil
-				}}
-				err := Teardown(context.Background(), rec.run, tc.rc)
-				if err == nil {
-					t.Fatal("expected an error naming the failed nft step")
-				}
-				plan := TeardownCommands(tc.rc)
-				failed := strings.Join(append([]string{plan[0].Name}, plan[0].Args...), " ")
-				if !strings.Contains(err.Error(), failed) {
-					t.Errorf("error %v does not name the failed step %q", err, failed)
-				}
-				assertRanPlan(t, rec.snapshot(), tc.wantPlan)
-			})
+			assertSteps(t, TeardownCommands(tc.rc), tc.wantPlan)
 		})
 	}
 }
@@ -125,4 +103,95 @@ func assertArgvPlan(t *testing.T, got, want [][]string) {
 			t.Errorf("step[%d] = %v, want %v", i, got[i], want[i])
 		}
 	}
+}
+
+func TestFencingTableNameDistinctFromDataPlaneTable(t *testing.T) {
+	gwIdent := NewGatewayIdentity(3)
+	rc := RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: &gwIdent}
+
+	got := fencingTableName(rc)
+	if got != "fence-gw3" {
+		t.Errorf("fencingTableName = %q, want %q", got, "fence-gw3")
+	}
+	if got == nftTableName(rc) {
+		t.Errorf("fencingTableName %q collides with the data-plane table name %q", got, nftTableName(rc))
+	}
+}
+
+// TestFencingRuleset admits loopback and applied-slot health traffic.
+func TestFencingRuleset(t *testing.T) {
+	gwIdent := NewGatewayIdentity(3)
+	rc := RuntimeConfig{
+		TrafficPolicy: TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		HealthPort:    gwIdent.HealthPort,
+		WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB0="}, {Slot: 2, PublicKey: "PUB2="}}},
+	}
+	const (
+		head = "add table inet fence-gw3\n" +
+			"flush table inet fence-gw3\n" +
+			"table inet fence-gw3 {\n" +
+			"\tchain input {\n" +
+			"\t\ttype filter hook input priority filter; policy accept;\n" +
+			"\t\ttcp dport 27003 iifname \"lo\" accept\n"
+		tail = "\t\ttcp dport 27003 drop\n\t}\n}\n"
+	)
+
+	tcs := []struct {
+		name     string
+		admitted []int
+		want     string
+	}{
+		{
+			name: "no_applied_slot_admits_loopback_alone",
+			want: head + tail,
+		},
+		{
+			name:     "one_applied_slot_admits_its_interface",
+			admitted: []int{0},
+			want:     head + "\t\ttcp dport 27003 iifname \"wg-gw3\" accept\n" + tail,
+		},
+		{
+			name:     "every_applied_slot_is_admitted_in_slot_order",
+			admitted: []int{2, 0},
+			want: head + "\t\ttcp dport 27003 iifname \"wg-gw3\" accept\n" +
+				"\t\ttcp dport 27003 iifname \"wg-gw3-2\" accept\n" + tail,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FencingRuleset(rc, tc.admitted); got != tc.want {
+				t.Errorf("fencing ruleset = %q, want %q", got, tc.want)
+			}
+
+			rec := &runRecorder{}
+			if err := InstallFencing(context.Background(), rec.run, rc, tc.admitted); err != nil {
+				t.Fatalf("InstallFencing: %v", err)
+			}
+			cmds := rec.snapshot()
+			if len(cmds) != 1 {
+				t.Fatalf("InstallFencing ran %d commands, want 1", len(cmds))
+			}
+			if cmds[0].name != "nft" || !slices.Equal(cmds[0].args, []string{"-f", "-"}) {
+				t.Fatalf("InstallFencing command = %s %v, want nft -f -", cmds[0].name, cmds[0].args)
+			}
+			if cmds[0].stdin != tc.want {
+				t.Errorf("installed ruleset = %q, want %q", cmds[0].stdin, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoveFencingDeletesByName pins that RemoveFencing issues exactly one delete of the
+// fencing table, never the data-plane table.
+func TestRemoveFencingDeletesByName(t *testing.T) {
+	gwIdent := NewGatewayIdentity(3)
+	rc := RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: &gwIdent}
+
+	rec := &runRecorder{}
+	if err := RemoveFencing(context.Background(), rec.run, rc); err != nil {
+		t.Fatalf("RemoveFencing: %v", err)
+	}
+	assertRanPlan(t, rec.snapshot(), [][]string{{"nft", "delete", "table", "inet", "fence-gw3"}})
 }

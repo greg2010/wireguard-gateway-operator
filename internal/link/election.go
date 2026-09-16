@@ -68,16 +68,19 @@ type electionDeps struct {
 	ew   *endpointWatcher
 	// identity is the startup config's identity block, nil in Cluster mode; a reload
 	// that changes it is refused.
-	identity   *Identity
-	cs         kubernetes.Interface
-	privKey    string
-	peerPubKey string
-	reconcile  applyFunc
-	timing     electionTiming
+	identity  *GatewayIdentity
+	cs        kubernetes.Interface
+	privKey   string
+	reconcile applyFunc
+	timing    electionTiming
 	// fence removes this replica's data plane. Required: Run populates it with the
 	// Teardown closure for the loaded RuntimeConfig.
 	fence func(ctx context.Context) error
-	log   *zap.SugaredLogger
+	// onOtherHolder reports the evidence that another replica holds the Lease to whoever keeps
+	// state on it. Optional: a caller that keeps none leaves it nil.
+	onOtherHolder    func()
+	onStartedLeading func()
+	log              *zap.SugaredLogger
 
 	// inheritedDataPlane records an interface an earlier process left on the node.
 	// The first cycle starts with a pending fence so the entry gate tears it down.
@@ -286,6 +289,9 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 				OnStartedLeading: func(leaderCtx context.Context) {
 					defer close(done)
 					keptDataPlane := d.claimPendingFence(&pendingFence)
+					if d.onStartedLeading != nil {
+						d.onStartedLeading()
+					}
 					d.rd.setLeader(true)
 					defer d.rd.setLeader(false)
 					// The fault describes a cycle that has ended and must not gate
@@ -308,7 +314,7 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 					// Lease past the termination grace period while a voluntary end waits for the fence.
 					acquiredTerm, acquiredTermKnown := readLeaseTransitions(watchCtx, d.cs, d.cfg.PodNamespace, d.cfg.LeaseName, d.log)
 
-					reloadErr := watchAndReload(watchCtx, d.cfg, d.ew, d.identity, keptDataPlane, d.privKey, d.peerPubKey, d.reconcile, d.log)
+					reloadErr := watchAndReload(watchCtx, d.cfg, d.ew, d.identity, keptDataPlane, d.privKey, d.reconcile, d.log)
 					close(reloadDone)
 					cancelWatch()
 					// A return while leadership continues and nothing asked the loop to stop means
@@ -346,7 +352,14 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 					}
 
 					if !teardownDecision(stepped, sigterm, forced, readOK, holder, d.cfg.PodName, term, acquiredTerm, acquiredTermKnown) {
-						pendingFence.Store(true)
+						// One decision under the fences' mutex: publishing hands this cycle's plane
+						// to the exit fence, so a shutdown fence racing it must not tear down too.
+						d.fenceMu.Lock()
+						if !cycle.fenced {
+							cycle.fenced = true
+							pendingFence.Store(true)
+						}
+						d.fenceMu.Unlock()
 						return
 					}
 
@@ -479,21 +492,32 @@ func (d *electionDeps) fencePendingOnPoll(ctx context.Context, pending *atomic.B
 	d.fencePendingOnHolder(ctx, pending, holder)
 }
 
-// fencePendingOnHolder fences a kept data plane once holder is evidence another replica
-// took over: in Local mode, only a holder the pod informer places on another node.
+// fencePendingOnHolder fences a kept data plane once holder is evidence another replica took over.
 func (d *electionDeps) fencePendingOnHolder(ctx context.Context, pending *atomic.Bool, holder string) {
-	if !observedHolderFences(pending.Load(), d.cfg.PodName, holder) {
+	if !d.observeHolder(holder) || !pending.Load() {
 		return
+	}
+	d.fenceKept(ctx, pending, "holder", holder, "self", d.cfg.PodName)
+}
+
+// observeHolder reports whether holder is evidence another replica took over: in Local mode, only
+// a holder the pod informer places on another node. It publishes that evidence to onOtherHolder.
+func (d *electionDeps) observeHolder(holder string) bool {
+	if !holderIsAnother(d.cfg.PodName, holder) {
+		return false
 	}
 	if d.ew != nil {
 		node, known := d.ew.podNode(holder)
 		if !known || node == d.cfg.NodeName {
 			d.log.Debugw("holder is not a link pod on another node, keeping the data plane",
 				"holder", holder, "node", node, "known", known)
-			return
+			return false
 		}
 	}
-	d.fenceKept(ctx, pending, "holder", holder, "self", d.cfg.PodName)
+	if d.onOtherHolder != nil {
+		d.onOtherHolder()
+	}
+	return true
 }
 
 // fenceKept tears down a kept data plane at most once, clearing pending under fenceMu.
@@ -506,10 +530,10 @@ func (d *electionDeps) fenceKept(ctx context.Context, pending *atomic.Bool, kv .
 	d.runFence(ctx, "fencing the data plane kept by an earlier cycle", kv...)
 }
 
-// observedHolderFences reports whether an observed holder is evidence enough to fence.
+// holderIsAnother reports whether an observed holder names a replica other than self.
 // An empty holder means a free Lease, which is where a fail-static holder sits.
-func observedHolderFences(pending bool, self, holder string) bool {
-	return pending && holder != "" && holder != self
+func holderIsAnother(self, holder string) bool {
+	return holder != "" && holder != self
 }
 
 // waitForEntryEligible blocks until this replica may attempt to acquire the Lease: a less-fit
@@ -597,7 +621,7 @@ func (d *electionDeps) watchEntryEligibility(ctx context.Context, c *leadershipC
 }
 
 // entryStillEligible reports whether a candidate past the entry gate may stay in the acquire
-// poll: a less-fit one may not once another replica holds it, since rule 2 needs it free.
+// poll: a less-fit one may not once another replica holds the Lease, which it needs free.
 func entryStillEligible(node string, v electionView, otherHolder bool, now time.Time, hold time.Duration) bool {
 	if v.live[node] && v.scores[node] == v.forwardCount {
 		return true
@@ -650,8 +674,8 @@ func entryDecision(node string, v electionView, noEligiblePeerSince, noHolderSin
 	return now.Sub(since) >= hold
 }
 
-// monitorHandoff releases a held Lease per spec 7 through endCycle, which must fence before
-// cancelling the elector's context: only that reaches ReleaseOnCancel. endCycle may block.
+// monitorHandoff releases a held Lease through endCycle, which must fence before cancelling
+// the elector's context: only that reaches ReleaseOnCancel. endCycle may block.
 func monitorHandoff(ctx context.Context, endCycle context.CancelFunc, node string, ew *endpointWatcher, timing electionTiming, steppedDown *atomic.Bool, log *zap.SugaredLogger) {
 	ticker := time.NewTicker(timing.retry)
 	defer ticker.Stop()

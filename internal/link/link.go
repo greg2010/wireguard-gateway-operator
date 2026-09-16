@@ -7,6 +7,7 @@ package link
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -26,10 +27,7 @@ import (
 
 const shutdownTimeout = 5 * time.Second
 
-// Run loads the config and key material, then runs leader election and the readiness HTTP server
-// until ctx is cancelled. Config and key reads are fatal and precede the in-cluster client, so
-// they surface without apiserver access. The health server starts only once the link pod watch has
-// synced, so a link that cannot yet see its peers stays unready instead of answering the probe.
+// Run starts election and readiness until ctx is cancelled.
 func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	rc, err := LoadRuntimeConfig(cfg.ConfigPath)
 	if err != nil {
@@ -40,13 +38,25 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	if err != nil {
 		return fmt.Errorf("read wireguard private key: %w", err)
 	}
-	peerPubKey, err := readKeyFile(cfg.PeerPubKeyPath)
-	if err != nil {
-		return fmt.Errorf("read wireguard peer public key: %w", err)
-	}
 
 	if rc.isLocal() && cfg.NodeName == "" {
 		return fmt.Errorf("local mode requires NODE_NAME")
+	}
+
+	dp := newDataPlane(rc)
+	if rc.isLocal() {
+		// No slot is admitted yet: this replica has applied none, and the fence admits the
+		// health port on exactly the interfaces of the slots its own passes applied.
+		if err := InstallFencing(ctx, execCommand, rc, nil); err != nil {
+			return fmt.Errorf("install fencing table: %w", err)
+		}
+		// Deferred first so Go's LIFO order runs it last, after every other cleanup this
+		// function defers below and after g.Wait() has returned serveHealth.
+		defer func() {
+			if err := RemoveFencing(context.Background(), execCommand, rc); err != nil {
+				log.Warnw("remove fencing table", "error", err)
+			}
+		}()
 	}
 
 	restCfg, err := rest.InClusterConfig()
@@ -69,23 +79,21 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 		return fmt.Errorf("create lease lock: %w", err)
 	}
 
-	iface := interfaceName(rc)
-	// A holder that died without releasing the Lease leaves its interface behind: it is an earlier
-	// process's data plane, kept until another holder is observed or this replica re-applies it.
+	// Discovery holds every inherited Gateway slot so departed slots are torn down.
 	var inherited bool
 	if rc.isLocal() {
-		var err error
-		// A failed probe is logged, not fatal: a node whose ip(8) is broken cannot
-		// fence or apply either, and the first apply publishes that as a fault.
-		inherited, err = ifaceExists(ctx, execCommand, iface)
-		if err != nil {
-			log.Warnw("probe for an existing data plane failed, assuming none", "interface", iface, "error", err)
+		names, listErr := linkNames(ctx)
+		if listErr != nil {
+			log.Warnw("enumerate the node's links, assuming no inherited data plane", "error", listErr)
 		}
-		if inherited {
-			log.Infow("found an existing data plane at start, keeping it until a holder on another node is observed", "interface", iface)
+		for _, slot := range InheritedSlots(names, rc.Identity.ID) {
+			inherited = true
+			dp.hold(slot)
+			log.Infow("found an existing data plane at start, keeping it until this replica's first pass",
+				"interface", NewSlotIdentity(rc.Identity.ID, slot).Interface)
 		}
 	}
-	rd := newReadiness(iface, rc.WireGuard.Peer.PersistentKeepalive, time.Now, wgShowHandshakes)
+	rd := newReadiness(rc.isLocal(), gatewayIDOf(rc), time.Now, wgShowHandshakes, log)
 
 	var preCheck preCheckFault
 	if rc.isLocal() {
@@ -105,34 +113,41 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 
 	resolve := newResolver(net.DefaultResolver.LookupIP)
 
-	apply := func(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string, localForwards []ResolvedForward) error {
-		return Apply(ctx, execCommand, rc, privKey, peerPubKey, resolve, localForwards, log)
+	apply := func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward) ([]SlotResult, error) {
+		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context) ([]SlotResult, error) {
+			return Apply(ctx, execCommand, rc, privKey, resolve, localForwards, log)
+		}, log)
 	}
 	reconcile := newLeaderReconcile(cs, cfg, rd, preCheck, apply, log)
 
 	g, gctx := errgroup.WithContext(ctx)
 	if ew != nil {
 		g.Go(func() error {
-			return watchLocalForwards(gctx, cfg, ew, rc.Identity, log)
+			return watchLocalForwards(gctx, cfg, ew, rc.Identity, func(ctx context.Context, accepted RuntimeConfig) {
+				if err := dp.standbyPass(ctx, execCommand, accepted, rd.isLeader, log); err != nil {
+					log.Warnw("maintain the standby's fence", "error", err)
+				}
+			}, log)
 		})
 	}
 	deps := electionDeps{
-		cfg:        cfg,
-		lock:       lock,
-		rd:         rd,
-		ew:         ew,
-		identity:   rc.Identity,
-		cs:         cs,
-		privKey:    privKey,
-		peerPubKey: peerPubKey,
-		reconcile:  reconcile,
-		timing:     defaultElectionTiming,
+		cfg:       cfg,
+		lock:      lock,
+		rd:        rd,
+		ew:        ew,
+		identity:  rc.Identity,
+		cs:        cs,
+		privKey:   privKey,
+		reconcile: reconcile,
+		timing:    defaultElectionTiming,
 
 		inheritedDataPlane: inherited,
 		fence: func(ctx context.Context) error {
-			return Teardown(ctx, execCommand, rc)
+			return dp.stepDown(ctx, execCommand, log)
 		},
-		log: log,
+		onOtherHolder:    dp.observeOtherHolder,
+		onStartedLeading: dp.clearOtherHolder,
+		log:              log,
 	}
 	g.Go(func() error {
 		return deps.runElection(ctx, gctx)
@@ -141,6 +156,15 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 		return serveHealth(gctx, rd, cs, cfg, log)
 	})
 	return g.Wait()
+}
+
+// gatewayIDOf returns rc's Gateway-level link id, or 0 in Cluster mode, whose passes carry no
+// slot so the id is never read.
+func gatewayIDOf(rc RuntimeConfig) int {
+	if rc.Identity != nil {
+		return rc.Identity.ID
+	}
+	return 0
 }
 
 // newLocalEndpointWatcher builds the Local EndpointSlice and pod watches, returning nil in Cluster
@@ -158,38 +182,45 @@ func newLocalEndpointWatcher(ctx context.Context, cs kubernetes.Interface, cfg C
 	return ew, nil
 }
 
-// newLeaderReconcile builds the reload loop's apply step. A node the pre-check failed is never
-// programmed; a failed Local apply gates readiness; a failed publish forces a re-apply next tick.
-func newLeaderReconcile(cs kubernetes.Interface, cfg Config, rd *readiness, preCheck preCheckFault, apply func(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string, localForwards []ResolvedForward) error, log *zap.SugaredLogger) applyFunc {
-	return func(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string, localForwards []ResolvedForward, unsatisfied []unsatisfiedForward) error {
+// newLeaderReconcile starts reconciliation after leadership acquisition.
+func newLeaderReconcile(cs kubernetes.Interface, cfg Config, rd *readiness, preCheck preCheckFault,
+	apply func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward) ([]SlotResult, error),
+	log *zap.SugaredLogger) applyFunc {
+	return func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward, unsatisfied []unsatisfiedForward) ([]SlotResult, error) {
 		if preCheck.Reason != "" {
 			if err := publishFault(ctx, cs, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, preCheck.Reason, preCheck.Message, log); err != nil {
 				log.Warnw("publish lease fault", "reason", preCheck.Reason, "error", err)
 			}
 			// Returned as an error so the reload loop records no digest and a
 			// config that was never programmed is not suppressed as applied.
-			return fmt.Errorf("node pre-check fault %s: %s", preCheck.Reason, preCheck.Message)
+			return nil, fmt.Errorf("node pre-check fault %s: %s", preCheck.Reason, preCheck.Message)
 		}
 
-		applyErr := apply(ctx, rc, privKey, peerPubKey, localForwards)
-		// Only a failed apply gates readiness. A forward with no ready local endpoint is an
-		// election input, not a reason to hide this replica from its peers' liveness table.
-		if rc.isLocal() {
-			if applyErr != nil {
-				rd.setFault(FaultApplyFailed)
-			} else {
-				rd.setFault("")
-			}
+		results, applyErr := apply(ctx, rc, privKey, localForwards)
+
+		keepalive := 0
+		if len(rc.WireGuard.Peers) > 0 {
+			keepalive = rc.WireGuard.Peers[0].PersistentKeepalive
+		}
+		rd.setPass(results, len(rc.WireGuard.Peers), keepalive, applyErr == nil)
+		faultReason := ""
+		if applyErr != nil {
+			faultReason = FaultApplyFailed
+		}
+		rd.setFault(faultReason)
+
+		if err := publishSlotState(ctx, cs, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, results, log); err != nil {
+			log.Warnw("publish lease slot state", "error", err)
 		}
 
 		reason, message := leaderFault(cfg.NodeName, applyErr, unsatisfied)
 		if err := publishFault(ctx, cs, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, reason, message, log); err != nil {
 			log.Warnw("publish lease fault", "reason", reason, "error", err)
 			if applyErr == nil {
-				return fmt.Errorf("publish lease fault %q: %w", reason, err)
+				return results, fmt.Errorf("publish lease fault %q: %w", reason, err)
 			}
 		}
-		return applyErr
+		return results, applyErr
 	}
 }
 
@@ -212,6 +243,7 @@ func readKeyFile(path string) (string, error) {
 func serveHealth(ctx context.Context, rd *readiness, cs kubernetes.Interface, cfg Config, log *zap.SugaredLogger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", rd.handler)
+	mux.HandleFunc("/forwarded-healthz", rd.forwardedHandler)
 	srv := &http.Server{Addr: cfg.HealthAddr, Handler: mux}
 
 	errCh := make(chan error, 1)
@@ -238,6 +270,26 @@ func serveHealth(ctx context.Context, rd *readiness, cs kubernetes.Interface, cf
 		}
 		return nil
 	}
+}
+
+// linkNames lists the node's link names in one call, the enumeration startup discovery matches
+// this Gateway's interface names against instead of probing every slot.
+func linkNames(ctx context.Context) ([]string, error) {
+	out, err := exec.CommandContext(ctx, "ip", "-j", "link", "show").Output()
+	if err != nil {
+		return nil, fmt.Errorf("ip -j link show: %w", err)
+	}
+	var links []struct {
+		IfName string `json:"ifname"`
+	}
+	if err := json.Unmarshal(out, &links); err != nil {
+		return nil, fmt.Errorf("decode ip -j link show output: %w", err)
+	}
+	names := make([]string, 0, len(links))
+	for _, l := range links {
+		names = append(names, l.IfName)
+	}
+	return names, nil
 }
 
 func wgShowHandshakes(ctx context.Context, iface string) (string, error) {

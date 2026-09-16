@@ -2,6 +2,7 @@ package link
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -91,15 +92,17 @@ func TestLeaderReconcilePublishesFault(t *testing.T) {
 		epEntry([]string{"10.244.1.7"}, node, new(true)),
 	))
 
+	gwIdent := NewGatewayIdentity(1)
 	localRC := RuntimeConfig{
 		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      &Identity{ID: 1, Interface: "wg-gw1"},
+		Identity:      &gwIdent,
 		Forwards:      forwards,
 	}
 
 	tcs := []struct {
 		name          string
 		watcher       *endpointWatcher
+		applyResults  []SlotResult
 		applyErr      error
 		wantReason    string
 		wantMessage   string
@@ -111,8 +114,9 @@ func TestLeaderReconcilePublishesFault(t *testing.T) {
 				{namespace: namespace, serviceName: "web"}: satisfiedIndexer,
 				{namespace: namespace, serviceName: "api"}: newTestIndexer(t),
 			}),
-			wantReason:  FaultNoLocalEndpoint,
-			wantMessage: "node-a: forwards without a ready local endpoint: api (no ready backend pod on this node)",
+			applyResults: []SlotResult{{Slot: 0, Applied: true}},
+			wantReason:   FaultNoLocalEndpoint,
+			wantMessage:  "node-a: forwards without a ready local endpoint: api (no ready backend pod on this node)",
 		},
 		{
 			name: "failed_apply_publishes_and_gates",
@@ -131,6 +135,7 @@ func TestLeaderReconcilePublishesFault(t *testing.T) {
 				{namespace: namespace, serviceName: "web"}: satisfiedIndexer,
 				{namespace: namespace, serviceName: "api"}: satisfiedIndexer,
 			}),
+			applyResults: []SlotResult{{Slot: 0, Applied: true}},
 		},
 	}
 
@@ -142,15 +147,17 @@ func TestLeaderReconcilePublishesFault(t *testing.T) {
 				Annotations: map[string]string{LeaseFaultAnnotation: "stale", LeaseFaultMessageAnnotation: "stale"},
 			}}
 			cs := fake.NewClientset(lease)
-			rd := newReadiness("wg-gw1", 25, time.Now, nil)
+			rd := newReadiness(true, 1, time.Now, nil, testLogger(t))
 			cfg := Config{PodNamespace: namespace, LeaseName: leaseName, NodeName: node}
 
 			reconcile := newLeaderReconcile(cs, cfg, rd, preCheckFault{},
-				func(context.Context, RuntimeConfig, string, string, []ResolvedForward) error { return tc.applyErr },
+				func(context.Context, RuntimeConfig, string, []ResolvedForward) ([]SlotResult, error) {
+					return tc.applyResults, tc.applyErr
+				},
 				testLogger(t))
 
 			forwards, unsatisfied, _ := tc.watcher.snapshot()
-			err := reconcile(context.Background(), localRC, "priv", "peer", forwards, unsatisfied)
+			_, err := reconcile(context.Background(), localRC, "priv", forwards, unsatisfied)
 			if (err != nil) != (tc.applyErr != nil) {
 				t.Fatalf("reconcile error = %v, want %v", err, tc.applyErr)
 			}
@@ -177,14 +184,14 @@ func TestLeaderReconcilePublishesFault(t *testing.T) {
 func TestLeaderReconcileRetriesAfterFailedPublish(t *testing.T) {
 	// No Lease object, so every publish attempt fails on the Get.
 	cs := fake.NewClientset()
-	rd := newReadiness("wg0", 25, time.Now, nil)
+	rd := newReadiness(false, 0, time.Now, nil, testLogger(t))
 
 	applied := make(chan struct{}, 8)
 	reconcile := newLeaderReconcile(cs, Config{PodNamespace: "gw-ns", LeaseName: "gw-link", NodeName: "node-a"},
 		rd, preCheckFault{},
-		func(context.Context, RuntimeConfig, string, string, []ResolvedForward) error {
+		func(context.Context, RuntimeConfig, string, []ResolvedForward) ([]SlotResult, error) {
 			applied <- struct{}{}
-			return nil
+			return nil, nil
 		}, testLogger(t))
 
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -195,7 +202,7 @@ func TestLeaderReconcileRetriesAfterFailedPublish(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", "pub", reconcile, testLogger(t))
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", reconcile, testLogger(t))
 	}()
 
 	for i := range 2 {
@@ -212,8 +219,8 @@ func TestLeaderReconcileRetriesAfterFailedPublish(t *testing.T) {
 	}
 }
 
-// TestLeaderReconcileRefusesToProgramFaultedNode pins spec §5: a node the startup pre-check failed
-// is never programmed, so no interface, sysctl, route or nft table is installed and no digest kept.
+// TestLeaderReconcileRefusesToProgramFaultedNode pins that a node the startup pre-check failed
+// is never programmed: no interface, sysctl, route or nft table is installed, no digest kept.
 func TestLeaderReconcileRefusesToProgramFaultedNode(t *testing.T) {
 	const namespace, leaseName, node = "gw-ns", "gw-link", "node-a"
 	rpFilter := preCheckFault{Reason: FaultRPFilterStrict, Message: node + ": rp_filter is 1"}
@@ -247,19 +254,20 @@ func TestLeaderReconcileRefusesToProgramFaultedNode(t *testing.T) {
 				Annotations: map[string]string{LeaseFaultAnnotation: "stale", LeaseFaultMessageAnnotation: "stale"},
 			}}
 			cs := fake.NewClientset(lease)
-			rd := newReadiness("wg-gw1", 25, time.Now, nil)
+			rd := newReadiness(true, 1, time.Now, nil, testLogger(t))
 			rd.setNodeFault(tc.preCheck.Reason)
 
 			applied := false
 			reconcile := newLeaderReconcile(cs, Config{PodNamespace: namespace, LeaseName: leaseName, NodeName: node},
 				rd, tc.preCheck,
-				func(context.Context, RuntimeConfig, string, string, []ResolvedForward) error {
+				func(context.Context, RuntimeConfig, string, []ResolvedForward) ([]SlotResult, error) {
 					applied = true
-					return nil
+					return []SlotResult{{Slot: 0, Applied: true}}, nil
 				}, testLogger(t))
 
-			rc := RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: &Identity{ID: 1, Interface: "wg-gw1"}}
-			err := reconcile(context.Background(), rc, "priv", "peer", nil, nil)
+			gwIdent := NewGatewayIdentity(1)
+			rc := RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: &gwIdent}
+			_, err := reconcile(context.Background(), rc, "priv", nil, nil)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("reconcile error = %v, want error %v", err, tc.wantErr)
 			}
@@ -430,5 +438,99 @@ func TestKnownFaults(t *testing.T) {
 	known[0] = "mutated"
 	if slices.Contains(KnownFaults(), "mutated") {
 		t.Error("KnownFaults() returned a slice a caller can mutate")
+	}
+}
+
+// TestPublishSlotState covers publishSlotState's writes to LeaseSlotStateAnnotation, distinct
+// from and never touching the Gateway-wide fault annotation.
+func TestPublishSlotState(t *testing.T) {
+	const namespace, leaseName, self = "gw-ns", "gw-link", "gw-link-abc"
+
+	tcs := []struct {
+		name       string
+		results    []SlotResult
+		wantStates map[string]SlotState
+		wantHasAnn bool
+	}{
+		{
+			name:       "publishes_down_slot_with_message",
+			results:    []SlotResult{{Slot: 1, Applied: false, Err: fmt.Errorf("ip link add wg-gw7-1: File exists")}},
+			wantStates: map[string]SlotState{"1": {State: "down", Message: "ip link add wg-gw7-1: File exists"}},
+			wantHasAnn: true,
+		},
+		{
+			name: "applied_slots_published_alongside_down",
+			results: []SlotResult{
+				{Slot: 0, Applied: true},
+				{Slot: 1, Applied: false, Err: fmt.Errorf("ip link add wg-gw7-1: File exists")},
+			},
+			wantStates: map[string]SlotState{
+				"0": {State: "applied"},
+				"1": {State: "down", Message: "ip link add wg-gw7-1: File exists"},
+			},
+			wantHasAnn: true,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: leaseName, Namespace: namespace}}
+			cs := fake.NewClientset(lease)
+
+			if err := publishSlotState(context.Background(), cs, namespace, leaseName, self, tc.results, testLogger(t)); err != nil {
+				t.Fatalf("publishSlotState: %v", err)
+			}
+
+			got, err := cs.CoordinationV1().Leases(namespace).Get(context.Background(), leaseName, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get lease: %v", err)
+			}
+			raw, has := got.Annotations[LeaseSlotStateAnnotation]
+			if has != tc.wantHasAnn {
+				t.Fatalf("slot state annotation present = %v, want %v", has, tc.wantHasAnn)
+			}
+			var states map[string]SlotState
+			if err := json.Unmarshal([]byte(raw), &states); err != nil {
+				t.Fatalf("decode slot state annotation %q: %v", raw, err)
+			}
+			if len(states) != len(tc.wantStates) {
+				t.Fatalf("slot state = %+v, want %+v", states, tc.wantStates)
+			}
+			for slot, want := range tc.wantStates {
+				if got := states[slot]; got != want {
+					t.Errorf("slot %s state = %+v, want %+v", slot, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestPublishSlotStateLeavesGatewayFaultUntouched preserves the Gateway fault annotation.
+func TestPublishSlotStateLeavesGatewayFaultUntouched(t *testing.T) {
+	const namespace, leaseName, self = "gw-ns", "gw-link", "gw-link-abc"
+	lease := &coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{
+		Name:      leaseName,
+		Namespace: namespace,
+		Annotations: map[string]string{
+			LeaseFaultAnnotation:        "stale",
+			LeaseFaultMessageAnnotation: "stale message",
+		},
+	}}
+	cs := fake.NewClientset(lease)
+	results := []SlotResult{{Slot: 1, Applied: false, Err: fmt.Errorf("ip link add wg-gw7-1: File exists")}}
+
+	if err := publishSlotState(context.Background(), cs, namespace, leaseName, self, results, testLogger(t)); err != nil {
+		t.Fatalf("publishSlotState: %v", err)
+	}
+
+	got, err := cs.CoordinationV1().Leases(namespace).Get(context.Background(), leaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	if got.Annotations[LeaseFaultAnnotation] != "stale" {
+		t.Errorf("gateway fault annotation = %q, want unchanged %q", got.Annotations[LeaseFaultAnnotation], "stale")
+	}
+	if got.Annotations[LeaseFaultMessageAnnotation] != "stale message" {
+		t.Errorf("gateway fault message annotation = %q, want unchanged %q", got.Annotations[LeaseFaultMessageAnnotation], "stale message")
 	}
 }

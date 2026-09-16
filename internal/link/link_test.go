@@ -3,16 +3,21 @@ package link
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"go.uber.org/zap"
 	"time"
 
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestReadKeyFile(t *testing.T) {
@@ -84,13 +89,18 @@ func TestReadKeyFile(t *testing.T) {
 	}
 }
 
-// newHealthHandler builds the readiness handler with an injected wgShow and a fixed clock, marked
-// leader so the handshake gate is exercised rather than short-circuited.
-func newHealthHandler(now time.Time, showOut string, showErr error) http.HandlerFunc {
-	rd := newReadiness("wg0", 25, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
+// newHealthHandler builds a leader/applied readiness handler with a fixed clock and injected
+// wgShow result. Local selects one applied slot; peers sets the reported peer count.
+func newHealthHandler(local bool, peers int, now time.Time, showOut string, showErr error) http.HandlerFunc {
+	rd := newReadiness(local, 3, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
 		return showOut, showErr
-	})
+	}, zap.NewNop().Sugar())
 	rd.setLeader(true)
+	var slots []SlotResult
+	if local {
+		slots = singleSlotApplied
+	}
+	rd.setPass(slots, peers, 25, true)
 	return rd.handler
 }
 
@@ -99,34 +109,63 @@ func TestServeHealthHandler(t *testing.T) {
 
 	tcs := []struct {
 		name     string
+		local    bool
+		peers    int
 		showOut  string
 		showErr  error
 		wantCode int
 		wantBody string
 	}{
 		{
-			name:     "ready_on_fresh_handshake",
+			name:     "local_ready_on_fresh_handshake",
+			local:    true,
+			peers:    1,
 			showOut:  fmt.Sprintf("PK=\t%d", now.Unix()-30),
 			wantCode: http.StatusOK,
 			wantBody: "ok",
 		},
 		{
-			name:     "not_ready_on_stale_handshake",
+			name:     "local_not_ready_on_stale_handshake",
+			local:    true,
+			peers:    1,
 			showOut:  fmt.Sprintf("PK=\t%d", now.Unix()-3600),
 			wantCode: http.StatusServiceUnavailable,
 			wantBody: "no recent handshake",
 		},
 		{
-			name:     "not_ready_on_wg_show_error",
+			name:     "local_not_ready_on_wg_show_error",
+			local:    true,
+			peers:    1,
 			showErr:  fmt.Errorf("wg0 does not exist"),
 			wantCode: http.StatusServiceUnavailable,
 			wantBody: "no recent handshake",
+		},
+		{
+			name:     "cluster_ready_on_fresh_handshake",
+			peers:    1,
+			showOut:  fmt.Sprintf("PK=\t%d", now.Unix()-30),
+			wantCode: http.StatusOK,
+			wantBody: "ok",
+		},
+		{
+			name:     "cluster_not_ready_on_stale_handshake",
+			peers:    1,
+			showOut:  fmt.Sprintf("PK=\t%d", now.Unix()-3600),
+			wantCode: http.StatusServiceUnavailable,
+			wantBody: "no recent handshake",
+		},
+		{
+			name:     "cluster_not_ready_without_a_configured_peer",
+			peers:    0,
+			showOut:  fmt.Sprintf("PK=\t%d", now.Unix()-30),
+			wantCode: http.StatusServiceUnavailable,
+			wantBody: "no peers configured",
 		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := newHealthHandler(now, tc.showOut, tc.showErr)
+			handler := newHealthHandler(tc.local, tc.peers, now, tc.showOut, tc.showErr)
 			req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 			rec := httptest.NewRecorder()
 
@@ -142,23 +181,28 @@ func TestServeHealthHandler(t *testing.T) {
 	}
 }
 
-// TestServeHealthServesAndDrains confirms /healthz answers over the wire, then cancels and asserts
-// a graceful nil return.
+// TestServeHealthServesAndDrains confirms /healthz and /forwarded-healthz both answer over the
+// wire, then cancels and asserts a graceful nil return.
 func TestServeHealthServesAndDrains(t *testing.T) {
 	now := time.Unix(1700001000, 0)
-	rd := newReadiness("wg0", 25, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
+	rd := newReadiness(true, 3, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
 		return fmt.Sprintf("PK=\t%d", now.Unix()-30), nil
-	})
+	}, testLogger(t))
 	rd.setLeader(true)
+	rd.setPass(singleSlotApplied, 1, 25, true)
 
 	addr := freeLoopbackAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serveHealth(ctx, rd, nil, Config{HealthAddr: addr}, testLogger(t)) }()
 
-	body := getHealthz(t, addr)
+	body := getBody(t, addr, "/healthz")
 	if body != "ok" {
 		t.Errorf("healthz body = %q, want ok", body)
+	}
+	forwardedBody := getBody(t, addr, "/forwarded-healthz")
+	if forwardedBody != "ok" {
+		t.Errorf("forwarded-healthz body = %q, want ok", forwardedBody)
 	}
 
 	cancel()
@@ -183,9 +227,6 @@ func TestRunErrorPaths(t *testing.T) {
 		// writePrivKey writes a private key file and points WGKeyPath at it; when
 		// false, WGKeyPath points at a missing file.
 		writePrivKey bool
-		// writePeerKey writes a peer public key file and points PeerPubKeyPath at
-		// it; when false, PeerPubKeyPath points at a missing file.
-		writePeerKey bool
 		wantErrSub   string
 	}{
 		{
@@ -199,22 +240,14 @@ func TestRunErrorPaths(t *testing.T) {
 			writePrivKey: false,
 			wantErrSub:   "read wireguard private key",
 		},
-		{
-			name:         "missing_peer_public_key",
-			configBody:   validConfig,
-			writePrivKey: true,
-			writePeerKey: false,
-			wantErrSub:   "read wireguard peer public key",
-		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			cfg := Config{
-				ConfigPath:     filepath.Join(dir, "missing-config.json"),
-				WGKeyPath:      filepath.Join(dir, "missing-priv"),
-				PeerPubKeyPath: filepath.Join(dir, "missing-peer"),
+				ConfigPath: filepath.Join(dir, "missing-config.json"),
+				WGKeyPath:  filepath.Join(dir, "missing-priv"),
 			}
 			if tc.configBody != "" {
 				cfg.ConfigPath = filepath.Join(dir, "config.json")
@@ -223,10 +256,6 @@ func TestRunErrorPaths(t *testing.T) {
 			if tc.writePrivKey {
 				cfg.WGKeyPath = filepath.Join(dir, "priv")
 				writeConfig(t, cfg.WGKeyPath, "private-key-material=")
-			}
-			if tc.writePeerKey {
-				cfg.PeerPubKeyPath = filepath.Join(dir, "peer")
-				writeConfig(t, cfg.PeerPubKeyPath, "peer-pub-key-material=")
 			}
 
 			err := Run(context.Background(), cfg, testLogger(t))
@@ -244,18 +273,16 @@ func TestRunErrorPaths(t *testing.T) {
 // client, when a Local-mode RuntimeConfig is loaded and cfg.NodeName is empty.
 func TestRunRejectsLocalWithoutNodeName(t *testing.T) {
 	dir := t.TempDir()
-	body := `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},` +
-		`"wireguard":{"address":"10.244.1.7/32","peer":{"endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}},` +
+	body := `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"nftTable":"gw3","healthPort":27003},"podSelector":{"app":"gateway-link"},` +
+		`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}]},` +
 		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
 
 	cfg := Config{
-		ConfigPath:     filepath.Join(dir, "config.json"),
-		WGKeyPath:      filepath.Join(dir, "priv"),
-		PeerPubKeyPath: filepath.Join(dir, "peer"),
+		ConfigPath: filepath.Join(dir, "config.json"),
+		WGKeyPath:  filepath.Join(dir, "priv"),
 	}
 	writeConfig(t, cfg.ConfigPath, body)
 	writeConfig(t, cfg.WGKeyPath, "priv-key-material=")
-	writeConfig(t, cfg.PeerPubKeyPath, "peer-key-material=")
 
 	err := Run(context.Background(), cfg, testLogger(t))
 	if err == nil {
@@ -281,22 +308,26 @@ func freeLoopbackAddr(t testing.TB) string {
 	return addr
 }
 
-// getHealthz polls GET /healthz on addr until the server is listening, returning
+// getBody polls GET path on addr until the server is listening, returning
 // the body of the first successful response or failing on timeout.
-func getHealthz(t testing.TB, addr string) string {
+func getBody(t testing.TB, addr, path string) string {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	url := "http://" + addr + "/healthz"
+	url := "http://" + addr + path
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(url)
 		if err != nil {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		body := make([]byte, 64)
-		n, _ := resp.Body.Read(body)
-		resp.Body.Close()
-		return string(body[:n])
+		body, readErr := io.ReadAll(resp.Body)
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Fatalf("close the %s response body: %v", url, closeErr)
+		}
+		if readErr != nil {
+			t.Fatalf("read the %s response body: %v", url, readErr)
+		}
+		return string(body)
 	}
 	t.Fatalf("GET %s never succeeded before deadline", url)
 	return ""
@@ -313,25 +344,26 @@ func TestNewLocalEndpointWatcherMode(t *testing.T) {
 		ServiceName: "web",
 	}}
 	podSelector := map[string]string{"app": "gateway-link"}
+	gwIdent := NewGatewayIdentity(1)
 
 	tcs := []struct {
-		name              string
-		rc                RuntimeConfig
-		wantWatcher       bool
-		wantSliceRequests bool
-		wantPodRequests   bool
+		name        string
+		rc          RuntimeConfig
+		wantWatcher bool
+		// wantResources is every resource the mode's watches request. Cluster mode builds no
+		// watcher, so its whole action list is compared against it instead.
+		wantResources []string
 	}{
 		{
 			name: "local_watches_endpointslices_and_pods",
 			rc: RuntimeConfig{
 				TrafficPolicy: TrafficPolicyLocal,
-				Identity:      &Identity{ID: 1, Interface: "wg-gw1"},
+				Identity:      &gwIdent,
 				PodSelector:   podSelector,
 				Forwards:      forwards,
 			},
-			wantWatcher:       true,
-			wantSliceRequests: true,
-			wantPodRequests:   true,
+			wantWatcher:   true,
+			wantResources: []string{"endpointslices", "pods"},
 		},
 		{
 			name: "cluster_watches_nothing",
@@ -340,6 +372,7 @@ func TestNewLocalEndpointWatcherMode(t *testing.T) {
 				PodSelector:   podSelector,
 				Forwards:      forwards,
 			},
+			wantResources: []string{},
 		},
 	}
 
@@ -358,24 +391,51 @@ func TestNewLocalEndpointWatcherMode(t *testing.T) {
 				t.Fatalf("watcher non-nil = %v, want %v", ew != nil, tc.wantWatcher)
 			}
 
-			requested := func(resource string) bool {
-				for _, action := range cs.Actions() {
-					if action.GetResource().Resource == resource {
-						return true
-					}
+			if !tc.wantWatcher {
+				if got := actionResources(cs.Actions()); !slices.Equal(got, tc.wantResources) {
+					t.Errorf("client actions = %v, want %v", got, tc.wantResources)
 				}
-				return false
+				return
 			}
-			// The EndpointSlice informers start without being waited on, so their
-			// first list is reached rather than observed at once.
-			if tc.wantSliceRequests {
-				eventually(t, func() bool { return requested("endpointslices") }, "endpointslice request from the started informer")
-			} else if requested("endpointslices") {
-				t.Errorf("endpointslices requested in Cluster mode (actions: %v)", cs.Actions())
-			}
-			if got := requested("pods"); got != tc.wantPodRequests {
-				t.Errorf("pods requests = %v, want %v (actions: %v)", got, tc.wantPodRequests, cs.Actions())
+			// The informers start without being waited on, so their first list is
+			// reached rather than observed at once.
+			for _, resource := range tc.wantResources {
+				eventually(t, func() bool { return slices.Contains(actionResources(cs.Actions()), resource) },
+					resource+" request from the started informer")
 			}
 		})
+	}
+}
+
+// actionResources is the resource each client action requested, in order.
+func actionResources(actions []k8stesting.Action) []string {
+	resources := make([]string, 0, len(actions))
+	for _, action := range actions {
+		resources = append(resources, action.GetResource().Resource)
+	}
+	return resources
+}
+
+// TestFencingInstalledBeforeListenerBinds installs the Local fence before listener startup.
+func TestFencingInstalledBeforeListenerBinds(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"nftTable":"gw3","healthPort":27003},"podSelector":{"app":"gateway-link"},` +
+		`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}]},` +
+		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
+
+	cfg := Config{
+		ConfigPath: filepath.Join(dir, "config.json"),
+		WGKeyPath:  filepath.Join(dir, "priv"),
+		NodeName:   "node-a",
+	}
+	writeConfig(t, cfg.ConfigPath, body)
+	writeConfig(t, cfg.WGKeyPath, "priv-key-material=")
+
+	err := Run(context.Background(), cfg, testLogger(t))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "install fencing table") {
+		t.Errorf("error = %q, want it to name the fencing install step, proving Run reached it before the in-cluster client or the health listener", err.Error())
 	}
 }
