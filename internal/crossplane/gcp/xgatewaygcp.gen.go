@@ -16,34 +16,47 @@ type XGatewayGCPSpec struct {
 		Port     int    `json:"port"`
 		Protocol string `json:"protocol"`
 	} `json:"allowedPorts,omitempty"`
-	DiskSizeGB         *int    `json:"diskSizeGB,omitempty"`
-	EnableOsLogin      *bool   `json:"enableOsLogin,omitempty"`
-	Image              *string `json:"image,omitempty"`
-	MachineType        string  `json:"machineType"`
-	ProjectID          *string `json:"projectID,omitempty"`
-	ProviderConfigName *string `json:"providerConfigName,omitempty"`
-	Region             string  `json:"region"`
-	SecretId           *string `json:"secretId,omitempty"`
-	ServiceAccountId   *string `json:"serviceAccountId,omitempty"`
-	SharedNetworkName  string  `json:"sharedNetworkName"`
-	Spot               *bool   `json:"spot,omitempty"`
-	TrafficPolicy      *string `json:"trafficPolicy,omitempty"`
-	UserData           *string `json:"userData,omitempty"`
-	WgGatewayAddress   *string `json:"wgGatewayAddress,omitempty"`
-	WgKeySecretRef     *struct {
-		Key  string `json:"key"`
-		Name string `json:"name"`
-	} `json:"wgKeySecretRef,omitempty"`
-	WgLinkAddress *string `json:"wgLinkAddress,omitempty"`
-	WgListenPort  int     `json:"wgListenPort"`
-	WgMTU         int     `json:"wgMTU"`
-	WgSubnet      *string `json:"wgSubnet,omitempty"`
-	Zone          string  `json:"zone"`
+	DiskSizeGB    *int    `json:"diskSizeGB,omitempty"`
+	EnableOsLogin *bool   `json:"enableOsLogin,omitempty"`
+	HealthPort    *int    `json:"healthPort,omitempty"`
+	Image         *string `json:"image,omitempty"`
+	LoadBalanced  *bool   `json:"loadBalanced,omitempty"`
+	MachineType   string  `json:"machineType"`
+	Members       *[]struct {
+		CloudSecretIamMemberName string `json:"cloudSecretIamMemberName"`
+		CloudSecretName          string `json:"cloudSecretName"`
+		CloudSecretVersionName   string `json:"cloudSecretVersionName"`
+		KubernetesSecretName     string `json:"kubernetesSecretName"`
+		Name                     string `json:"name"`
+		Slot                     int    `json:"slot"`
+		TunnelAddress            string `json:"tunnelAddress"`
+	} `json:"members,omitempty"`
+	ProjectID          *string   `json:"projectID,omitempty"`
+	ProviderConfigName *string   `json:"providerConfigName,omitempty"`
+	Region             string    `json:"region"`
+	SecretId           string    `json:"secretId"`
+	ServiceAccountId   *string   `json:"serviceAccountId,omitempty"`
+	SessionAffinity    *string   `json:"sessionAffinity,omitempty"`
+	SharedNetworkName  string    `json:"sharedNetworkName"`
+	Spot               *bool     `json:"spot,omitempty"`
+	TargetSize         *int      `json:"targetSize,omitempty"`
+	TemplateRevision   *string   `json:"templateRevision,omitempty"`
+	TrafficPolicy      *string   `json:"trafficPolicy,omitempty"`
+	UserData           *string   `json:"userData,omitempty"`
+	WgGatewayAddress   *string   `json:"wgGatewayAddress,omitempty"`
+	WgLinkAddress      *string   `json:"wgLinkAddress,omitempty"`
+	WgListenPort       int       `json:"wgListenPort"`
+	WgMTU              int       `json:"wgMTU"`
+	WgSubnet           *string   `json:"wgSubnet,omitempty"`
+	Zone               string    `json:"zone"`
+	Zones              *[]string `json:"zones,omitempty"`
 }
 
 // XGatewayGCPStatus defines model for XGatewayGCPStatus.
 type XGatewayGCPStatus struct {
 	Address             *string `json:"address,omitempty"`
+	InstanceName        *string `json:"instanceName,omitempty"`
 	Message             *string `json:"message,omitempty"`
+	MigName             *string `json:"migName,omitempty"`
 	ServiceAccountEmail *string `json:"serviceAccountEmail,omitempty"`
 }

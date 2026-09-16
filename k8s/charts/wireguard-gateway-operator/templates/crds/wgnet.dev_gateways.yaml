@@ -160,6 +160,22 @@ spec:
                       Image is the gateway VM boot image. The gateway boots Flatcar because its
                       userData is Flatcar Ignition; this defaults to the GCP Flatcar stable family.
                     type: string
+                  loadBalancer:
+                    description: |-
+                      LoadBalancer opts a Gateway into the regional-MIG-behind-passthrough-NLB path.
+                      Absent keeps the single-Instance path. Presence is fixed at creation.
+                    properties:
+                      sessionAffinity:
+                        default: NONE
+                        description: SessionAffinity is the regional backend service's
+                          affinity mode.
+                        enum:
+                        - NONE
+                        - CLIENT_IP_PORT_PROTO
+                        - CLIENT_IP_PROTO
+                        - CLIENT_IP
+                        type: string
+                    type: object
                   machineType:
                     default: e2-small
                     type: string
@@ -170,20 +186,57 @@ spec:
                     minLength: 1
                     type: string
                   region:
+                    maxLength: 63
                     minLength: 1
                     type: string
+                  replicas:
+                    default: 1
+                    description: 'Replicas is the desired member count. Ceiling: capacity
+                      C (see Wireguard.Subnet).'
+                    format: int32
+                    minimum: 1
+                    type: integer
                   spot:
                     default: false
                     description: Spot runs the gateway VM as a preemptible spot instance.
                     type: boolean
                   zone:
+                    maxLength: 63
                     minLength: 1
                     type: string
+                  zones:
+                    description: |-
+                      Zones spreads a load-balanced Gateway's regional MIG. Absent means the effective
+                      list [Zone]; the effective list is computed at reconcile, never persisted.
+                    items:
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                    maxItems: 8
+                    type: array
+                    x-kubernetes-list-type: set
                 required:
                 - projectID
                 - region
                 - zone
                 type: object
+                x-kubernetes-validations:
+                - message: spec.gcp.zones entries must be inside spec.gcp.region
+                  rule: '!has(self.zones) || self.zones.all(z, z.startsWith(self.region
+                    + ''-''))'
+                - message: without spec.gcp.loadBalancer, replicas must be 1 and zones,
+                    if set, must equal [zone]
+                  rule: has(self.loadBalancer) || (self.replicas <= 1 && (!has(self.zones)
+                    || (self.zones.size() == 1 && self.zones[0] == self.zone)))
+                - message: spec.gcp.loadBalancer presence is immutable
+                  rule: has(self.loadBalancer) == has(oldSelf.loadBalancer)
+                - message: a load-balanced Gateway's effective zone set is immutable
+                  rule: '!has(self.loadBalancer) || ((has(self.zones) ? self.zones
+                    : [self.zone]).size() == (has(oldSelf.zones) ? oldSelf.zones :
+                    [oldSelf.zone]).size() && (has(self.zones) ? self.zones : [self.zone]).all(z,
+                    z in (has(oldSelf.zones) ? oldSelf.zones : [oldSelf.zone])))'
+                - message: spec.gcp.diskSizeGB is immutable on a single-instance Gateway
+                  rule: has(self.loadBalancer) || self.diskSizeGB == oldSelf.diskSizeGB
               link:
                 default: {}
                 description: |-
@@ -289,6 +342,15 @@ spec:
             - message: spec.link.replicas applies only to trafficPolicy Cluster; Local
                 runs a DaemonSet on every eligible node
               rule: self.trafficPolicy != 'Local' || self.link.replicas == 1
+            - message: spec.wireguard.subnet, gatewayAddress and linkAddress are immutable
+                on a load-balanced Gateway
+              rule: '!has(self.gcp.loadBalancer) || (self.wireguard.subnet == oldSelf.wireguard.subnet
+                && self.wireguard.gatewayAddress == oldSelf.wireguard.gatewayAddress
+                && self.wireguard.linkAddress == oldSelf.wireguard.linkAddress)'
+            - message: 'a TCP forward on port 8080 is rejected under trafficPolicy
+                Cluster: it is the link''s health port'
+              rule: self.trafficPolicy == 'Local' || !has(self.forwards) || self.forwards.all(f,
+                !(f.protocol == 'TCP' && f.port == 8080))
           status:
             properties:
               address:
@@ -354,6 +416,63 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              gcp:
+                description: GCP is the observed state of a Gateway's GCP fleet. Empty
+                  on the single-Instance path.
+                properties:
+                  members:
+                    description: |-
+                      Members lists the instance group members seen by read-only discovery, keyed and ordered by name
+                      and refreshed on every reconcile of a load-balanced Gateway; empty until a member is observed.
+                    items:
+                      description: |-
+                        GatewayGCPMemberStatus is one fleet member's public-only observed state, keyed by
+                        instance name. No key material or bundle contents ever appear here.
+                      properties:
+                        externalAddress:
+                          description: ExternalAddress is the last observed public
+                            address and is empty until GCP reports one.
+                          type: string
+                        instanceID:
+                          description: InstanceID is the last observed GCP instance
+                            ID and is empty until GCP reports one.
+                          type: string
+                        message:
+                          description: Message is empty when there is nothing to report.
+                          type: string
+                        name:
+                          description: Name is the GCP managed instance name.
+                          type: string
+                        revision:
+                          description: Revision is the last path segment of the MIG
+                            version's instance template, empty until known.
+                          type: string
+                        slot:
+                          description: Slot is the persistent allocation slot; zero
+                            also represents an unallocated pending member.
+                          format: int32
+                          type: integer
+                        state:
+                          description: State is derived from the current discovery
+                            snapshot and durable member record.
+                          type: string
+                        tunnelAddress:
+                          description: TunnelAddress is the assigned tunnel host address
+                            and is empty for pending members.
+                          type: string
+                        zone:
+                          description: Zone is the last observed GCP zone and is empty
+                            until discovery reports it.
+                          type: string
+                      required:
+                      - name
+                      - state
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                type: object
               link:
                 description: Link is the observed state of this Gateway's link workload.
                 properties:

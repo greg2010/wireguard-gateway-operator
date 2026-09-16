@@ -54,17 +54,34 @@ spec:
                       protocol: { type: string }
                     required: [port, protocol]
                 serviceAccountId: { type: string }
-                secretId: { type: string }
-                wgKeySecretRef:
-                  type: object
-                  properties:
-                    name: { type: string }
-                    key: { type: string }
-                  required: [name, key]
-              required: [region, zone, machineType, sharedNetworkName, wgListenPort, wgMTU]
+                secretId: { type: string, minLength: 1 }
+                loadBalanced: { type: boolean }
+                sessionAffinity: { type: string }
+                targetSize: { type: integer }
+                zones:
+                  type: array
+                  items: { type: string }
+                templateRevision: { type: string }
+                healthPort: { type: integer }
+                members:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      slot: { type: integer }
+                      tunnelAddress: { type: string }
+                      kubernetesSecretName: { type: string }
+                      cloudSecretName: { type: string }
+                      cloudSecretVersionName: { type: string }
+                      cloudSecretIamMemberName: { type: string }
+                    required: [name, slot, tunnelAddress, kubernetesSecretName, cloudSecretName, cloudSecretVersionName, cloudSecretIamMemberName]
+              required: [region, zone, machineType, sharedNetworkName, wgListenPort, wgMTU, secretId]
             status:
               type: object
               properties:
                 address: { type: string }
                 serviceAccountEmail: { type: string }
                 message: { type: string }
+                migName: { type: string }
+                instanceName: { type: string }

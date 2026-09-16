@@ -29,6 +29,8 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.forwards) || self.forwards.all(f1, self.forwards.exists_one(f2, f2.port == f1.port && f2.protocol == f1.protocol))",message="each forward must use a unique port and protocol combination"
 // +kubebuilder:validation:XValidation:rule="!has(self.forwards) || self.forwards.all(f, !(f.protocol == 'UDP' && f.port == self.wireguard.listenPort))",message="a UDP forward must not use the WireGuard listen port (spec.wireguard.listenPort)"
 // +kubebuilder:validation:XValidation:rule="self.trafficPolicy != 'Local' || self.link.replicas == 1",message="spec.link.replicas applies only to trafficPolicy Cluster; Local runs a DaemonSet on every eligible node"
+// +kubebuilder:validation:XValidation:rule="!has(self.gcp.loadBalancer) || (self.wireguard.subnet == oldSelf.wireguard.subnet && self.wireguard.gatewayAddress == oldSelf.wireguard.gatewayAddress && self.wireguard.linkAddress == oldSelf.wireguard.linkAddress)",message="spec.wireguard.subnet, gatewayAddress and linkAddress are immutable on a load-balanced Gateway"
+// +kubebuilder:validation:XValidation:rule="self.trafficPolicy == 'Local' || !has(self.forwards) || self.forwards.all(f, !(f.protocol == 'TCP' && f.port == 8080))",message="a TCP forward on port 8080 is rejected under trafficPolicy Cluster: it is the link's health port"
 type GatewaySpec struct {
 	GCP GatewayGCPSpec `json:"gcp"`
 
@@ -66,6 +68,11 @@ type GatewaySpec struct {
 	DNSHostnames []string `json:"dnsHostnames,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.zones) || self.zones.all(z, z.startsWith(self.region + '-'))",message="spec.gcp.zones entries must be inside spec.gcp.region"
+// +kubebuilder:validation:XValidation:rule="has(self.loadBalancer) || (self.replicas <= 1 && (!has(self.zones) || (self.zones.size() == 1 && self.zones[0] == self.zone)))",message="without spec.gcp.loadBalancer, replicas must be 1 and zones, if set, must equal [zone]"
+// +kubebuilder:validation:XValidation:rule="has(self.loadBalancer) == has(oldSelf.loadBalancer)",message="spec.gcp.loadBalancer presence is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(self.loadBalancer) || ((has(self.zones) ? self.zones : [self.zone]).size() == (has(oldSelf.zones) ? oldSelf.zones : [oldSelf.zone]).size() && (has(self.zones) ? self.zones : [self.zone]).all(z, z in (has(oldSelf.zones) ? oldSelf.zones : [oldSelf.zone])))",message="a load-balanced Gateway's effective zone set is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.loadBalancer) || self.diskSizeGB == oldSelf.diskSizeGB",message="spec.gcp.diskSizeGB is immutable on a single-instance Gateway"
 type GatewayGCPSpec struct {
 	// ProjectID is the GCP project owning the gateway VM and its Secret Manager secret;
 	// the boot keyfetch resolves the secret URL through it.
@@ -73,9 +80,11 @@ type GatewayGCPSpec struct {
 	ProjectID string `json:"projectID"`
 
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Region string `json:"region"`
 
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Zone string `json:"zone"`
 
 	// +kubebuilder:default="e2-small"
@@ -100,6 +109,36 @@ type GatewayGCPSpec struct {
 	// Spot runs the gateway VM as a preemptible spot instance.
 	// +kubebuilder:default=false
 	Spot bool `json:"spot,omitempty"`
+
+	// Replicas is the desired member count. Ceiling: capacity C (see Wireguard.Subnet).
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Zones spreads a load-balanced Gateway's regional MIG. Absent means the effective
+	// list [Zone]; the effective list is computed at reconcile, never persisted.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	Zones []string `json:"zones,omitempty"`
+
+	// LoadBalancer opts a Gateway into the regional-MIG-behind-passthrough-NLB path.
+	// Absent keeps the single-Instance path. Presence is fixed at creation.
+	// +optional
+	LoadBalancer *GatewayGCPLoadBalancerSpec `json:"loadBalancer,omitempty"`
+}
+
+// GatewayGCPLoadBalancerSpec configures the regional load balancer and managed instance group.
+// Its presence selects this provisioning path and is immutable after creation.
+type GatewayGCPLoadBalancerSpec struct {
+	// SessionAffinity is the regional backend service's affinity mode.
+	// +optional
+	// +kubebuilder:validation:Enum=NONE;CLIENT_IP_PORT_PROTO;CLIENT_IP_PROTO;CLIENT_IP
+	// +kubebuilder:default=NONE
+	SessionAffinity string `json:"sessionAffinity,omitempty"`
 }
 
 // GatewayGCPAddressType selects where the gateway VM's public ingress address comes from.
@@ -239,6 +278,56 @@ type GatewayLinkStatus struct {
 	ActiveNode string `json:"activeNode,omitempty"`
 }
 
+// GatewayGCPStatus reports the observed fleet for a load-balanced Gateway.
+// It is empty for the single-instance provisioning path.
+type GatewayGCPStatus struct {
+	// Members lists the instance group members seen by read-only discovery, keyed and ordered by name
+	// and refreshed on every reconcile of a load-balanced Gateway; empty until a member is observed.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Members []GatewayGCPMemberStatus `json:"members,omitempty"`
+}
+
+// GatewayGCPMemberStatus is one fleet member's public-only observed state, keyed by
+// instance name. No key material or bundle contents ever appear here.
+type GatewayGCPMemberStatus struct {
+	// Name is the GCP managed instance name.
+	Name string `json:"name"`
+	// Zone is the last observed GCP zone and is empty until discovery reports it.
+	Zone string `json:"zone,omitempty"`
+	// Slot is the persistent allocation slot; zero also represents an unallocated pending member.
+	Slot int32 `json:"slot,omitempty"`
+	// TunnelAddress is the assigned tunnel host address and is empty for pending members.
+	TunnelAddress string `json:"tunnelAddress,omitempty"`
+	// ExternalAddress is the last observed public address and is empty until GCP reports one.
+	ExternalAddress string `json:"externalAddress,omitempty"`
+	// InstanceID is the last observed GCP instance ID and is empty until GCP reports one.
+	InstanceID string `json:"instanceID,omitempty"`
+	// Revision is the last path segment of the MIG version's instance template, empty until known.
+	Revision string `json:"revision,omitempty"`
+	// State is derived from the current discovery snapshot and durable member record.
+	State GatewayGCPMemberState `json:"state"`
+	// Message is empty when there is nothing to report.
+	Message string `json:"message,omitempty"`
+}
+
+// GatewayGCPMemberState classifies a member from discovery and its durable record.
+type GatewayGCPMemberState string
+
+const (
+	// GatewayGCPMemberPending is listed without a record, slot, key, or peer.
+	GatewayGCPMemberPending GatewayGCPMemberState = "Pending"
+	// GatewayGCPMemberActive has an allocated record, whether or not it is currently listed.
+	GatewayGCPMemberActive GatewayGCPMemberState = "Active"
+	// GatewayGCPMemberRecreating is listed recreating while its record and peer remain retained.
+	GatewayGCPMemberRecreating GatewayGCPMemberState = "Recreating"
+	// GatewayGCPMemberDeparting is absent from one or two usable snapshots and remains retained.
+	GatewayGCPMemberDeparting GatewayGCPMemberState = "Departing"
+	// GatewayGCPMemberDeparted has its peer removed while its record awaits release confirmation.
+	GatewayGCPMemberDeparted GatewayGCPMemberState = "Departed"
+)
+
 type GatewayStatus struct {
 	// Address is the gateway VM's public ingress IP, mirrored from the XGatewayGCP.
 	Address string `json:"address,omitempty"`
@@ -248,6 +337,10 @@ type GatewayStatus struct {
 	// Link is the observed state of this Gateway's link workload.
 	// +optional
 	Link GatewayLinkStatus `json:"link"`
+
+	// GCP is the observed state of a Gateway's GCP fleet. Empty on the single-Instance path.
+	// +optional
+	GCP GatewayGCPStatus `json:"gcp"`
 
 	// +listType=map
 	// +listMapKey=type
