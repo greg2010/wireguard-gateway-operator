@@ -20,7 +20,7 @@ type Peer struct {
 	ExternalAddress string
 	ListenPort      int
 	// TunnelAddress is this member's tunnel address, rendered into the peer's
-	// AllowedIPs as a /32 by the caller (D-CONTROLLER's builders.go).
+	// AllowedIPs as a /32 by the caller.
 	TunnelAddress string
 }
 
@@ -282,8 +282,8 @@ func buildMemberStatus(rec Record, zone, revision string, state wgnetv1alpha1.Ga
 	}
 }
 
-// buildPeer's ListenPort is left zero: Reconcile has no wireguard-listen-port input (the
-// signature carries none), so the caller (D-CONTROLLER) fills it in uniformly before use.
+// buildPeer leaves ListenPort zero: Reconcile has no listen-port input, so its caller fills
+// in the Gateway-wide listen port before use.
 func buildPeer(rec Record) Peer {
 	return Peer{Slot: rec.Slot, PublicKey: rec.PublicKey, ExternalAddress: rec.ExternalAddress, TunnelAddress: rec.TunnelAddress}
 }

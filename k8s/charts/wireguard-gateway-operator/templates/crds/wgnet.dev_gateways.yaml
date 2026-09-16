@@ -191,8 +191,9 @@ spec:
                     type: string
                   replicas:
                     default: 1
-                    description: 'Replicas is the desired member count. Ceiling: capacity
-                      C (see Wireguard.Subnet).'
+                    description: |-
+                      Replicas is the desired member count, at most the usable hosts of Wireguard.Subnet less
+                      the link's own address, and never more than 256.
                     format: int32
                     minimum: 1
                     type: integer

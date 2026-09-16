@@ -110,7 +110,8 @@ type GatewayGCPSpec struct {
 	// +kubebuilder:default=false
 	Spot bool `json:"spot,omitempty"`
 
-	// Replicas is the desired member count. Ceiling: capacity C (see Wireguard.Subnet).
+	// Replicas is the desired member count, at most the usable hosts of Wireguard.Subnet less
+	// the link's own address, and never more than 256.
 	// +optional
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
