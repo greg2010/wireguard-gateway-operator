@@ -2,6 +2,8 @@ package linkint
 
 import (
 	"context"
+	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,7 +20,9 @@ func TestFenceRemovesDataPlane(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	ctr := startNftContainer(ctx, t)
+	ctr := netns.Start(ctx, t)
+	baseline := readFenceState(ctx, t, ctr, nil)
+	createWG0(ctx, t, ctr)
 
 	// The rendered ruleset is the exact document the daemon loads, so the table the
 	// fence deletes is created by production code, not a stand-in.
@@ -39,69 +43,54 @@ func TestFenceRemovesDataPlane(t *testing.T) {
 
 	runTeardownPlan(ctx, t, ctr, rc)
 
-	// A demoted replica that left either object behind would keep carrying traffic
-	// after losing leadership, the failure the fence prevents.
-	if ifacePresent(ctx, t, ctr, "wg0") {
-		t.Error("wg0 still present after fence; the demoted replica's interface was not removed")
-	}
-	if nftTablePresent(ctx, t, ctr, "gateway") {
-		t.Error("inet gateway table still present after fence; the demoted replica's nftables data plane was not removed")
-	}
+	assertFenceState(ctx, t, ctr, nil, baseline, "after fence; want the baseline from before link setup")
 }
 
-// TestLocalFenceRemovesNodeState covers node-global state: an fwmark rule or route table
-// left behind outlives the link pod and diverts the node's traffic into an empty table.
+// TestLocalFenceRemovesNodeState removes every configured slot's node state.
 func TestLocalFenceRemovesNodeState(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	ident := link.NewIdentity(lpLinkID)
-	rc := link.RuntimeConfig{TrafficPolicy: link.TrafficPolicyLocal, Identity: &ident}
+	gwIdent := link.NewGatewayIdentity(lpLinkID)
+	slots := []link.SlotIdentity{link.NewSlotIdentity(lpLinkID, 0), link.NewSlotIdentity(lpLinkID, 2)}
+	rc := link.RuntimeConfig{
+		TrafficPolicy: link.TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB0="}, {Slot: 2, PublicKey: "PUB2="}}},
+	}
 	forwards := []link.ResolvedForward{
 		{Name: "tcp-8443", PublicPort: lpPublicPort, Protocol: "tcp", Target: lpPodIP, TargetPort: lpPodPort},
 	}
 
 	ctr := netns.Start(ctx, t)
-	// A dummy stands in for the WireGuard device: the ruleset and the route plan both
-	// name it, and nft resolves iifname at load time.
-	if code, out := netns.Exec(ctx, t, ctr, "ip", "link", "add", ident.Interface, "type", "dummy"); code != 0 {
-		t.Fatalf("ip link add %s failed (exit %d):\n%s", ident.Interface, code, out)
+	routeTables := []int{slots[0].RouteTable, slots[1].RouteTable}
+	baseline := readFenceState(ctx, t, ctr, routeTables)
+	for _, id := range slots {
+		// A dummy stands in for each WireGuard device: the ruleset and the route plan both
+		// name it, and nft resolves iifname at load time.
+		if code, out := netns.Exec(ctx, t, ctr, "ip", "link", "add", id.Interface, "type", "dummy"); code != 0 {
+			t.Fatalf("ip link add %s failed (exit %d):\n%s", id.Interface, code, out)
+		}
+		if code, out := netns.Exec(ctx, t, ctr, "ip", "link", "set", id.Interface, "up"); code != 0 {
+			t.Fatalf("ip link set %s up failed (exit %d):\n%s", id.Interface, code, out)
+		}
+		programLocalRoutes(ctx, t, ctr, id, []string{lpPodIP})
 	}
-	if code, out := netns.Exec(ctx, t, ctr, "ip", "link", "set", ident.Interface, "up"); code != 0 {
-		t.Fatalf("ip link set %s up failed (exit %d):\n%s", ident.Interface, code, out)
-	}
-	programLocalRoutes(ctx, t, ctr, ident, []string{lpPodIP})
 	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, forwards))
 
-	if n := countPlanRules(ctx, t, ctr, ident); n != 1 {
-		t.Fatalf("precondition failed: %d ip rules match the plan before the fence, want 1", n)
+	for _, id := range slots {
+		if n := countPlanRules(ctx, t, ctr, id); n != 1 {
+			t.Fatalf("precondition failed: %d ip rules match slot %d's plan before the fence, want 1", n, id.RouteTable)
+		}
 	}
-	if !nftTablePresent(ctx, t, ctr, ident.NftTable) {
-		t.Fatalf("precondition failed: inet %s table absent before the fence", ident.NftTable)
+	if !nftTablePresent(ctx, t, ctr, gwIdent.NftTable) {
+		t.Fatalf("precondition failed: inet %s table absent before the fence", gwIdent.NftTable)
 	}
 
 	runTeardownPlan(ctx, t, ctr, rc)
-
-	if n := countPlanRules(ctx, t, ctr, ident); n != 0 {
-		t.Errorf("%d ip rules still match the plan's fwmark %s/%s and table %d after the fence; the rule is node-global and outlives the pod",
-			n, ident.Mark, ident.MarkMask, ident.RouteTable)
-	}
-	table := strconv.Itoa(ident.RouteTable)
-	code, out := netns.Exec(ctx, t, ctr, "ip", "route", "show", "table", table)
-	if code != 0 {
-		t.Fatalf("ip route show table %s failed (exit %d):\n%s", table, code, out)
-	}
-	if strings.TrimSpace(out) != "" {
-		t.Errorf("route table %s still holds routes after the fence:\n%s", table, out)
-	}
-	if nftTablePresent(ctx, t, ctr, ident.NftTable) {
-		t.Errorf("inet %s table still present after the fence", ident.NftTable)
-	}
-	if ifacePresent(ctx, t, ctr, ident.Interface) {
-		t.Errorf("%s still present after the fence", ident.Interface)
-	}
+	assertFenceState(ctx, t, ctr, routeTables, baseline, "after fence; want the baseline from before link setup")
 }
 
 // runTeardownPlan runs the product's teardown plan in order. The test programmed every
@@ -126,4 +115,97 @@ func nftTablePresent(ctx context.Context, t testing.TB, ctr testcontainers.Conta
 	t.Helper()
 	code, _ := netns.Exec(ctx, t, ctr, "nft", "list", "table", "inet", table)
 	return code == 0
+}
+
+type fenceState struct {
+	Devices     []string
+	Tables      []string
+	Routes      map[int][]string
+	PolicyRules []string
+}
+
+func readFenceState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) fenceState {
+	t.Helper()
+	devices := nodeLinkNames(ctx, t, ctr)
+	slices.Sort(devices)
+	return fenceState{
+		Devices:     devices,
+		Tables:      nftTableNames(ctx, t, ctr),
+		Routes:      fenceRoutes(ctx, t, ctr, routeTables),
+		PolicyRules: jsonEntries(ctx, t, ctr, "ip -j rule show", "ip", "-j", "rule", "show"),
+	}
+}
+
+func assertFenceState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int, want fenceState, stage string) {
+	t.Helper()
+	got := readFenceState(ctx, t, ctr, routeTables)
+	if !slices.Equal(got.Devices, want.Devices) {
+		t.Errorf("network devices %s = %v, want %v", stage, got.Devices, want.Devices)
+	}
+	if !slices.Equal(got.Tables, want.Tables) {
+		t.Errorf("nft tables %s = %v, want %v", stage, got.Tables, want.Tables)
+	}
+	for _, table := range routeTables {
+		if !slices.Equal(got.Routes[table], want.Routes[table]) {
+			t.Errorf("route table %d %s = %v, want %v", table, stage, got.Routes[table], want.Routes[table])
+		}
+	}
+	if !slices.Equal(got.PolicyRules, want.PolicyRules) {
+		t.Errorf("policy rules %s = %v, want %v", stage, got.PolicyRules, want.PolicyRules)
+	}
+}
+
+func nftTableNames(ctx context.Context, t testing.TB, ctr testcontainers.Container) []string {
+	t.Helper()
+	names := []string{}
+	for line := range strings.SplitSeq(netns.List(ctx, t, ctr, "tables"), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[0] == "table" {
+			names = append(names, fields[1]+" "+fields[2])
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+func fenceRoutes(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) map[int][]string {
+	t.Helper()
+	routes := make(map[int][]string, len(routeTables))
+	for _, table := range routeTables {
+		command := "ip -j route show table " + strconv.Itoa(table)
+		code, out := netns.Exec(ctx, t, ctr, "ip", "-j", "route", "show", "table", strconv.Itoa(table))
+		if code != 0 && (!strings.HasPrefix(strings.TrimSpace(out), "[]") || !strings.Contains(out, "FIB table does not exist")) {
+			t.Fatalf("%s failed (exit %d):\n%s", command, code, out)
+		}
+		routes[table] = decodeJSONEntries(t, command, out)
+	}
+	return routes
+}
+
+func jsonEntries(ctx context.Context, t testing.TB, ctr testcontainers.Container, command string, args ...string) []string {
+	t.Helper()
+	code, out := netns.Exec(ctx, t, ctr, args...)
+	if code != 0 {
+		t.Fatalf("%s failed (exit %d):\n%s", command, code, out)
+	}
+	return decodeJSONEntries(t, command, out)
+}
+
+func decodeJSONEntries(t testing.TB, command, out string) []string {
+	t.Helper()
+	jsonOutput, _, _ := strings.Cut(out, "\nError:")
+	var entries []json.RawMessage
+	if err := json.Unmarshal([]byte(jsonOutput), &entries); err != nil {
+		t.Fatalf("decode %s output %q: %v", command, out, err)
+	}
+	got := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		normalized, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatalf("normalize %s entry %q: %v", command, entry, err)
+		}
+		got = append(got, string(normalized))
+	}
+	slices.Sort(got)
+	return got
 }

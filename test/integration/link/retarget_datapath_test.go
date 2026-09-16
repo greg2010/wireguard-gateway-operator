@@ -18,6 +18,8 @@ import (
 const (
 	// dpRetargetPort is the public port the forward exposes on wg0.
 	dpRetargetPort = 8453
+	// dpGatewayAddr is the gateway's tunnel-side address, the address the client dials.
+	dpGatewayAddr = "10.99.0.2"
 	// dpTargetPort is the backend port both stand-in Services listen on.
 	dpTargetPort = 443
 	// dpClusterIPA and dpClusterIPB are the stand-in ClusterIPs the forward is
@@ -45,7 +47,7 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPA, TargetPort: dpTargetPort}
 	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPB, TargetPort: dpTargetPort}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardA}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardA}))
 
 	if got := probeOnce(ctx, t, ctr); got != dpMarkerA {
 		t.Fatalf("before retarget: fresh probe = %q, want %q (DNAT to A not working)", got, dpMarkerA)
@@ -53,17 +55,16 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 
 	held := openHeldConnection(ctx, t, ctr)
 	defer held.close(t)
-	if got := held.request(ctx, t); got != dpMarkerA {
-		t.Fatalf("before retarget: held connection = %q, want %q", got, dpMarkerA)
+	if got, err := held.request(ctx, t); err != nil || strings.TrimSpace(got) != dpMarkerA {
+		t.Fatalf("before retarget: held connection bytes = %q, err = %v, want %q", []byte(got), err, dpMarkerA)
 	}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardB}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardB}))
+	assertClusterForwardRules(ctx, t, ctr, []link.ResolvedForward{forwardB}, "after retarget")
 
-	reused := held.request(ctx, t)
-	if reused == "" {
-		t.Errorf("after retarget: reused established connection blackholed (no reply); the leading ct established,related accept should keep it flowing to A")
-	} else if reused != dpMarkerA {
-		t.Errorf("after retarget: reused established connection = %q, want %q (an established flow is conntrack-pinned to A, not re-DNATed)", reused, dpMarkerA)
+	reused, err := held.request(ctx, t)
+	if err != nil || strings.TrimSpace(reused) != dpMarkerA {
+		t.Fatalf("after retarget: reused established connection bytes = %q, err = %v, want %q", []byte(reused), err, dpMarkerA)
 	}
 
 	if got := probeOnce(ctx, t, ctr); got != dpMarkerB {
@@ -192,7 +193,7 @@ func probeOnce(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 		t.Fatalf("copy probe script: %v", err)
 	}
 	secs := fmt.Sprintf("%.0f", dpProbeTimeout.Seconds())
-	cmd := fmt.Sprintf("ip netns exec client python3 /tmp/probe.py 10.99.0.2 %d %s", dpRetargetPort, secs)
+	cmd := fmt.Sprintf("ip netns exec client python3 /tmp/probe.py %s %d %s", dpGatewayAddr, dpRetargetPort, secs)
 	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd)
 	if code != 0 {
 		t.Fatalf("probe exec failed (exit %d):\n%s", code, out)
@@ -267,9 +268,7 @@ func (h *heldConnection) waitConnected(ctx context.Context, t testing.TB) {
 	t.Fatalf("held connection did not establish to port %d within deadline", dpRetargetPort)
 }
 
-// request sends one request on the held connection and returns the backend marker, or ""
-// when the held flow blackholed: no reply before the wait elapses.
-func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
+func (h *heldConnection) request(ctx context.Context, t testing.TB) (string, error) {
 	t.Helper()
 	h.gen++
 	if code, out := netns.Exec(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("echo %d > /tmp/held_gen", h.gen)); code != 0 {
@@ -281,14 +280,14 @@ func (h *heldConnection) request(ctx context.Context, t testing.TB) string {
 		code, out := netns.Exec(ctx, t, h.ctr, "sh", "-c", fmt.Sprintf("cat %s 2>/dev/null", replyPath))
 		if code == 0 {
 			reply := strings.TrimSpace(out)
-			if reply == "" || strings.HasPrefix(reply, "ERR:") {
-				return ""
+			if strings.HasPrefix(reply, "ERR:") {
+				return out, fmt.Errorf("held connection read: %s", reply)
 			}
-			return reply
+			return out, nil
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	return ""
+	return "", fmt.Errorf("read held connection reply: deadline exceeded")
 }
 
 // close runs on context.Background() because the test's own context may already be

@@ -166,7 +166,8 @@ func TestLocalDataPathPreservesClientSource(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	ident := link.NewIdentity(lpLinkID)
+	gwIdent := link.NewGatewayIdentity(lpLinkID)
+	ident := link.NewSlotIdentity(lpLinkID, 0)
 
 	ctr := netns.Start(ctx, t, "python3")
 	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", localTopologyScript(ident.Interface)); code != 0 {
@@ -174,7 +175,11 @@ func TestLocalDataPathPreservesClientSource(t *testing.T) {
 	}
 	startPeerBackend(ctx, t, ctr)
 
-	rc := link.RuntimeConfig{TrafficPolicy: link.TrafficPolicyLocal, Identity: &ident}
+	rc := link.RuntimeConfig{
+		TrafficPolicy: link.TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB="}}},
+	}
 	forwards := []link.ResolvedForward{
 		{Name: "tcp-8443", PublicPort: lpPublicPort, Protocol: "tcp", Target: lpPodIP, TargetPort: lpPodPort},
 		{Name: "udp-8445", PublicPort: lpUDPPublicPort, Protocol: "udp", Target: lpPodIP, TargetPort: lpUDPPodPort},
@@ -272,18 +277,114 @@ func TestLocalDataPathPreservesClientSource(t *testing.T) {
 	}
 
 	t.Run("unsolicited connection from the backend towards the tunnel is dropped", func(t *testing.T) {
-		before := egressDropPackets(ctx, t, ctr, ident.NftTable, ident.Interface)
+		before := egressDropPackets(ctx, t, ctr, gwIdent.NftTable, ident.Interface)
 
 		err := probeErrorFrom(ctx, t, ctr, tcpProbe, "backend", lpVMTunnelAddr, lpEgressPort)
 		if !isTimeout(err) {
 			t.Fatalf("tcp probe from the backend to %s:%d failed with %q, want a timeout; a refusal means the packet left the node instead of hitting the egress drop", lpVMTunnelAddr, lpEgressPort, err)
 		}
 
-		after := egressDropPackets(ctx, t, ctr, ident.NftTable, ident.Interface)
+		after := egressDropPackets(ctx, t, ctr, gwIdent.NftTable, ident.Interface)
 		if after <= before {
 			t.Errorf("the forward chain's oifname %q drop counted %d packets before the probe and %d after, want an increase; the connection must die on that rule, not elsewhere", ident.Interface, before, after)
 		}
 	})
+}
+
+// TestLocalDatapathTwoSlots proves each slot's mark and route table returns its own flow while
+// the main-table default route is a separate decoy.
+func TestLocalDatapathTwoSlots(t *testing.T) {
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	gwIdent := link.NewGatewayIdentity(lpLinkID)
+	slot0 := link.NewSlotIdentity(lpLinkID, 0)
+	slot1 := link.NewSlotIdentity(lpLinkID, 1)
+	ctr := netns.Start(ctx, t, "python3")
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", localTopologyScript(slot0.Interface)); code != 0 {
+		t.Fatalf("set up slot 0 topology (exit %d):\n%s", code, out)
+	}
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", secondSlotTopologyScript(slot1.Interface)); code != 0 {
+		t.Fatalf("set up slot 1 topology (exit %d):\n%s", code, out)
+	}
+	startPeerBackend(ctx, t, ctr)
+
+	rc := link.RuntimeConfig{
+		TrafficPolicy: link.TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		HealthPort:    gwIdent.HealthPort,
+		WireGuard: link.WireGuard{Peers: []link.Peer{
+			{Slot: 0, PublicKey: "PUB0="},
+			{Slot: 1, PublicKey: "PUB1="},
+		}},
+	}
+	forwards := []link.ResolvedForward{{Name: "tcp-8443", PublicPort: lpPublicPort, Protocol: "tcp", Target: lpPodIP, TargetPort: lpPodPort}}
+	programLocalRoutes(ctx, t, ctr, slot0, []string{lpPodIP})
+	programLocalRoutes(ctx, t, ctr, slot1, []string{lpPodIP})
+	ruleset := renderRuleset(t, rc, forwards)
+	netns.Apply(ctx, t, ctr, ruleset)
+
+	for _, id := range []link.SlotIdentity{slot0, slot1} {
+		for _, fragment := range []string{
+			`iifname "` + id.Interface + `" ct state new counter ct mark set ct mark`,
+			`iifname "` + id.Interface + `" tcp dport 8443 counter dnat`,
+			`oifname "` + id.Interface + `" tcp flags syn counter`,
+			`ct direction reply ct mark and ` + id.MarkMask + ` == ` + id.Mark,
+		} {
+			if !strings.Contains(ruleset, fragment) {
+				t.Errorf("ruleset missing slot %s fragment %q", id.Interface, fragment)
+			}
+		}
+		if n := countPlanRules(ctx, t, ctr, id); n != 1 {
+			t.Errorf("slot %s has %d matching ip rules, want exactly 1", id.Interface, n)
+		}
+		code, out := netns.Exec(ctx, t, ctr, "ip", "route", "show", "table", strconv.Itoa(id.RouteTable))
+		if code != 0 || !strings.Contains(out, "default dev "+id.Interface) {
+			t.Errorf("slot %s route table %d = %q (exit %d), want its default through that slot", id.Interface, id.RouteTable, out, code)
+		}
+	}
+
+	probes := []struct {
+		name  string
+		id    link.SlotIdentity
+		ns    string
+		addr  string
+		iface string
+	}{
+		{name: "slot 0 probe is answered through its own reply path", id: slot0, ns: "vm", addr: lpTunnelAddr, iface: "vt-vm"},
+		{name: "slot 1 probe is answered through its own reply path", id: slot1, ns: "vm2", addr: "10.98.0.2", iface: "vt2-vm"},
+	}
+	for _, tc := range probes {
+		t.Run(tc.name, func(t *testing.T) {
+			before := interfacePacketCount(ctx, t, ctr, "", tc.id.Interface, "tx")
+			proberBefore := interfacePacketCount(ctx, t, ctr, tc.ns, tc.iface, "rx")
+			if got := probeFrom(ctx, t, ctr, tcpProbe, tc.ns, tc.addr, lpPublicPort); !strings.Contains(got, lpMarker) {
+				t.Fatalf("probe through %s = %q, want reply carrying %q", tc.id.Interface, got, lpMarker)
+			}
+			slotReplies := interfacePacketCount(ctx, t, ctr, "", tc.id.Interface, "tx") - before
+			proberReplies := interfacePacketCount(ctx, t, ctr, tc.ns, tc.iface, "rx") - proberBefore
+			if slotReplies == 0 || proberReplies == 0 {
+				t.Errorf("slot %s reply path has %d slot packets and %d prober packets, want packets on both ends", tc.id.Interface, slotReplies, proberReplies)
+			}
+		})
+	}
+}
+
+func secondSlotTopologyScript(iface string) string {
+	return fmt.Sprintf(`set -e
+ip netns add vm2
+ip link add vt2-vm type veth peer name %[1]s
+ip link set vt2-vm netns vm2
+ip netns exec vm2 ip addr add 10.98.0.1/24 dev vt2-vm
+ip netns exec vm2 ip link set vt2-vm up
+ip netns exec vm2 ip link set lo up
+ip netns exec vm2 sysctl -w net.ipv4.conf.vt2-vm.proxy_arp=1
+ip addr add 10.98.0.2/24 dev %[1]s
+ip link set %[1]s up
+sysctl -w net.ipv4.conf.%[1]s.rp_filter=0
+`, iface)
 }
 
 // nftRuleDump is the subset of `nft -j list chain` a rule is identified by: its ordered
@@ -372,7 +473,7 @@ type ipRule struct {
 	Table  string `json:"table"`
 }
 
-func countPlanRules(ctx context.Context, t testing.TB, ctr testcontainers.Container, id link.Identity) int {
+func countPlanRules(ctx context.Context, t testing.TB, ctr testcontainers.Container, id link.SlotIdentity) int {
 	t.Helper()
 	code, out := netns.Exec(ctx, t, ctr, "ip", "-j", "rule", "show")
 	if code != 0 {
@@ -409,7 +510,7 @@ func hexValue(t testing.TB, s string) uint64 {
 
 // programLocalRoutes runs the product's own route plan, so the data path is programmed
 // by the same steps apply emits. Only steps flagged TolerateExists may fail on EEXIST.
-func programLocalRoutes(ctx context.Context, t testing.TB, ctr testcontainers.Container, id link.Identity, targets []string) {
+func programLocalRoutes(ctx context.Context, t testing.TB, ctr testcontainers.Container, id link.SlotIdentity, targets []string) {
 	t.Helper()
 	for _, step := range link.LocalRouteCommands(id, targets) {
 		code, out := netns.Exec(ctx, t, ctr, append([]string{"ip"}, step.Args...)...)

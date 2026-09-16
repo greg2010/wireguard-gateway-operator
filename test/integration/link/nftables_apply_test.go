@@ -6,6 +6,8 @@ package linkint
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +30,7 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 		{Name: "udp-svc", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.2", TargetPort: 9000},
 	}
 
-	rulesetTwo := renderRuleset(t, link.RuntimeConfig{}, twoForwards)
+	rulesetTwo := renderRuleset(t, twoPeerClusterRC(), twoForwards)
 
 	netns.Apply(ctx, t, ctr, rulesetTwo)
 	firstListing := listTable(ctx, t, ctr)
@@ -50,14 +52,10 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	}
 
 	oneForward := []link.ResolvedForward{twoForwards[0]}
-	rulesetOne := renderRuleset(t, link.RuntimeConfig{}, oneForward)
+	rulesetOne := renderRuleset(t, twoPeerClusterRC(), oneForward)
 	netns.Apply(ctx, t, ctr, rulesetOne)
 	prunedListing := listTable(ctx, t, ctr)
 
-	removedDNAT := dnatRuleFor(twoForwards[1])
-	if strings.Contains(prunedListing, removedDNAT) {
-		t.Errorf("DNAT rule for the removed forward is still present after re-apply: %q\n%s", removedDNAT, prunedListing)
-	}
 	keptDNAT := dnatRuleFor(twoForwards[0])
 	if !strings.Contains(prunedListing, keptDNAT) {
 		t.Errorf("DNAT rule for the retained forward is missing after re-apply: %q\n%s", keptDNAT, prunedListing)
@@ -65,6 +63,7 @@ func TestNftablesApplyIsSelfReplacing(t *testing.T) {
 	if got := countDNATRules(prunedListing); got != len(oneForward) {
 		t.Errorf("after pruning to one forward: DNAT rule count = %d, want %d\n%s", got, len(oneForward), prunedListing)
 	}
+	assertClusterForwardRules(ctx, t, ctr, oneForward, "after pruning")
 }
 
 // TestNftablesRetargetReplacesClusterIP repoints a forward to a second ClusterIP: a rule
@@ -88,13 +87,13 @@ func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 	forwardA := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, Target: clusterIPA, TargetPort: retargetTarget}
 	forwardB := link.ResolvedForward{Name: "retarget", PublicPort: retargetPort, Protocol: retargetProtocol, Target: clusterIPB, TargetPort: retargetTarget}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardA}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardA}))
 	beforeListing := listTable(ctx, t, ctr)
 	if dnat := dnatRuleFor(forwardA); !strings.Contains(beforeListing, dnat) {
 		t.Fatalf("before retarget: DNAT to ClusterIP_A missing: %q\n%s", dnat, beforeListing)
 	}
 
-	netns.Apply(ctx, t, ctr, renderRuleset(t, link.RuntimeConfig{}, []link.ResolvedForward{forwardB}))
+	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardB}))
 	afterListing := listTable(ctx, t, ctr)
 
 	wantDNAT := dnatRuleFor(forwardB)
@@ -106,20 +105,22 @@ func TestNftablesRetargetReplacesClusterIP(t *testing.T) {
 		t.Errorf("after retarget: forward accept rule for daddr B missing: %q\n%s", wantAccept, afterListing)
 	}
 
-	staleDNAT := dnatRuleFor(forwardA)
-	if strings.Contains(afterListing, staleDNAT) {
-		t.Errorf("after retarget: stale DNAT to ClusterIP_A survives: %q\n%s", staleDNAT, afterListing)
-	}
-	staleAccept := acceptRuleFor(forwardA)
-	if strings.Contains(afterListing, staleAccept) {
-		t.Errorf("after retarget: stale accept rule for daddr A survives: %q\n%s", staleAccept, afterListing)
-	}
-	if n := strings.Count(afterListing, clusterIPA); n != 0 {
-		t.Errorf("after retarget: ClusterIP_A %q still referenced %d time(s) in the ruleset; a retarget must leave no rule pointing at the old target\n%s",
-			clusterIPA, n, afterListing)
-	}
+	assertClusterForwardRules(ctx, t, ctr, []link.ResolvedForward{forwardB}, "after retarget")
 	if got := countDNATRules(afterListing); got != 1 {
 		t.Errorf("after retarget: DNAT rule count = %d, want 1 (the single retargeted forward)\n%s", got, afterListing)
+	}
+}
+
+// twoPeerClusterRC is the Cluster-mode fixture every rendering test in this package uses:
+// two live members, exercising RenderNftables against a multi-peer WireGuard.Peers list.
+func twoPeerClusterRC() link.RuntimeConfig {
+	return link.RuntimeConfig{
+		WireGuard: link.WireGuard{
+			Peers: []link.Peer{
+				{Slot: 0, PublicKey: "PUBA=", Endpoint: "203.0.113.1:51820", AllowedIPs: []string{"10.99.0.2/32"}},
+				{Slot: 1, PublicKey: "PUBB=", Endpoint: "203.0.113.2:51820", AllowedIPs: []string{"10.99.0.3/32"}},
+			},
+		},
 	}
 }
 
@@ -172,4 +173,45 @@ func dnatRuleFor(f link.ResolvedForward) string {
 // retarget must move the accept in lockstep with the DNAT.
 func acceptRuleFor(f link.ResolvedForward) string {
 	return fmt.Sprintf("iif \"wg0\" ip daddr %s %s dport %d accept", f.Target, f.Protocol, f.TargetPort)
+}
+
+var nftRuleNoise = regexp.MustCompile(` counter packets \d+ bytes \d+| comment "[^"]*"| # handle \d+`)
+
+func assertClusterForwardRules(ctx context.Context, t testing.TB, ctr testcontainers.Container, forwards []link.ResolvedForward, stage string) {
+	t.Helper()
+	want := clusterForwardRules(forwards)
+	got := append(nftChainRuleExpressions(ctx, t, ctr, "prerouting"), nftChainRuleExpressions(ctx, t, ctr, "forward")...)
+	if !slices.Equal(got, want) {
+		t.Errorf("cluster forwarding rules %s = %v, want %v", stage, got, want)
+	}
+}
+
+func clusterForwardRules(forwards []link.ResolvedForward) []string {
+	want := make([]string, 0, len(forwards)*2+2)
+	for _, forward := range forwards {
+		want = append(want, "prerouting: iif \"wg0\" "+dnatRuleFor(forward))
+	}
+	want = append(want,
+		"forward: oifname \"wg0\" tcp flags syn tcp option maxseg size set rt mtu",
+		"forward: ct state established,related accept",
+	)
+	for _, forward := range forwards {
+		want = append(want, "forward: "+acceptRuleFor(forward))
+	}
+	return want
+}
+
+func nftChainRuleExpressions(ctx context.Context, t testing.TB, ctr testcontainers.Container, chain string) []string {
+	t.Helper()
+	listing := netns.List(ctx, t, ctr, "chain", "inet", "gateway", chain)
+	rules := []string{}
+	for line := range strings.SplitSeq(listing, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == "}" || strings.HasPrefix(line, "table ") || strings.HasPrefix(line, "chain ") || strings.HasPrefix(line, "type ") {
+			continue
+		}
+		line = strings.TrimSpace(nftRuleNoise.ReplaceAllString(line, ""))
+		rules = append(rules, chain+": "+strings.Join(strings.Fields(line), " "))
+	}
+	return rules
 }
