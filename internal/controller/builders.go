@@ -3,6 +3,7 @@ package controller
 import (
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -21,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	gcp "github.com/greg2010/wireguard-gateway-operator/internal/crossplane/gcp"
+	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
@@ -81,7 +83,23 @@ const (
 	// clusterHealthPort is the Cluster-mode readiness port; it must match the
 	// GATEWAY_HEALTH_ADDR default in internal/link/config.go. Local mode binds loopback.
 	clusterHealthPort = 8080
+
+	// bootstrapScriptRevision is bumped whenever files/gcp/keyfetch.sh's contract changes,
+	// folding that change into templateRevision's hash.
+	bootstrapScriptRevision = "v1"
 )
+
+// templateRevision hashes only inputs that affect the instance template.
+func templateRevision(gw *wgnetv1alpha1.Gateway, cfg Config, secretID string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%t\x00%t\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s",
+		bootstrapScriptRevision, effectiveGCPImage(gw), gw.Spec.GCP.MachineType,
+		effectiveGCPDiskSizeGB(gw), effectiveGCPSpot(gw), cfg.EnableOSLogin, cfg.UserData,
+		cfg.SharedNetworkName, effectiveWireguardPort(gw), effectiveWGMTU(gw),
+		effectiveWGLinkAddress(gw), strings.ToLower(string(effectiveTrafficPolicy(gw))),
+		gw.Spec.GCP.ProjectID, secretID)
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
 
 // hashedName derives prefix + lowercase base32 of SHA-256 over "<namespace>/<name>",
 // truncated to maxLen. The input is namespace-qualified so equal names do not collide.
@@ -115,6 +133,14 @@ func linkClusterRoleBindingName(gw *wgnetv1alpha1.Gateway) string {
 	return hashedName(linkClusterRoleBindingPrefix, gw.Namespace, gw.Name, linkClusterRoleBindingMaxLen)
 }
 
+// rosterOf is result's roster, empty when no pass has produced one yet.
+func rosterOf(result *gcpmembers.Result) []gcpmembers.RosterEntry {
+	if result == nil {
+		return nil
+	}
+	return result.Roster
+}
+
 // commonLabels are the identifying labels stamped on every child object.
 func commonLabels(gw *wgnetv1alpha1.Gateway, component string) map[string]string {
 	return map[string]string{
@@ -125,10 +151,41 @@ func commonLabels(gw *wgnetv1alpha1.Gateway, component string) map[string]string
 	}
 }
 
-// buildXGatewayGCP builds the Crossplane composite provisioning the gateway VM.
-// forwards is the validated subset to expose; empty opens the underlay port only.
-func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1alpha1.Forward) (*unstructured.Unstructured, error) {
+// xgatewayMember aliases the generated composite's roster entry, so both branches render the
+// roster through one helper.
+type xgatewayMember = struct {
+	CloudSecretIamMemberName string `json:"cloudSecretIamMemberName"`
+	CloudSecretName          string `json:"cloudSecretName"`
+	CloudSecretVersionName   string `json:"cloudSecretVersionName"`
+	KubernetesSecretName     string `json:"kubernetesSecretName"`
+	Name                     string `json:"name"`
+	Slot                     int    `json:"slot"`
+	TunnelAddress            string `json:"tunnelAddress"`
+}
+
+func rosterMembers(roster []gcpmembers.RosterEntry) []xgatewayMember {
+	members := make([]xgatewayMember, 0, len(roster))
+	for _, e := range roster {
+		members = append(members, xgatewayMember{
+			CloudSecretIamMemberName: e.CloudSecretIAMMemberName,
+			CloudSecretName:          e.CloudSecretName,
+			CloudSecretVersionName:   e.CloudSecretVersionName,
+			KubernetesSecretName:     e.KubernetesSecretName,
+			Name:                     e.Name,
+			Slot:                     e.Slot,
+			TunnelAddress:            e.TunnelAddress,
+		})
+	}
+	return members
+}
+
+// buildXGatewayGCP builds the composite for either gateway provisioning branch.
+func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1alpha1.Forward, loadBalanced bool, result *gcpmembers.Result, healthPort int) (*unstructured.Unstructured, error) {
 	id := gcpID(gw.Namespace, gw.Name)
+	secretID, err := gcpmembers.NameBase(string(gw.UID), gw.Spec.GCP.ProjectID)
+	if err != nil {
+		return nil, fmt.Errorf("derive bundle secret id: %w", err)
+	}
 	image := effectiveGCPImage(gw)
 	diskSizeGB := int(effectiveGCPDiskSizeGB(gw))
 	addr := effectiveGCPAddress(gw)
@@ -180,16 +237,38 @@ func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1a
 		Spot:               &spot,
 		EnableOsLogin:      new(cfg.EnableOSLogin),
 		ServiceAccountId:   &id,
-		SecretId:           &id,
-		WgKeySecretRef: &struct {
-			Key  string `json:"key"`
-			Name string `json:"name"`
-		}{Key: wg.BundleKey, Name: bundleSecretName(gw)},
+		SecretId:           secretID,
 	}
 
 	if cfg.UserData != "" {
 		spec.UserData = &cfg.UserData
 	}
+
+	if loadBalanced {
+		enabled := true
+		sessionAffinity := gw.Spec.GCP.LoadBalancer.SessionAffinity
+		targetSize := int(gw.Spec.GCP.Replicas)
+		if result != nil {
+			targetSize = int(result.TargetSize)
+		}
+		zones := effectiveZones(gw)
+		revision := templateRevision(gw, cfg, secretID)
+		hp := healthPort
+
+		spec.LoadBalanced = &enabled
+		spec.SessionAffinity = &sessionAffinity
+		spec.TargetSize = &targetSize
+		spec.Zones = &zones
+		spec.TemplateRevision = &revision
+		spec.HealthPort = &hp
+
+		members := rosterMembers(rosterOf(result))
+		spec.Members = &members
+	} else if roster := rosterOf(result); len(roster) > 0 {
+		members := rosterMembers(roster)
+		spec.Members = &members
+	}
+
 	if len(forwards) > 0 {
 		ports := make([]struct {
 			Port     int    `json:"port"`
@@ -394,14 +473,22 @@ func isLocal(gw *wgnetv1alpha1.Gateway) bool {
 	return effectiveTrafficPolicy(gw) == wgnetv1alpha1.TrafficPolicyLocal
 }
 
-// linkIdentityOf returns the identity derived from the allocated id, nil in Cluster mode
-// and before allocation. Local workload builders require a non-nil result.
-func linkIdentityOf(gw *wgnetv1alpha1.Gateway) *link.Identity {
+// linkIdentityOf returns the Gateway-level identity derived from the allocated id, nil in
+// Cluster mode and before allocation. Local workload builders require a non-nil result.
+func linkIdentityOf(gw *wgnetv1alpha1.Gateway) *link.GatewayIdentity {
 	if !isLocal(gw) || gw.Status.Link.ID <= 0 {
 		return nil
 	}
-	ident := link.NewIdentity(int(gw.Status.Link.ID))
+	ident := link.NewGatewayIdentity(int(gw.Status.Link.ID))
 	return &ident
+}
+
+// effectiveHealthPort returns the local identity port or the cluster default.
+func effectiveHealthPort(gw *wgnetv1alpha1.Gateway) int {
+	if ident := linkIdentityOf(gw); ident != nil {
+		return ident.HealthPort
+	}
+	return clusterHealthPort
 }
 
 // XGatewayGCPGVK is the composite's GroupVersionKind, exported so the manager can
@@ -461,9 +548,33 @@ func buildLinkSecret(gw *wgnetv1alpha1.Gateway, linkPriv, gatewayPub string) *co
 	}
 }
 
-// buildLinkConfigMap builds the link's RuntimeConfig ConfigMap; the private key is
-// mounted separately. The peer endpoint stays empty until the gateway IP is observed.
-func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.Identity) (*corev1.ConfigMap, error) {
+// fleetLinkPeers renders one link peer per fleet member. Local mode overrides every peer's
+// AllowedIPs with the wildcard so cryptokey routing selects a peer for an arbitrary client.
+func fleetLinkPeers(gw *wgnetv1alpha1.Gateway, fleetPeers []gcpmembers.Peer) []link.Peer {
+	keepalive := int(effectiveWGKeepalive(gw))
+	peers := make([]link.Peer, 0, len(fleetPeers))
+	for _, p := range fleetPeers {
+		var endpoint string
+		if p.ExternalAddress != "" {
+			endpoint = net.JoinHostPort(p.ExternalAddress, strconv.Itoa(p.ListenPort))
+		}
+		allowedIPs := []string{p.TunnelAddress + "/32"}
+		if isLocal(gw) {
+			allowedIPs = []string{"0.0.0.0/0"}
+		}
+		peers = append(peers, link.Peer{
+			Slot:                p.Slot,
+			PublicKey:           p.PublicKey,
+			Endpoint:            endpoint,
+			AllowedIPs:          allowedIPs,
+			PersistentKeepalive: keepalive,
+		})
+	}
+	return peers
+}
+
+// buildLinkConfigMap renders the link configuration for either gateway branch.
+func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int) (*corev1.ConfigMap, error) {
 	wgSubnet := effectiveWGSubnet(gw)
 	suffix := wgSubnet
 	if i := strings.LastIndex(suffix, "/"); i >= 0 {
@@ -491,30 +602,42 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []fo
 		linkForwards = append(linkForwards, lf)
 	}
 
-	var endpoint string
-	if address != "" {
-		endpoint = net.JoinHostPort(address, strconv.Itoa(int(effectiveWireguardPort(gw))))
-	}
+	keepalive := int(effectiveWGKeepalive(gw))
 
-	allowedIPs := []string{wgSubnet}
-	if local {
-		// Outbound cryptokey routing must select the peer for an arbitrary client
-		// destination, and inbound validation must admit an arbitrary client source.
-		allowedIPs = []string{"0.0.0.0/0"}
+	// Local mode needs wildcard routes for arbitrary client traffic.
+	wildcardAllowedIPs := []string{"0.0.0.0/0"}
+
+	peers := fleetPeers
+	if gw.Spec.GCP.LoadBalancer != nil && peers == nil {
+		peers = []link.Peer{}
+	}
+	if gw.Spec.GCP.LoadBalancer == nil {
+		var endpoint string
+		if address != "" {
+			endpoint = net.JoinHostPort(address, strconv.Itoa(int(effectiveWireguardPort(gw))))
+		}
+		allowedIPs := []string{wgSubnet}
+		if local {
+			allowedIPs = wildcardAllowedIPs
+		}
+		peers = []link.Peer{{
+			Slot:                0,
+			PublicKey:           gatewayPublicKey,
+			Endpoint:            endpoint,
+			AllowedIPs:          allowedIPs,
+			PersistentKeepalive: keepalive,
+		}}
 	}
 
 	rc := link.RuntimeConfig{
 		TrafficPolicy: string(effectiveTrafficPolicy(gw)),
 		Identity:      ident,
+		HealthPort:    healthPort,
 		WireGuard: link.WireGuard{
 			Address:    fmt.Sprintf("%s/%s", effectiveWGLinkAddress(gw), suffix),
 			ListenPort: 0,
 			MTU:        int(effectiveWGMTU(gw)),
-			Peer: link.Peer{
-				Endpoint:            endpoint,
-				AllowedIPs:          allowedIPs,
-				PersistentKeepalive: int(effectiveWGKeepalive(gw)),
-			},
+			Peers:      peers,
 		},
 		Forwards: linkForwards,
 	}
@@ -667,7 +790,7 @@ func linkSelectorLabels(gw *wgnetv1alpha1.Gateway) map[string]string {
 
 // linkPodSpec builds the pod spec both link workloads share. A nil ident selects Cluster
 // mode (own netns, init container enables ip_forward); non-nil selects host-netns Local.
-func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.Identity) corev1.PodSpec {
+func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.GatewayIdentity) corev1.PodSpec {
 	var runAsUser int64
 	allowPrivilegeEscalation := false
 	terminationGracePeriod := int64(30)
@@ -685,7 +808,9 @@ func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.Identity) co
 
 	healthAddr := ":" + strconv.Itoa(clusterHealthPort)
 	if ident != nil {
-		healthAddr = "127.0.0.1:" + strconv.Itoa(ident.HealthPort)
+		// Wildcard, not loopback: a load-balanced Local Gateway's health check can arrive
+		// over the tunnel interface, not just from the local node.
+		healthAddr = ":" + strconv.Itoa(ident.HealthPort)
 	}
 
 	env := []corev1.EnvVar{
@@ -865,7 +990,7 @@ func buildLinkDeployment(gw *wgnetv1alpha1.Gateway, cfg Config) *appsv1.Deployme
 
 // buildLinkDaemonSet builds the Local-mode link DaemonSet, one host-network pod per node.
 // ident must be non-nil: every name, mark, route table and health port derives from it.
-func buildLinkDaemonSet(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.Identity) *appsv1.DaemonSet {
+func buildLinkDaemonSet(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.GatewayIdentity) *appsv1.DaemonSet {
 	selector := linkSelectorLabels(gw)
 
 	return &appsv1.DaemonSet{

@@ -36,6 +36,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/greg2010/wireguard-gateway-operator/internal/gcpdiscovery"
+	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
@@ -68,11 +70,22 @@ const (
 	reasonUnsupportedServiceType      = "UnsupportedServiceType"
 	reasonServiceNotFound             = "ServiceNotFound"
 	reasonTargetPortNotListening      = "TargetPortNotListening"
+
+	// GCP-fleet Ready=False reasons.
+	reasonInvalidTunnelAddresses      = "InvalidTunnelAddresses"
+	reasonInsufficientTunnelAddresses = "InsufficientTunnelAddresses"
+	reasonReservedHealthPort          = "ReservedHealthPort"
+	reasonMemberDiscoveryFailed       = "MemberDiscoveryFailed"
+	reasonMembersNotReady             = "MembersNotReady"
 )
 
 // reasonUnresolvedBackendPort is event-only, never a Ready reason: the forward stays
 // valid, but its named targetPort widens the link's egress rule to the whole protocol.
 const reasonUnresolvedBackendPort = "UnresolvedBackendPort"
+
+// reasonMemberCleanupBlocked is an event-only reason: a blocked departure is reported on the
+// member's own status.gcp.members entry, never in the Ready condition.
+const reasonMemberCleanupBlocked = "MemberCleanupBlocked"
 
 // crossNamespaceIngressLabel is the consent label a target namespace must carry before a
 // Gateway elsewhere may forward public traffic into it.
@@ -112,6 +125,12 @@ type GatewayReconciler struct {
 	// unresolvedWarned maps a Gateway UID to the last warned unresolved-backend-port signature,
 	// suppressing an identical Warning every requeue. In-memory: a restart warns once more.
 	unresolvedWarned sync.Map
+
+	// gcpCreds shares a client until its operator-wide credential bytes change.
+	gcpCreds gcpCredentialCache
+
+	gcpAddressRefreshed sync.Map
+	now                 func() time.Time
 }
 
 // +kubebuilder:rbac:groups=wgnet.dev,resources=gateways,verbs=get;list;watch;create;update;patch;delete
@@ -121,7 +140,8 @@ type GatewayReconciler struct {
 // +kubebuilder:rbac:groups=infra.wgnet.dev,resources=xgatewaygcps/status,verbs=get
 // +kubebuilder:rbac:groups=infra.wgnet.dev,resources=xgatewaynetworks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=infra.wgnet.dev,resources=xgatewaynetworks/status,verbs=get
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=secretmanager.gcp.m.upbound.io,resources=secrets;secretversions;secretiammembers,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=create;get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
@@ -161,6 +181,21 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
+	eligibleAddresses, tunnelOK, tunnelReason := tunnelAddresses(
+		effectiveWGSubnet(&gw), effectiveWGGatewayAddress(&gw), effectiveWGLinkAddress(&gw))
+	if !tunnelOK {
+		r.warnInvalidTunnelAddresses(&gw, tunnelReason)
+		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", linkStatus{},
+			readySignals{InvalidTunnelAddresses: true, InvalidTunnelMessage: tunnelReason}, nil); serr != nil {
+			return ctrl.Result{}, fmt.Errorf("mirror status: %w", serr)
+		}
+		logger.V(1).Info("gateway not provisioned: invalid tunnel addresses", "reason", tunnelReason)
+		return ctrl.Result{RequeueAfter: validationRequeueAfter}, nil
+	}
+	// Suppression covers a repeat of an unchanged state: once validation passes, the same
+	// reason recurring later warns again.
+	r.unresolvedWarned.Delete(invalidTunnelWarnKeyPrefix + unresolvedWarnKey(&gw))
+
 	valid, invalid, err := r.classifyForwards(ctx, &gw)
 	if err != nil {
 		return r.fail(ctx, &gw, "classify forwards", err)
@@ -171,8 +206,18 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.fail(ctx, &gw, "check xgatewaygcp existence", err)
 	}
 
-	// Requeue on the transient floor when an invalid forward can clear on its own, so
-	// the Gateway converges without a spec edit once a backend catches up.
+	if err := r.ensureLinkID(ctx, &gw); err != nil {
+		if errors.Is(err, errNoFreeLinkID) {
+			return r.failReported(ctx, &gw, "allocate link id", err)
+		}
+		return r.fail(ctx, &gw, "allocate link id", err)
+	}
+
+	// Health-port validation requires the allocated local link ID.
+	valid, invalid, rejectedOnHealthPort := rejectReservedHealthPort(&gw, valid, invalid)
+	r.warnReservedHealthPort(&gw, rejectedOnHealthPort)
+
+	// Provision only when validation leaves at least one usable forward.
 	if len(valid) == 0 && !provisioned {
 		// Read the link the healthy path's way: it may still hold its Lease and serve
 		// the last applied config, and status.link must not blink on this pass.
@@ -180,7 +225,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if lerr != nil {
 			return r.fail(ctx, &gw, "read link activity", lerr)
 		}
-		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", false, invalid, ls, ""); serr != nil {
+		if serr := r.mirrorStatusWithForwards(ctx, &gw, "", "", ls,
+			readySignals{InvalidForward: firstInvalidForward(invalid)}, nil); serr != nil {
 			return ctrl.Result{}, fmt.Errorf("mirror status: %w", serr)
 		}
 		result := ctrl.Result{}
@@ -191,12 +237,46 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return result, nil
 	}
 
-	if err := r.ensureLinkID(ctx, &gw); err != nil {
-		if errors.Is(err, errNoFreeLinkID) {
-			return r.failReported(ctx, &gw, "allocate link id", err)
-		}
-		return r.fail(ctx, &gw, "allocate link id", err)
+	loadBalanced := gw.Spec.GCP.LoadBalancer != nil
+	healthPort := effectiveHealthPort(&gw)
+
+	// Read observed names before apply because roster rendering depends on them.
+	observed, err := r.readXGatewayGCPStatus(ctx, &gw)
+	if err != nil {
+		return r.fail(ctx, &gw, "read xgatewaygcp status", err)
 	}
+	address, saEmail, message := observed.Address, observed.ServiceAccountEmail, observed.Message
+
+	// Capacity decides before anything is written: over the bound no secret, no shared
+	// network and no composite is touched this pass.
+	if limit := capacity(effectiveWGSubnet(&gw)); loadBalanced && int(gw.Spec.GCP.Replicas) > limit {
+		capacityMessage := fmt.Sprintf("spec.gcp.replicas %d exceeds capacity %d of spec.wireguard.subnet",
+			gw.Spec.GCP.Replicas, limit)
+		r.warnInsufficientTunnelAddresses(&gw, capacityMessage)
+		if aerr := r.applyOverCapacityXGatewayGCP(ctx, &gw, forwardSpecs(valid), healthPort); aerr != nil {
+			return r.fail(ctx, &gw, "ensure xgatewaygcp", aerr)
+		}
+		ls, lerr := r.linkStatusOf(ctx, &gw)
+		if lerr != nil {
+			return r.fail(ctx, &gw, "read link activity", lerr)
+		}
+		if serr := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ls, readySignals{
+			InvalidForward:       firstInvalidForward(invalid),
+			LinkFaultReason:      ls.FaultReason,
+			LinkFaultMessage:     ls.FaultMessage,
+			LoadBalanced:         true,
+			InsufficientCapacity: true,
+			CapacityMessage:      capacityMessage,
+			ProvisionMessage:     message,
+		}, nil); serr != nil {
+			return ctrl.Result{}, fmt.Errorf("mirror status: %w", serr)
+		}
+		logger.V(1).Info("gateway not provisioned: insufficient tunnel addresses",
+			"replicas", gw.Spec.GCP.Replicas, "capacity", limit)
+		return ctrl.Result{RequeueAfter: r.steadyRequeue(loadBalanced)}, nil
+	}
+	// As with the tunnel-address warning: a pass that fits releases the suppression.
+	r.unresolvedWarned.Delete(capacityWarnKeyPrefix + unresolvedWarnKey(&gw))
 
 	if err := r.ensureSecrets(ctx, &gw); err != nil {
 		return r.fail(ctx, &gw, "ensure key secrets", err)
@@ -204,16 +284,48 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.ensureXGatewayNetwork(ctx); err != nil {
 		return r.fail(ctx, &gw, "ensure shared network", err)
 	}
-	if err := r.ensureXGatewayGCP(ctx, &gw, forwardSpecs(valid)); err != nil {
+
+	var result *gcpmembers.Result
+	var discoveryFailed bool
+	var discoveryMessage string
+	if loadBalanced {
+		result, discoveryFailed, discoveryMessage, err = r.reconcileMembers(ctx, &gw, observed.MIGName, eligibleAddresses)
+		if err != nil {
+			return r.fail(ctx, &gw, "reconcile gcp members", err)
+		}
+	} else {
+		result, err = r.reconcileSingleMember(ctx, &gw, observed.InstanceName)
+		if err != nil {
+			return r.fail(ctx, &gw, "reconcile single instance member", err)
+		}
+	}
+
+	if err := r.ensureXGatewayGCP(ctx, &gw, forwardSpecs(valid), loadBalanced, result, healthPort); err != nil {
 		return r.fail(ctx, &gw, "ensure xgatewaygcp", err)
 	}
 
-	address, saEmail, message, err := r.readXGatewayGCPStatus(ctx, &gw)
-	if err != nil {
-		return r.fail(ctx, &gw, "read xgatewaygcp status", err)
+	var fleetPeers []link.Peer
+	switch {
+	case loadBalanced && result != nil && !result.Unusable:
+		fleetPeers = fleetLinkPeers(&gw, fillPeerListenPort(result.Peers, int(effectiveWireguardPort(&gw))))
+	case loadBalanced:
+		// A pass with no usable snapshot publishes no membership: keep the peers the last
+		// usable pass applied rather than unpeering a live fleet.
+		fleetPeers, err = r.appliedLinkPeers(ctx, &gw)
+		if err != nil {
+			return r.fail(ctx, &gw, "read applied link peers", err)
+		}
 	}
 
-	if err := r.ensureLink(ctx, &gw, address, valid, linkIdentityOf(&gw)); err != nil {
+	var gatewayPublicKey string
+	if !loadBalanced {
+		gatewayPublicKey, err = r.readLinkPeerPublicKey(ctx, &gw)
+		if err != nil {
+			return r.fail(ctx, &gw, "read link peer public key", err)
+		}
+	}
+
+	if err := r.ensureLink(ctx, &gw, address, valid, linkIdentityOf(&gw), gatewayPublicKey, fleetPeers, healthPort); err != nil {
 		return r.fail(ctx, &gw, "ensure link", err)
 	}
 
@@ -226,22 +338,45 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.fail(ctx, &gw, "read link activity", err)
 	}
 
-	ready := address != "" && ls.Active && len(invalid) == 0 && ls.FaultReason == ""
-	if err := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ready, invalid, ls, message); err != nil {
+	ready := address != "" && ls.Active
+	provisionAddress := ""
+	if ready {
+		provisionAddress = address
+	}
+
+	signals := readySignals{
+		InvalidForward:   firstInvalidForward(invalid),
+		LinkFaultReason:  ls.FaultReason,
+		LinkFaultMessage: ls.FaultMessage,
+		LoadBalanced:     loadBalanced,
+		DiscoveryFailed:  discoveryFailed,
+		DiscoveryMessage: discoveryMessage,
+		PeerCount:        len(fleetPeers),
+		MembersNotReady:  loadBalanced && !ls.Active,
+		ProvisionAddress: provisionAddress,
+		ProvisionMessage: message,
+	}
+	// status.gcp.members mirrors a fleet: the single-Instance branch's own record is
+	// published through the composite roster and carries no membership status.
+	var membersResult *gcpmembers.Result
+	if loadBalanced {
+		membersResult = result
+	}
+	if err := r.mirrorStatusWithForwards(ctx, &gw, address, saEmail, ls, signals, membersResult); err != nil {
 		return ctrl.Result{}, fmt.Errorf("mirror status: %w", err)
 	}
 
 	// Transient invalid forwards requeue on the transient floor, independent of the
 	// steady-state poll (which may be zero in tests).
-	result := ctrl.Result{RequeueAfter: r.Config.RequeueInterval}
+	reconcileResult := ctrl.Result{RequeueAfter: r.steadyRequeue(loadBalanced)}
 	if anyTransientReason(invalid) {
-		result.RequeueAfter = validationRequeueAfter
+		reconcileResult.RequeueAfter = validationRequeueAfter
 	}
 
 	logger.V(1).Info("reconciled gateway",
 		"address", address, "linkActive", ls.Active, "activeNode", ls.Node, "linkFault", ls.FaultReason, "ready", ready,
 		"valid", len(valid), "invalid", len(invalid))
-	return result, nil
+	return reconcileResult, nil
 }
 
 // invalidForward is a forward classifyForwards rejected, paired with the
@@ -555,8 +690,20 @@ func (r *GatewayReconciler) releaseFinalizer(ctx context.Context, gw *wgnetv1alp
 	if err := r.Update(ctx, gw); err != nil {
 		return ctrl.Result{}, fmt.Errorf("remove finalizer: %w", err)
 	}
-	r.unresolvedWarned.Delete(unresolvedWarnKey(gw))
+	r.dropWarnSuppression(gw)
+	r.gcpAddressRefreshed.Delete(gatewayRefreshKey(gw))
 	return ctrl.Result{}, nil
+}
+
+// dropWarnSuppression clears the suppression entries the Gateway being deleted owns, so a
+// Gateway re-created under the same name warns again on the same condition.
+func (r *GatewayReconciler) dropWarnSuppression(gw *wgnetv1alpha1.Gateway) {
+	key := unresolvedWarnKey(gw)
+	r.unresolvedWarned.Delete(key)
+	r.unresolvedWarned.Delete(blockedCleanupWarnKeyPrefix + key)
+	r.unresolvedWarned.Delete(invalidTunnelWarnKeyPrefix + key)
+	r.unresolvedWarned.Delete(capacityWarnKeyPrefix + key)
+	r.unresolvedWarned.Delete(reservedHealthPortWarnKeyPrefix + key)
 }
 
 // linkTeardownRequeueAfter paces the wait for the link pods to exit. Nothing watches
@@ -788,8 +935,7 @@ func lowestFreeLinkID(gateways []wgnetv1alpha1.Gateway, self client.ObjectKey) (
 	return 0, false
 }
 
-// ensureSecrets generates the key material once into the owner-ref'd bundle and link
-// Secrets. Existing Secrets are untouched: keys are never rotated, and GC reaps them.
+// ensureSecrets writes both key Secrets from one pair when either is missing.
 func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
 	bundleExists, err := r.objectExists(ctx, gw.Namespace, bundleSecretName(gw), &corev1.Secret{})
 	if err != nil {
@@ -816,19 +962,27 @@ func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1
 		return fmt.Errorf("generate link keypair: %w", err)
 	}
 
-	if err := r.createOwned(ctx, gw, buildBundleSecret(gw, gatewayPriv, linkPub)); err != nil {
-		return fmt.Errorf("create bundle secret: %w", err)
+	if err := r.apply(ctx, gw, buildBundleSecret(gw, gatewayPriv, linkPub)); err != nil {
+		return fmt.Errorf("write bundle secret: %w", err)
 	}
-	if err := r.createOwned(ctx, gw, buildLinkSecret(gw, linkPriv, gatewayPub)); err != nil {
-		return fmt.Errorf("create link secret: %w", err)
+	if err := r.apply(ctx, gw, buildLinkSecret(gw, linkPriv, gatewayPub)); err != nil {
+		return fmt.Errorf("write link secret: %w", err)
 	}
 	return nil
 }
 
-// ensureXGatewayGCP server-side-applies the composite, leaving Crossplane's status and
-// defaulted fields intact. forwards is the subset whose ports the firewall opens.
-func (r *GatewayReconciler) ensureXGatewayGCP(ctx context.Context, gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.Forward) error {
-	desired, err := buildXGatewayGCP(gw, r.Config, forwards)
+// ensureXGatewayGCP server-side applies the composite without changing its status.
+func (r *GatewayReconciler) ensureXGatewayGCP(ctx context.Context, gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.Forward, loadBalanced bool, result *gcpmembers.Result, healthPort int) error {
+	if result != nil {
+		roster, err := r.passRoster(ctx, gw, result)
+		if err != nil {
+			return err
+		}
+		pass := *result
+		pass.Roster = roster
+		result = &pass
+	}
+	desired, err := buildXGatewayGCP(gw, r.Config, forwards, loadBalanced, result, healthPort)
 	if err != nil {
 		return err
 	}
@@ -845,6 +999,368 @@ func (r *GatewayReconciler) ensureXGatewayGCP(ctx context.Context, gw *wgnetv1al
 	return nil
 }
 
+// applyOverCapacityXGatewayGCP preserves the existing target size and roster.
+func (r *GatewayReconciler) applyOverCapacityXGatewayGCP(ctx context.Context, gw *wgnetv1alpha1.Gateway, forwards []wgnetv1alpha1.Forward, healthPort int) error {
+	exists, err := r.xgatewayGCPExists(ctx, gw)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	targetSize, err := r.readXGatewayGCPTargetSize(ctx, gw)
+	if err != nil {
+		return err
+	}
+	// The unusable result retains the applied roster.
+	return r.ensureXGatewayGCP(ctx, gw, forwards, true, &gcpmembers.Result{TargetSize: targetSize, Unusable: true}, healthPort)
+}
+
+// parseCredentialsSecretRef accepts an empty setting or exactly "<namespace>/<name>".
+func parseCredentialsSecretRef(setting string) (namespace, name string, err error) {
+	if setting == "" {
+		return "", "", nil
+	}
+	namespace, name, found := strings.Cut(setting, "/")
+	if !found || namespace == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("gcp credentials secret %q: want \"<namespace>/<name>\"", setting)
+	}
+	return namespace, name, nil
+}
+
+// appliedLinkPeers reads the peer list already applied to the link ConfigMap, nil when there is
+// no ConfigMap yet. It is the last usable pass's membership, which an unusable pass keeps.
+func (r *GatewayReconciler) appliedLinkPeers(ctx context.Context, gw *wgnetv1alpha1.Gateway) ([]link.Peer, error) {
+	var cm corev1.ConfigMap
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: linkComponentName(gw)}
+	if err := r.Get(ctx, key, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get link configmap %s: %w", key, err)
+	}
+	var rc link.RuntimeConfig
+	if err := json.Unmarshal([]byte(cm.Data[linkConfigKey]), &rc); err != nil {
+		return nil, fmt.Errorf("decode link runtime config %s: %w", key, err)
+	}
+	return rc.WireGuard.Peers, nil
+}
+
+// passRoster retains the composite roster when discovery is unusable.
+func (r *GatewayReconciler) passRoster(ctx context.Context, gw *wgnetv1alpha1.Gateway, result *gcpmembers.Result) ([]gcpmembers.RosterEntry, error) {
+	if !result.Unusable {
+		return result.Roster, nil
+	}
+	xg := newXGatewayGCP()
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}
+	if err := r.Get(ctx, key, xg); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get xgatewaygcp %s for applied members: %w", key, err)
+	}
+	raw, found, err := unstructured.NestedSlice(xg.Object, "spec", "members")
+	if err != nil {
+		return nil, fmt.Errorf("read spec.members of %s: %w", key, err)
+	}
+	if !found {
+		return nil, nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("encode applied members of %s: %w", key, err)
+	}
+	var applied []struct {
+		CloudSecretIAMMemberName string `json:"cloudSecretIamMemberName"`
+		CloudSecretName          string `json:"cloudSecretName"`
+		CloudSecretVersionName   string `json:"cloudSecretVersionName"`
+		KubernetesSecretName     string `json:"kubernetesSecretName"`
+		Name                     string `json:"name"`
+		Slot                     int    `json:"slot"`
+		TunnelAddress            string `json:"tunnelAddress"`
+	}
+	if err := json.Unmarshal(data, &applied); err != nil {
+		return nil, fmt.Errorf("decode applied members of %s: %w", key, err)
+	}
+	entries := make([]gcpmembers.RosterEntry, 0, len(applied))
+	for _, m := range applied {
+		entries = append(entries, gcpmembers.RosterEntry{
+			Name:          m.Name,
+			Slot:          m.Slot,
+			TunnelAddress: m.TunnelAddress,
+			ManagedResourceNames: gcpmembers.ManagedResourceNames{
+				KubernetesSecretName:     m.KubernetesSecretName,
+				CloudSecretName:          m.CloudSecretName,
+				CloudSecretVersionName:   m.CloudSecretVersionName,
+				CloudSecretIAMMemberName: m.CloudSecretIAMMemberName,
+			},
+		})
+	}
+	return entries, nil
+}
+
+// fillPeerListenPort supplies the Gateway-wide port omitted by member reconciliation.
+func fillPeerListenPort(peers []gcpmembers.Peer, port int) []gcpmembers.Peer {
+	out := make([]gcpmembers.Peer, len(peers))
+	for i, p := range peers {
+		p.ListenPort = port
+		out[i] = p
+	}
+	return out
+}
+
+// readLinkPeerPublicKey reads the single-instance peer key from the link Secret.
+func (r *GatewayReconciler) readLinkPeerPublicKey(ctx context.Context, gw *wgnetv1alpha1.Gateway) (string, error) {
+	var secret corev1.Secret
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: linkSecretName(gw)}
+	if err := r.Get(ctx, key, &secret); err != nil {
+		return "", fmt.Errorf("get link secret %s for peer public key: %w", key, err)
+	}
+	return string(secret.Data[wg.LinkPeerPublicKey]), nil
+}
+
+// readXGatewayGCPTargetSize reads the composite's own current spec.targetSize (0 when the
+// composite does not exist yet), gcpmembers.Reconcile's lastAcceptedTargetSize input.
+func (r *GatewayReconciler) readXGatewayGCPTargetSize(ctx context.Context, gw *wgnetv1alpha1.Gateway) (int32, error) {
+	xg := newXGatewayGCP()
+	if err := r.Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}, xg); err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("get xgatewaygcp for target size: %w", err)
+	}
+	v, found, err := unstructured.NestedInt64(xg.Object, "spec", "targetSize")
+	if err != nil {
+		return 0, fmt.Errorf("read spec.targetSize: %w", err)
+	}
+	if !found {
+		return 0, nil
+	}
+	return int32(v), nil
+}
+
+// steadyRequeue is the steady-state poll: a load-balanced Gateway re-lists its fleet no more
+// often than GCPDiscoveryInterval, every other Gateway keeps the general RequeueInterval.
+func (r *GatewayReconciler) steadyRequeue(loadBalanced bool) time.Duration {
+	if loadBalanced && r.Config.GCPDiscoveryInterval > r.Config.RequeueInterval {
+		return r.Config.GCPDiscoveryInterval
+	}
+	return r.Config.RequeueInterval
+}
+
+// readGatewayKeys reads the key material ensureSecrets generated once: the VM's own private
+// key and the link's public key, both from the Gateway's bundle Secret.
+func (r *GatewayReconciler) readGatewayKeys(ctx context.Context, gw *wgnetv1alpha1.Gateway) (gatewayPrivateKey, linkPublicKey string, err error) {
+	var secret corev1.Secret
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: bundleSecretName(gw)}
+	if err := r.Get(ctx, key, &secret); err != nil {
+		return "", "", fmt.Errorf("get bundle secret %s: %w", key, err)
+	}
+	gatewayPrivateKey, rest, _ := strings.Cut(string(secret.Data[wg.BundleKey]), "\n")
+	linkPublicKey, _, _ = strings.Cut(rest, "\n")
+	if gatewayPrivateKey == "" || linkPublicKey == "" {
+		return "", "", fmt.Errorf("bundle secret %s carries no gateway key pair", key)
+	}
+	return gatewayPrivateKey, linkPublicKey, nil
+}
+
+// bundleInputs are the values every member's bundle payload carries beside its own key,
+// address and slot: they are uniform across a Gateway.
+func bundleInputs(gw *wgnetv1alpha1.Gateway, linkPublicKey string) gcpmembers.BundleInputs {
+	return gcpmembers.BundleInputs{
+		SubnetPrefix:   subnetPrefix(effectiveWGSubnet(gw)),
+		PeerPublicKey:  linkPublicKey,
+		PeerAllowedIPs: effectiveWGLinkAddress(gw) + "/32",
+	}
+}
+
+// reconcileSingleMember retains the applied roster until an instance name is observed.
+func (r *GatewayReconciler) reconcileSingleMember(ctx context.Context, gw *wgnetv1alpha1.Gateway, instanceName string) (*gcpmembers.Result, error) {
+	if instanceName == "" {
+		return &gcpmembers.Result{Unusable: true}, nil
+	}
+	gatewayPrivateKey, linkPublicKey, err := r.readGatewayKeys(ctx, gw)
+	if err != nil {
+		return nil, err
+	}
+	gatewayPublicKey, err := r.readLinkPeerPublicKey(ctx, gw)
+	if err != nil {
+		return nil, err
+	}
+	deps := gcpmembers.NewKubernetesDeps(r.Client, r.APIReader, gw.UID, gw.Spec.GCP.ProjectID)
+	res, err := gcpmembers.ReconcileSingle(ctx, deps, string(gw.UID), gw.Namespace, gw.Name,
+		gw.Spec.GCP.ProjectID, instanceName, effectiveWGGatewayAddress(gw),
+		gatewayPrivateKey, gatewayPublicKey, bundleInputs(gw, linkPublicKey))
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// reconcileMembers runs one discovery-and-allocation pass for a load-balanced Gateway.
+func (r *GatewayReconciler) reconcileMembers(ctx context.Context, gw *wgnetv1alpha1.Gateway, migName string, eligibleAddresses []string) (result *gcpmembers.Result, discoveryFailed bool, discoveryMessage string, err error) {
+	if migName == "" {
+		waiting, werr := r.dependencyWaitResult(ctx, gw)
+		return waiting, false, "", werr
+	}
+
+	deps := gcpmembers.NewKubernetesDeps(r.Client, r.APIReader, gw.UID, gw.Spec.GCP.ProjectID)
+	names, nerr := deps.ListRecordNames(ctx, gw.Namespace, gw.Name)
+	if nerr != nil {
+		return nil, false, "", fmt.Errorf("list member records: %w", nerr)
+	}
+	records := make([]gcpmembers.Record, 0, len(names))
+	for _, name := range names {
+		rec, found, rerr := deps.GetRecord(ctx, gw.Namespace, gw.Name, name)
+		if rerr != nil {
+			return nil, false, "", fmt.Errorf("get member record %q: %w", name, rerr)
+		}
+		if found {
+			records = append(records, *rec)
+		}
+	}
+	recorded := discoveryRecorded(records)
+	now := time.Now()
+	if r.now != nil {
+		now = r.now()
+	}
+	refreshNames := []string(nil)
+	if gcpAddressRefreshDue(&r.gcpAddressRefreshed, gatewayRefreshKey(gw), now, r.Config.GCPAddressRefreshInterval) {
+		refreshNames = names
+	}
+
+	var snap *gcpdiscovery.Snapshot
+	credNamespace, credName, cerr := parseCredentialsSecretRef(r.Config.GCPCredentialsSecret)
+	if cerr != nil {
+		return nil, false, "", cerr
+	}
+	discClient, cerr := r.gcpCreds.clientFor(ctx, r.APIReader, credNamespace, credName, r.Config.GCPCredentialsKey)
+	if cerr != nil {
+		discoveryFailed = true
+		discoveryMessage = cerr.Error()
+	} else {
+		listed, lerr := discClient.List(ctx, gw.Spec.GCP.ProjectID, gw.Spec.GCP.Region, migName, recorded, refreshNames)
+		if lerr != nil {
+			discoveryFailed = true
+			discoveryMessage = lerr.Error()
+		} else {
+			snap = &listed
+			r.gcpAddressRefreshed.Store(gatewayRefreshKey(gw), now)
+		}
+	}
+
+	lastTargetSize, terr := r.readXGatewayGCPTargetSize(ctx, gw)
+	if terr != nil {
+		return nil, false, "", terr
+	}
+	_, linkPublicKey, kerr := r.readGatewayKeys(ctx, gw)
+	if kerr != nil {
+		return nil, false, "", kerr
+	}
+	res, rerr := gcpmembers.Reconcile(ctx, deps, string(gw.UID), gw.Namespace, gw.Name, gw.Spec.GCP.ProjectID,
+		snap, gw.Spec.GCP.Replicas, capacity(effectiveWGSubnet(gw)), eligibleAddresses,
+		effectiveWGGatewayAddress(gw), lastTargetSize, bundleInputs(gw, linkPublicKey))
+	if rerr != nil {
+		return nil, false, "", rerr
+	}
+	if res.Unusable && discoveryMessage == "" {
+		discoveryFailed = true
+		discoveryMessage = "gcp member discovery pass produced no usable snapshot"
+	}
+	// An unusable pass neither changes cleanup warnings nor releases suppression.
+	if !res.Unusable {
+		r.warnBlockedMemberCleanup(gw, blockedMemberCleanups(&res))
+	}
+	return &res, discoveryFailed, discoveryMessage, nil
+}
+
+// dependencyWaitResult retains applied membership while the MIG name is unavailable.
+func (r *GatewayReconciler) dependencyWaitResult(ctx context.Context, gw *wgnetv1alpha1.Gateway) (*gcpmembers.Result, error) {
+	exists, err := r.xgatewayGCPExists(ctx, gw)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, nil
+	}
+	targetSize, err := r.readXGatewayGCPTargetSize(ctx, gw)
+	if err != nil {
+		return nil, err
+	}
+	return &gcpmembers.Result{TargetSize: targetSize, Unusable: true}, nil
+}
+
+// blockedCleanupWarnKeyPrefix distinguishes warnBlockedMemberCleanup's suppression entries
+// from the other warn helpers' in the shared unresolvedWarned map.
+const blockedCleanupWarnKeyPrefix = "member-cleanup/"
+
+// blockedMemberCleanups are the members whose confirmation could not complete this pass:
+// Departed carrying the message naming what blocks the release.
+func blockedMemberCleanups(result *gcpmembers.Result) []wgnetv1alpha1.GatewayGCPMemberStatus {
+	if result == nil {
+		return nil
+	}
+	blocked := make([]wgnetv1alpha1.GatewayGCPMemberStatus, 0, len(result.Members))
+	for _, m := range result.Members {
+		if m.State == wgnetv1alpha1.GatewayGCPMemberDeparted && m.Message != "" {
+			blocked = append(blocked, m)
+		}
+	}
+	return blocked
+}
+
+// warnBlockedMemberCleanup emits one Warning per member whose departure cannot complete, only when
+// the blocked set changed: the block persists until its cause clears, so a requeue must not warn.
+func (r *GatewayReconciler) warnBlockedMemberCleanup(gw *wgnetv1alpha1.Gateway, blocked []wgnetv1alpha1.GatewayGCPMemberStatus) {
+	if r.Recorder == nil {
+		return
+	}
+	key := blockedCleanupWarnKeyPrefix + unresolvedWarnKey(gw)
+	if len(blocked) == 0 {
+		r.unresolvedWarned.Delete(key)
+		return
+	}
+	signature := blockedCleanupSignature(blocked)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == signature {
+		return
+	}
+	r.unresolvedWarned.Store(key, signature)
+	for _, m := range blocked {
+		r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonMemberCleanupBlocked, actionReconcile,
+			"member %q has departed but its cleanup cannot complete: %s", m.Name, m.Message)
+	}
+}
+
+func blockedCleanupSignature(blocked []wgnetv1alpha1.GatewayGCPMemberStatus) string {
+	parts := make([]string, 0, len(blocked))
+	for _, m := range blocked {
+		parts = append(parts, m.Name+"="+m.Message)
+	}
+	return strings.Join(parts, ",")
+}
+
+func discoveryRecorded(records []gcpmembers.Record) []gcpdiscovery.Recorded {
+	recorded := make([]gcpdiscovery.Recorded, 0, len(records))
+	for _, rec := range records {
+		recorded = append(recorded, gcpdiscovery.Recorded{Name: rec.Name, ExternalAddress: rec.ExternalAddress, InstanceID: rec.InstanceID})
+	}
+	return recorded
+}
+
+func gatewayRefreshKey(gw *wgnetv1alpha1.Gateway) string { return gw.Namespace + "/" + gw.Name }
+
+func gcpAddressRefreshDue(refreshed *sync.Map, key string, now time.Time, interval time.Duration) bool {
+	last, found := refreshed.Load(key)
+	if !found {
+		return true
+	}
+	at, ok := last.(time.Time)
+	if !ok {
+		return true
+	}
+	return now.Sub(at) >= interval
+}
+
 // ensureXGatewayNetwork applies the singleton shared-VPC composite before anything
 // references it. It is unowned and re-created here if a racing last-delete tore it down.
 func (r *GatewayReconciler) ensureXGatewayNetwork(ctx context.Context) error {
@@ -859,9 +1375,8 @@ func (r *GatewayReconciler) ensureXGatewayNetwork(ctx context.Context) error {
 	return nil
 }
 
-// ensureLink applies the link RBAC and ConfigMap, then the mode's workload. Local skips the
-// NetworkPolicy (it cannot select host-network pods) and the PDB (it would block node drains).
-func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.Identity) error {
+// ensureLink applies common link resources and the mode-specific workload.
+func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int) error {
 	if err := r.apply(ctx, gw, buildLinkServiceAccount(gw)); err != nil {
 		return err
 	}
@@ -872,7 +1387,7 @@ func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Ga
 		return err
 	}
 
-	cm, err := buildLinkConfigMap(gw, address, backends, ident)
+	cm, err := buildLinkConfigMap(gw, address, backends, ident, gatewayPublicKey, fleetPeers, healthPort)
 	if err != nil {
 		return err
 	}
@@ -961,29 +1476,44 @@ func (r *GatewayReconciler) xgatewayGCPExists(ctx context.Context, gw *wgnetv1al
 	return true, nil
 }
 
-// readXGatewayGCPStatus reads the composite's observed address, serviceAccountEmail and
-// message. A missing composite yields empty values: the apply has not yet propagated.
-func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnetv1alpha1.Gateway) (address, saEmail, message string, err error) {
+// compositeStatus holds observed Crossplane values used by reconciliation.
+type compositeStatus struct {
+	Address             string
+	ServiceAccountEmail string
+	Message             string
+	MIGName             string
+	InstanceName        string
+}
+
+// readXGatewayGCPStatus reads the composite's observed status. A missing composite yields
+// zero values: the apply has not yet propagated.
+func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnetv1alpha1.Gateway) (compositeStatus, error) {
 	xg := newXGatewayGCP()
 	if err := r.Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}, xg); err != nil {
 		if apierrors.IsNotFound(err) {
-			return "", "", "", nil
+			return compositeStatus{}, nil
 		}
-		return "", "", "", fmt.Errorf("get xgatewaygcp: %w", err)
+		return compositeStatus{}, fmt.Errorf("get xgatewaygcp: %w", err)
 	}
-	address, _, err = unstructured.NestedString(xg.Object, "status", "address")
-	if err != nil {
-		return "", "", "", fmt.Errorf("read status.address: %w", err)
+	var status compositeStatus
+	into := []struct {
+		field string
+		dest  *string
+	}{
+		{"address", &status.Address},
+		{"serviceAccountEmail", &status.ServiceAccountEmail},
+		{"message", &status.Message},
+		{"migName", &status.MIGName},
+		{"instanceName", &status.InstanceName},
 	}
-	saEmail, _, err = unstructured.NestedString(xg.Object, "status", "serviceAccountEmail")
-	if err != nil {
-		return "", "", "", fmt.Errorf("read status.serviceAccountEmail: %w", err)
+	for _, f := range into {
+		value, _, err := unstructured.NestedString(xg.Object, "status", f.field)
+		if err != nil {
+			return compositeStatus{}, fmt.Errorf("read status.%s: %w", f.field, err)
+		}
+		*f.dest = value
 	}
-	message, _, err = unstructured.NestedString(xg.Object, "status", "message")
-	if err != nil {
-		return "", "", "", fmt.Errorf("read status.message: %w", err)
-	}
-	return address, saEmail, message, nil
+	return status, nil
 }
 
 // linkStatus is what the operator observes about a Gateway's link from the Lease and
@@ -1071,44 +1601,77 @@ func (r *GatewayReconciler) linkStatusOf(ctx context.Context, gw *wgnetv1alpha1.
 	return ls, nil
 }
 
-// Ready precedence: invalid forward, then link fault, then ready, then provisioning. An unchanged
-// status is not written, to avoid a write loop; compositeMessage reaches Provisioning only.
-func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway, address, saEmail string, ready bool, invalid []invalidForward, ls linkStatus, compositeMessage string) error {
-	cond := metav1.Condition{Type: conditionReady}
+// readySignals holds the inputs to Ready-condition precedence.
+type readySignals struct {
+	InvalidTunnelAddresses bool
+	InvalidTunnelMessage   string
+	InvalidForward         *invalidForward // first invalid forward, nil when none
+	LinkFaultReason        string
+	LinkFaultMessage       string
+	LoadBalanced           bool
+	InsufficientCapacity   bool
+	CapacityMessage        string
+	DiscoveryFailed        bool
+	DiscoveryMessage       string
+	// PeerCount is how many peers this pass rendered into the link config. Read only when
+	// loadBalanced: none means no fleet member has been observed yet.
+	PeerCount        int
+	MembersNotReady  bool // true only when loadBalanced and no member has a live session
+	ProvisionAddress string
+	ProvisionMessage string
+}
+
+// readyPrecedence returns the first applicable Ready-condition reason.
+func readyPrecedence(in readySignals) (reason, message string, ready bool) {
 	switch {
-	case len(invalid) > 0:
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = invalid[0].reason
-		cond.Message = invalidForwardsMessage(invalid)
-	case ls.FaultReason != "":
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = ls.FaultReason
-		cond.Message = ls.FaultMessage
-	case ready:
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = reasonReady
-		cond.Message = "gateway address provisioned and active link tunnel up"
+	case in.InvalidTunnelAddresses:
+		return reasonInvalidTunnelAddresses, in.InvalidTunnelMessage, false
+	case in.InvalidForward != nil:
+		return in.InvalidForward.reason, in.InvalidForward.message, false
+	case in.LinkFaultReason != "":
+		return in.LinkFaultReason, in.LinkFaultMessage, false
+	case in.LoadBalanced && in.InsufficientCapacity:
+		return reasonInsufficientTunnelAddresses, in.CapacityMessage, false
+	case in.DiscoveryFailed:
+		return reasonMemberDiscoveryFailed, in.DiscoveryMessage, false
+	case in.LoadBalanced && in.PeerCount == 0:
+		return reasonMembersNotReady, "no fleet member observed yet", false
+	case in.LoadBalanced && in.MembersNotReady:
+		return reasonMembersNotReady, "no fleet member has a live wireguard session", false
+	case in.ProvisionAddress != "":
+		return reasonReady, "gateway address provisioned and active link tunnel up", true
 	default:
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = reasonProvisioning
-		cond.Message = "waiting for gateway address and active link tunnel"
-		if m := truncateFaultMessage(compositeMessage); m != "" {
-			cond.Message += ": " + m
+		message = "waiting for gateway address and active link tunnel"
+		if m := truncateFaultMessage(in.ProvisionMessage); m != "" {
+			message += ": " + m
 		}
+		return reasonProvisioning, message, false
+	}
+}
+
+// mirrorStatusWithForwards writes changed Gateway status while retaining unusable members.
+func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wgnetv1alpha1.Gateway, address, saEmail string, ls linkStatus, signals readySignals, result *gcpmembers.Result) error {
+	reason, message, ready := readyPrecedence(signals)
+	cond := metav1.Condition{Type: conditionReady, Reason: reason, Message: message}
+	if ready {
+		cond.Status = metav1.ConditionTrue
+	} else {
+		cond.Status = metav1.ConditionFalse
 	}
 
-	// Earlier SSA applies stale the in-memory resourceVersion, so the write re-Gets a
-	// fresh copy inside RetryOnConflict rather than losing the concurrency race.
+	// Re-read after SSA because its resourceVersion may be stale.
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh wgnetv1alpha1.Gateway
-		// Re-Get uncached: the cache can still hold the copy whose resourceVersion lost
-		// the conflict, so a cached retry would resubmit the same stale object forever.
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
+		// Use the uncached reader so a retry does not resubmit a stale object.
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
 			return fmt.Errorf("get gateway for status update: %w", err)
 		}
 
-		// Stamp observedGeneration from the fresh object: the passed-in gw may be stale
-		// relative to a spec edit that landed mid-reconcile.
+		// A concurrent spec edit requires the fresh observed generation.
 		cond.ObservedGeneration = fresh.Generation
 
 		prevAddress := fresh.Status.Address
@@ -1117,9 +1680,17 @@ func (r *GatewayReconciler) mirrorStatusWithForwards(ctx context.Context, gw *wg
 		fresh.Status.Address = address
 		fresh.Status.ServiceAccountEmail = saEmail
 		fresh.Status.Link.ActiveNode = ls.Node
+
+		membersChanged := false
+		if result != nil && !result.Unusable {
+			membersChanged = !slices.EqualFunc(fresh.Status.GCP.Members, result.Members,
+				func(a, b wgnetv1alpha1.GatewayGCPMemberStatus) bool { return a == b })
+			fresh.Status.GCP.Members = result.Members
+		}
+
 		conditionChanged := meta.SetStatusCondition(&fresh.Status.Conditions, cond)
 
-		if prevAddress == address && prevSAEmail == saEmail && prevNode == ls.Node && !conditionChanged {
+		if prevAddress == address && prevSAEmail == saEmail && prevNode == ls.Node && !conditionChanged && !membersChanged {
 			return nil
 		}
 
@@ -1140,6 +1711,97 @@ func invalidForwardsMessage(invalid []invalidForward) string {
 	return fmt.Sprintf("%d forward(s) invalid: %s", len(invalid), strings.Join(parts, "; "))
 }
 
+// firstInvalidForward preserves the first reason and all rejection messages.
+func firstInvalidForward(invalid []invalidForward) *invalidForward {
+	if len(invalid) == 0 {
+		return nil
+	}
+	return &invalidForward{reason: invalid[0].reason, message: invalidForwardsMessage(invalid)}
+}
+
+// rejectReservedHealthPort rejects local TCP forwards colliding with the health port.
+func rejectReservedHealthPort(gw *wgnetv1alpha1.Gateway, valid []forwardBackend, invalid []invalidForward) ([]forwardBackend, []invalidForward, []wgnetv1alpha1.Forward) {
+	ident := linkIdentityOf(gw)
+	if ident == nil {
+		return valid, invalid, nil
+	}
+	var rejected []wgnetv1alpha1.Forward
+	stillValid := make([]forwardBackend, 0, len(valid))
+	for _, b := range valid {
+		if b.Forward.Protocol == wgnetv1alpha1.ProtocolTCP && int(b.Forward.Port) == ident.HealthPort {
+			invalid = append(invalid, invalidForward{reasonReservedHealthPort,
+				fmt.Sprintf("forward TCP port %d collides with this Local gateway's own health port", ident.HealthPort)})
+			rejected = append(rejected, b.Forward)
+			continue
+		}
+		stillValid = append(stillValid, b)
+	}
+	return stillValid, invalid, rejected
+}
+
+// reservedHealthPortWarnKeyPrefix distinguishes warnReservedHealthPort's suppression entries
+// from the other warn helpers' in the shared unresolvedWarned map.
+const reservedHealthPortWarnKeyPrefix = "health-port/"
+
+// warnReservedHealthPort emits one Warning per forward rejected for taking the link's own health
+// port, while the rejected set is unchanged, mirroring warnUnresolvedBackendPorts.
+func (r *GatewayReconciler) warnReservedHealthPort(gw *wgnetv1alpha1.Gateway, rejected []wgnetv1alpha1.Forward) {
+	if r.Recorder == nil {
+		return
+	}
+	key := reservedHealthPortWarnKeyPrefix + unresolvedWarnKey(gw)
+	if len(rejected) == 0 {
+		r.unresolvedWarned.Delete(key)
+		return
+	}
+	signature := fmt.Sprintf("%v", rejected)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == signature {
+		return
+	}
+	r.unresolvedWarned.Store(key, signature)
+	for _, f := range rejected {
+		r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonReservedHealthPort, actionReconcile,
+			"forward %s port %d to Service %q collides with this Local gateway's own health port",
+			strings.ToLower(string(f.Protocol)), f.Port, f.Service)
+	}
+}
+
+// invalidTunnelWarnKeyPrefix distinguishes warnInvalidTunnelAddresses' suppression entries
+// from warnUnresolvedBackendPorts' in the shared unresolvedWarned map.
+const invalidTunnelWarnKeyPrefix = "tunnel/"
+
+// warnInvalidTunnelAddresses emits one Warning per distinct invalid-tunnel-address reason,
+// suppressing a repeat while the reason stays unchanged, mirroring warnUnresolvedBackendPorts.
+func (r *GatewayReconciler) warnInvalidTunnelAddresses(gw *wgnetv1alpha1.Gateway, reason string) {
+	if r.Recorder == nil {
+		return
+	}
+	key := invalidTunnelWarnKeyPrefix + unresolvedWarnKey(gw)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == reason {
+		return
+	}
+	r.unresolvedWarned.Store(key, reason)
+	r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonInvalidTunnelAddresses, actionReconcile, "%s", reason)
+}
+
+// capacityWarnKeyPrefix distinguishes warnInsufficientTunnelAddresses' suppression entries
+// from the other warn helpers' in the shared unresolvedWarned map.
+const capacityWarnKeyPrefix = "capacity/"
+
+// warnInsufficientTunnelAddresses emits one Warning while the capacity message is unchanged,
+// mirroring warnInvalidTunnelAddresses.
+func (r *GatewayReconciler) warnInsufficientTunnelAddresses(gw *wgnetv1alpha1.Gateway, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	key := capacityWarnKeyPrefix + unresolvedWarnKey(gw)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == message {
+		return
+	}
+	r.unresolvedWarned.Store(key, message)
+	r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonInsufficientTunnelAddresses, actionReconcile, "%s", message)
+}
+
 // recordFailure emits the Warning and writes Ready=False for a reconcile failure,
 // returning the wrapped cause and any status-write error.
 func (r *GatewayReconciler) recordFailure(ctx context.Context, gw *wgnetv1alpha1.Gateway, op string, cause error) (wrapped, statusErr error) {
@@ -1151,7 +1813,11 @@ func (r *GatewayReconciler) recordFailure(ctx context.Context, gw *wgnetv1alpha1
 		var fresh wgnetv1alpha1.Gateway
 		// Re-Get uncached: the cache can still hold the copy whose resourceVersion lost
 		// the conflict, so a cached retry would resubmit the same stale object forever.
-		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
 			return fmt.Errorf("get gateway for status update: %w", err)
 		}
 		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
@@ -1197,18 +1863,6 @@ func (r *GatewayReconciler) objectExists(ctx context.Context, namespace, name st
 		return false, fmt.Errorf("get %s/%s: %w", namespace, name, err)
 	}
 	return true, nil
-}
-
-// createOwned sets the Gateway owner reference on obj and creates it, treating an
-// already-exists result as success.
-func (r *GatewayReconciler) createOwned(ctx context.Context, gw *wgnetv1alpha1.Gateway, obj client.Object) error {
-	if err := controllerutil.SetControllerReference(gw, obj, r.Scheme); err != nil {
-		return fmt.Errorf("set owner reference: %w", err)
-	}
-	if err := r.Create(ctx, obj); err != nil && !apierrors.IsAlreadyExists(err) {
-		return err
-	}
-	return nil
 }
 
 // apply server-side-applies desired, filling the GVK from the scheme because typed builders omit

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -28,6 +30,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
@@ -160,7 +164,6 @@ func TestReconcileLifecycle(t *testing.T) {
 		xg := newXGatewayGCP()
 		mustGet(ctx, t, cl, key, xg)
 		assertNestedString(t, xg, "us-central1", "spec", "region")
-		assertNestedString(t, xg, bundleSecretName(gw), "spec", "wgKeySecretRef", "name")
 		assertOwnedByGatewayUnstructured(t, xg, gw)
 	})
 
@@ -215,8 +218,11 @@ func TestReconcileLifecycle(t *testing.T) {
 		mustGet(ctx, t, cl, client.ObjectKey{Namespace: "wg-system", Name: "edge-link"}, &cm)
 		var rc link.RuntimeConfig
 		decodeJSON(t, cm.Data[linkConfigKey], &rc)
-		if want := "203.0.113.9:51820"; rc.WireGuard.Peer.Endpoint != want {
-			t.Errorf("link configmap peer.endpoint = %q, want %q", rc.WireGuard.Peer.Endpoint, want)
+		if len(rc.WireGuard.Peers) != 1 {
+			t.Fatalf("link configmap peers = %d, want 1", len(rc.WireGuard.Peers))
+		}
+		if want := "203.0.113.9:51820"; rc.WireGuard.Peers[0].Endpoint != want {
+			t.Errorf("link configmap peer.endpoint = %q, want %q", rc.WireGuard.Peers[0].Endpoint, want)
 		}
 	})
 
@@ -1708,11 +1714,11 @@ func TestForwardValidationTransitions(t *testing.T) {
 		const ns = "tr-svc-delete"
 		mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
 		mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
-		mustCreate(ctx, t, direct, portedClusterIPService(ns, "api", 8080, corev1.ProtocolTCP))
+		mustCreate(ctx, t, direct, portedClusterIPService(ns, "api", 7443, corev1.ProtocolTCP))
 
 		gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
 			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
-			{Port: 8080, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "api"},
+			{Port: 7443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "api"},
 		}, nil)
 		mustCreate(ctx, t, direct, gw)
 		key := client.ObjectKeyFromObject(gw)
@@ -3112,6 +3118,94 @@ func linkElectorPod(gw *wgnetv1alpha1.Gateway, name string) *corev1.Pod {
 	}
 }
 
+// TestDropWarnSuppression covers the deletion-time clearing: every suppression entry the deleted
+// Gateway owns goes, including the tunnel-address one, and another Gateway's entry stays.
+func TestDropWarnSuppression(t *testing.T) {
+	gw := &wgnetv1alpha1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "gw", UID: "uid-1"}}
+	other := &wgnetv1alpha1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "other", UID: "uid-2"}}
+	otherKey := invalidTunnelWarnKeyPrefix + unresolvedWarnKey(other)
+	allWarned := func(gws ...*wgnetv1alpha1.Gateway) map[string]string {
+		seeded := map[string]string{}
+		for _, g := range gws {
+			for _, k := range allWarnSuppressionKeys(g) {
+				seeded[k] = "warned"
+			}
+		}
+		return seeded
+	}
+
+	tests := []struct {
+		name string
+		seed map[string]string
+		want map[string]string
+	}{
+		{
+			name: "every key of the deleted gateway",
+			seed: map[string]string{
+				unresolvedWarnKey(gw):                               "backends",
+				blockedCleanupWarnKeyPrefix + unresolvedWarnKey(gw): "cleanup",
+				invalidTunnelWarnKeyPrefix + unresolvedWarnKey(gw):  "tunnel",
+				otherKey: "tunnel",
+			},
+			want: map[string]string{otherKey: "tunnel"},
+		},
+		{
+			name: "over-capacity gateway beside a co-resident one",
+			seed: allWarned(gw, other),
+			want: allWarned(other),
+		},
+		{
+			name: "nothing suppressed",
+			seed: map[string]string{},
+			want: map[string]string{},
+		},
+		{
+			name: "only another gateway suppressed",
+			seed: map[string]string{otherKey: "tunnel"},
+			want: map[string]string{otherKey: "tunnel"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &GatewayReconciler{}
+			for k, v := range tt.seed {
+				r.unresolvedWarned.Store(k, v)
+			}
+
+			r.dropWarnSuppression(gw)
+
+			got := map[string]string{}
+			r.unresolvedWarned.Range(func(k, v any) bool {
+				key, ok := k.(string)
+				if !ok {
+					t.Fatalf("suppression key %#v is not a string", k)
+				}
+				value, ok := v.(string)
+				if !ok {
+					t.Fatalf("suppression entry %q holds %#v, want a string", key, v)
+				}
+				got[key] = value
+				return true
+			})
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("suppression entries = %v, want exactly %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// allWarnSuppressionKeys lists every suppression entry one Gateway can own.
+func allWarnSuppressionKeys(gw *wgnetv1alpha1.Gateway) []string {
+	key := unresolvedWarnKey(gw)
+	return []string{
+		key,
+		blockedCleanupWarnKeyPrefix + key,
+		invalidTunnelWarnKeyPrefix + key,
+		capacityWarnKeyPrefix + key,
+	}
+}
+
 // stuckPodFinalizer keeps a hand-made link pod in Terminating, standing in for a pod on
 // a node the kubelet no longer reports from.
 const stuckPodFinalizer = "wgnet.dev/test-hold-pod"
@@ -3140,4 +3234,84 @@ func removePodFinalizer(ctx context.Context, t *testing.T, cl client.Client, key
 	if err := cl.Update(ctx, &pod); err != nil && !apierrors.IsNotFound(err) {
 		t.Errorf("remove finalizer from pod %s: %v", key, err)
 	}
+}
+
+// TestEnsureSecretsWritesThePairWhole verifies either missing Secret rewrites both.
+func TestEnsureSecretsWritesThePairWhole(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+
+	stalePriv, stalePub := testMemberKeypair(t)
+	tests := []struct {
+		name string
+		// present is the half already in the namespace when the pass runs, holding key
+		// material the other half never saw.
+		present func(gw *wgnetv1alpha1.Gateway) *corev1.Secret
+	}{
+		{
+			name: "bundle present, link secret missing",
+			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
+				return buildBundleSecret(gw, stalePriv, stalePub)
+			},
+		},
+		{
+			name: "link secret present, bundle missing",
+			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
+				return buildLinkSecret(gw, stalePriv, stalePub)
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("half-written-pair-%d", i)
+			mustCreate(ctx, t, te.client, namespaceWithLabels(ns, nil))
+			gw := newGateway(ns, ns, nil, nil)
+			mustCreate(ctx, t, te.client, gw)
+			mustGet(ctx, t, te.client, client.ObjectKeyFromObject(gw), gw)
+			mustCreate(ctx, t, te.client, tt.present(gw))
+
+			r := &GatewayReconciler{Client: te.client, APIReader: te.client, Scheme: te.scheme,
+				Config: reconcileConfig(), Recorder: &fakeEventRecorder{}}
+			if err := r.ensureSecrets(ctx, gw); err != nil {
+				t.Fatalf("ensureSecrets: %v", err)
+			}
+
+			var bundle, linkSecret corev1.Secret
+			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &bundle)
+			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: linkSecretName(gw)}, &linkSecret)
+
+			if got := slices.Sorted(maps.Keys(bundle.Data)); !slices.Equal(got, []string{wg.BundleKey}) {
+				t.Fatalf("bundle Secret data keys = %v, want exactly %v", got, []string{wg.BundleKey})
+			}
+			wantLinkKeys := []string{wg.LinkPeerPublicKey, wg.LinkPrivateKey}
+			slices.Sort(wantLinkKeys)
+			if got := slices.Sorted(maps.Keys(linkSecret.Data)); !slices.Equal(got, wantLinkKeys) {
+				t.Fatalf("link Secret data keys = %v, want exactly %v", got, wantLinkKeys)
+			}
+
+			gatewayPriv, rest, _ := strings.Cut(string(bundle.Data[wg.BundleKey]), "\n")
+			linkPub, _, _ := strings.Cut(rest, "\n")
+			linkPriv := string(linkSecret.Data[wg.LinkPrivateKey])
+			gatewayPub := string(linkSecret.Data[wg.LinkPeerPublicKey])
+
+			if got := publicKeyOf(t, gatewayPriv); got != gatewayPub {
+				t.Errorf("public key of the bundle's private key = %q, want the link Secret's peer public key %q", got, gatewayPub)
+			}
+			if got := publicKeyOf(t, linkPriv); got != linkPub {
+				t.Errorf("public key of the link Secret's private key = %q, want the bundle's peer public key %q", got, linkPub)
+			}
+		})
+	}
+}
+
+// publicKeyOf derives a WireGuard public key from its private key, the relation each key
+// Secret's peer public key must satisfy against the other Secret's private key.
+func publicKeyOf(t *testing.T, privateKey string) string {
+	t.Helper()
+	key, err := wgtypes.ParseKey(privateKey)
+	if err != nil {
+		t.Fatalf("parse private key %q: %v", privateKey, err)
+	}
+	return key.PublicKey().String()
 }

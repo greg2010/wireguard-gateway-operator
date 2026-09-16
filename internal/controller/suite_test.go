@@ -59,7 +59,12 @@ func setupEnvtest(t *testing.T) *testEnv {
 		ErrorIfCRDPathMissing: true,
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			Paths: []string{gatewayCRDPath()},
-			CRDs:  []*apiextensionsv1.CustomResourceDefinition{minimalXGatewayGCPCRD(), minimalXGatewayNetworkCRD(), minimalDNSEndpointCRD()},
+			CRDs: []*apiextensionsv1.CustomResourceDefinition{
+				minimalXGatewayGCPCRD(), minimalXGatewayNetworkCRD(), minimalDNSEndpointCRD(),
+				minimalSecretManagerCRD("secrets", "Secret", "SecretList"),
+				minimalSecretManagerCRD("secretversions", "SecretVersion", "SecretVersionList"),
+				minimalSecretManagerCRD("secretiammembers", "SecretIAMMember", "SecretIAMMemberList"),
+			},
 		},
 	}
 
@@ -249,6 +254,32 @@ func minimalXGatewayNetworkCRD() *apiextensionsv1.CustomResourceDefinition {
 				},
 				Subresources: &apiextensionsv1.CustomResourceSubresources{
 					Status: &apiextensionsv1.CustomResourceSubresourceStatus{},
+				},
+			}},
+		},
+	}
+}
+
+// minimalSecretManagerCRD is a cluster-scoped stand-in CRD for one secretmanager.gcp.m.upbound.io
+// managed-resource kind, enough for gcpmembers' confirmation to observe presence or NotFound.
+func minimalSecretManagerCRD(plural, kind, listKind string) *apiextensionsv1.CustomResourceDefinition {
+	return &apiextensionsv1.CustomResourceDefinition{
+		ObjectMeta: metav1.ObjectMeta{Name: plural + ".secretmanager.gcp.m.upbound.io"},
+		Spec: apiextensionsv1.CustomResourceDefinitionSpec{
+			Group: "secretmanager.gcp.m.upbound.io",
+			Names: apiextensionsv1.CustomResourceDefinitionNames{
+				Kind:     kind,
+				ListKind: listKind,
+				Plural:   plural,
+				Singular: plural,
+			},
+			Scope: apiextensionsv1.ClusterScoped,
+			Versions: []apiextensionsv1.CustomResourceDefinitionVersion{{
+				Name:    "v1beta1",
+				Served:  true,
+				Storage: true,
+				Schema: &apiextensionsv1.CustomResourceValidation{
+					OpenAPIV3Schema: preserveUnknownProps(),
 				},
 			}},
 		},

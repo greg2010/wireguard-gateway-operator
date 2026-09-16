@@ -20,8 +20,10 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
@@ -42,11 +44,12 @@ func testConfig() Config {
 	}
 }
 
-// newGateway leaves every defaulted spec.gcp and spec.wireguard field unset, so the
-// builders exercise their defaulting accessors.
+// testGatewayUID is a stable UID for builder assertions.
+const testGatewayUID = types.UID("11112222-3333-4444-5555-666677778888")
+
 func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostnames []string) *wgnetv1alpha1.Gateway {
 	return &wgnetv1alpha1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: testGatewayUID},
 		Spec: wgnetv1alpha1.GatewaySpec{
 			GCP: wgnetv1alpha1.GatewayGCPSpec{
 				ProjectID:   "test-project",
@@ -174,7 +177,7 @@ func TestBuildXGatewayGCP(t *testing.T) {
 		[]string{"edge.example.com"},
 	)
 
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
@@ -231,11 +234,8 @@ func TestBuildXGatewayGCP(t *testing.T) {
 		t.Errorf("enableOsLogin = %v, want %v", got, cfg.EnableOSLogin)
 	}
 
-	id := gcpID(gw.Namespace, gw.Name)
-	assertNestedString(t, u, id, "spec", "serviceAccountId")
-	assertNestedString(t, u, id, "spec", "secretId")
-	assertNestedString(t, u, wg.BundleKey, "spec", "wgKeySecretRef", "key")
-	assertNestedString(t, u, bundleSecretName(gw), "spec", "wgKeySecretRef", "name")
+	assertNestedString(t, u, gcpID(gw.Namespace, gw.Name), "spec", "serviceAccountId")
+	assertNestedString(t, u, testRecordNameBase(t, gw), "spec", "secretId")
 
 	ports, _, err := unstructured.NestedSlice(u.Object, "spec", "allowedPorts")
 	if err != nil {
@@ -316,7 +316,7 @@ func TestBuildXGatewayGCPAddress(t *testing.T) {
 			gw := newGateway("edge", "wg-system", nil, nil)
 			gw.Spec.GCP.Address = tt.addr
 
-			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildXGatewayGCP: %v", err)
 			}
@@ -331,6 +331,179 @@ func TestBuildXGatewayGCPAddress(t *testing.T) {
 	}
 }
 
+// TestTemplateRevision verifies template-affecting inputs change the revision.
+func TestTemplateRevision(t *testing.T) {
+	cfg := testConfig()
+	base := func(t *testing.T, gw *wgnetv1alpha1.Gateway) string {
+		t.Helper()
+		return testRecordNameBase(t, gw)
+	}
+
+	tests := []struct {
+		name          string
+		mutate        func(gw *wgnetv1alpha1.Gateway)
+		wantIdentical bool
+	}{
+		{name: "unchanged inputs", mutate: func(*wgnetv1alpha1.Gateway) {}, wantIdentical: true},
+		{name: "same name, new uid", mutate: func(gw *wgnetv1alpha1.Gateway) {
+			gw.UID = types.UID("99998888-7777-6666-5555-444433332222")
+		}},
+		{name: "new project", mutate: func(gw *wgnetv1alpha1.Gateway) { gw.Spec.GCP.ProjectID = "other-project" }},
+		{name: "new machine type", mutate: func(gw *wgnetv1alpha1.Gateway) { gw.Spec.GCP.MachineType = "e2-medium" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			first := templateRevision(gw, cfg, base(t, gw))
+
+			other := newGateway("edge", "wg-system", nil, nil)
+			tt.mutate(other)
+			second := templateRevision(other, cfg, base(t, other))
+
+			if identical := first == second; identical != tt.wantIdentical {
+				t.Errorf("templateRevision = %q and %q, identical=%v, want identical=%v",
+					first, second, identical, tt.wantIdentical)
+			}
+		})
+	}
+}
+
+// testRecordNameBase is the record naming base the VM reads as its "secret-id" metadata
+// value and suffixes with its own name to derive its bundle id.
+func testRecordNameBase(t *testing.T, gw *wgnetv1alpha1.Gateway) string {
+	t.Helper()
+	base, err := gcpmembers.NameBase(string(gw.UID), gw.Spec.GCP.ProjectID)
+	if err != nil {
+		t.Fatalf("gcpmembers.NameBase(...) returned unexpected error: %v", err)
+	}
+	return base
+}
+
+// TestBuildXGatewayGCPBranches verifies the composite for both provisioning branches.
+func TestBuildXGatewayGCPBranches(t *testing.T) {
+	cfg := testConfig()
+	singleInstanceKeys := []string{
+		"address", "crossplane", "diskSizeGB", "enableOsLogin", "image", "machineType",
+		"projectID", "providerConfigName", "region", "secretId", "serviceAccountId",
+		"sharedNetworkName", "spot", "trafficPolicy", "userData", "wgGatewayAddress",
+		"wgLinkAddress", "wgListenPort", "wgMTU", "wgSubnet", "zone",
+	}
+	loadBalancedKeys := append(append([]string{}, singleInstanceKeys...),
+		"healthPort", "loadBalanced", "members", "sessionAffinity", "targetSize",
+		"templateRevision", "zones")
+	slices.Sort(loadBalancedKeys)
+
+	roster := func(t *testing.T, gw *wgnetv1alpha1.Gateway, name string) []gcpmembers.RosterEntry {
+		t.Helper()
+		names, err := gcpmembers.NameResourceNames(string(gw.UID), gw.Spec.GCP.ProjectID, name)
+		if err != nil {
+			t.Fatalf("gcpmembers.NameResourceNames(...) returned unexpected error: %v", err)
+		}
+		return []gcpmembers.RosterEntry{{Name: name, Slot: 0, TunnelAddress: "10.99.0.1", ManagedResourceNames: names}}
+	}
+
+	tests := []struct {
+		name           string
+		loadBalanced   bool
+		replicas       int32
+		result         func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result
+		wantKeys       []string
+		wantTargetSize int64
+		wantMembers    []any
+	}{
+		{
+			name:     "single instance without an observed name renders no roster",
+			wantKeys: singleInstanceKeys,
+		},
+		{
+			name: "single instance with an observed name renders one member",
+			result: func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result {
+				return &gcpmembers.Result{Roster: roster(t, gw, "gw-edge-9x2k")}
+			},
+			wantKeys:    slices.Sorted(slices.Values(append(append([]string{}, singleInstanceKeys...), "members"))),
+			wantMembers: []any{memberEntry("gw-edge-9x2k")},
+		},
+		{
+			name:           "load balanced without a result renders an empty roster",
+			loadBalanced:   true,
+			replicas:       2,
+			wantKeys:       loadBalancedKeys,
+			wantTargetSize: 2,
+			wantMembers:    []any{},
+		},
+		{
+			name:         "load balanced with a result renders its roster",
+			loadBalanced: true,
+			replicas:     2,
+			result: func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result {
+				return &gcpmembers.Result{TargetSize: 1, Roster: roster(t, gw, "gw-edge-7f31")}
+			},
+			wantKeys:       loadBalancedKeys,
+			wantTargetSize: 1,
+			wantMembers:    []any{memberEntry("gw-edge-7f31")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.GCP.Replicas = tt.replicas
+			if tt.loadBalanced {
+				gw.Spec.GCP.LoadBalancer = &wgnetv1alpha1.GatewayGCPLoadBalancerSpec{SessionAffinity: "NONE"}
+			}
+			var result *gcpmembers.Result
+			if tt.result != nil {
+				result = tt.result(t, gw)
+			}
+
+			u, err := buildXGatewayGCP(gw, cfg, nil, tt.loadBalanced, result, clusterHealthPort)
+			if err != nil {
+				t.Fatalf("buildXGatewayGCP: %v", err)
+			}
+			specMap, found, err := unstructured.NestedMap(u.Object, "spec")
+			if err != nil || !found {
+				t.Fatalf("read spec: found=%v err=%v", found, err)
+			}
+			if got := slices.Sorted(maps.Keys(specMap)); !slices.Equal(got, tt.wantKeys) {
+				t.Errorf("spec keys = %v, want %v", got, tt.wantKeys)
+			}
+			if tt.loadBalanced {
+				if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "targetSize"); got != tt.wantTargetSize {
+					t.Errorf("spec.targetSize = %d, want %d", got, tt.wantTargetSize)
+				}
+				if got, _, _ := unstructured.NestedBool(u.Object, "spec", "loadBalanced"); !got {
+					t.Errorf("spec.loadBalanced = %v, want true", got)
+				}
+			}
+			if tt.wantMembers != nil {
+				got, _, err := unstructured.NestedSlice(u.Object, "spec", "members")
+				if err != nil {
+					t.Fatalf("read spec.members: %v", err)
+				}
+				if !reflect.DeepEqual(got, tt.wantMembers) {
+					t.Errorf("spec.members = %#v, want %#v", got, tt.wantMembers)
+				}
+			}
+		})
+	}
+}
+
+// memberEntry is the exact roster entry the composite carries for instanceName on the
+// fixture Gateway: names derived from the base plus the instance's own name.
+func memberEntry(instanceName string) map[string]any {
+	base := "gw-" + string(testGatewayUID) + "-test-project-" + instanceName
+	return map[string]any{
+		"name":                     instanceName,
+		"slot":                     int64(0),
+		"tunnelAddress":            "10.99.0.1",
+		"kubernetesSecretName":     base,
+		"cloudSecretName":          base,
+		"cloudSecretVersionName":   base + "-version",
+		"cloudSecretIamMemberName": base + "-iam",
+	}
+}
+
 // TestBuildXGatewayGCPKeySet pins the composite's exact spec key set: a stray or
 // dropped field fails here even when no other test reads it.
 func TestBuildXGatewayGCPKeySet(t *testing.T) {
@@ -340,7 +513,7 @@ func TestBuildXGatewayGCPKeySet(t *testing.T) {
 		nil,
 	)
 
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
@@ -353,7 +526,7 @@ func TestBuildXGatewayGCPKeySet(t *testing.T) {
 		"address", "allowedPorts", "crossplane", "diskSizeGB", "enableOsLogin", "image",
 		"machineType", "projectID", "providerConfigName", "region", "secretId",
 		"serviceAccountId", "sharedNetworkName", "spot", "trafficPolicy", "userData",
-		"wgGatewayAddress", "wgKeySecretRef", "wgLinkAddress", "wgListenPort", "wgMTU",
+		"wgGatewayAddress", "wgLinkAddress", "wgListenPort", "wgMTU",
 		"wgSubnet", "zone",
 	}
 	if !slices.Equal(got, want) {
@@ -370,7 +543,7 @@ func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
 
 	gw := newGateway("edge", "wg-system", nil, nil)
 
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
@@ -402,7 +575,7 @@ func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	gw.Spec.Wireguard.ListenPort = 51999
 
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
@@ -419,7 +592,7 @@ func TestBuildXGatewayGCPWireguardMTU(t *testing.T) {
 	gw := newGateway("edge", "wg-system", nil, nil)
 	gw.Spec.Wireguard.MTU = 1280
 
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildXGatewayGCP: %v", err)
 	}
@@ -474,7 +647,7 @@ func TestBuildLinkConfigMap(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -497,16 +670,16 @@ func TestBuildLinkConfigMap(t *testing.T) {
 		t.Errorf("wireguard.mtu = %d, want %d", rc.WireGuard.MTU, wantMTU)
 	}
 	wantKeepalive := int(effectiveWGKeepalive(gw))
-	if rc.WireGuard.Peer.PersistentKeepalive != wantKeepalive {
-		t.Errorf("peer.persistentKeepalive = %d, want %d", rc.WireGuard.Peer.PersistentKeepalive, wantKeepalive)
+	if rc.WireGuard.Peers[0].PersistentKeepalive != wantKeepalive {
+		t.Errorf("peer.persistentKeepalive = %d, want %d", rc.WireGuard.Peers[0].PersistentKeepalive, wantKeepalive)
 	}
 	wantSubnet := effectiveWGSubnet(gw)
-	if len(rc.WireGuard.Peer.AllowedIPs) != 1 || rc.WireGuard.Peer.AllowedIPs[0] != wantSubnet {
-		t.Errorf("peer.allowedIPs = %v, want [%s]", rc.WireGuard.Peer.AllowedIPs, wantSubnet)
+	if len(rc.WireGuard.Peers[0].AllowedIPs) != 1 || rc.WireGuard.Peers[0].AllowedIPs[0] != wantSubnet {
+		t.Errorf("peer.allowedIPs = %v, want [%s]", rc.WireGuard.Peers[0].AllowedIPs, wantSubnet)
 	}
 
-	if rc.WireGuard.Peer.Endpoint != "" {
-		t.Errorf("peer.endpoint = %q, want empty when address is unknown", rc.WireGuard.Peer.Endpoint)
+	if rc.WireGuard.Peers[0].Endpoint != "" {
+		t.Errorf("peer.endpoint = %q, want empty when address is unknown", rc.WireGuard.Peers[0].Endpoint)
 	}
 
 	wantForwards := []link.Forward{
@@ -535,15 +708,15 @@ func TestBuildLinkConfigMapEndpoint(t *testing.T) {
 			gw := newGateway("edge", "wg-system",
 				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
 
-			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil)
+			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
 			var rc link.RuntimeConfig
 			decodeJSON(t, cm.Data[linkConfigKey], &rc)
 
-			if rc.WireGuard.Peer.Endpoint != tt.wantEndpoint {
-				t.Errorf("peer.endpoint = %q, want %q", rc.WireGuard.Peer.Endpoint, tt.wantEndpoint)
+			if rc.WireGuard.Peers[0].Endpoint != tt.wantEndpoint {
+				t.Errorf("peer.endpoint = %q, want %q", rc.WireGuard.Peers[0].Endpoint, tt.wantEndpoint)
 			}
 		})
 	}
@@ -568,7 +741,7 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 					{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: tt.targetPort},
 				}, nil)
 
-			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -594,7 +767,7 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -661,7 +834,7 @@ func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system", []wgnetv1alpha1.Forward{tt.forward}, nil)
-			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -1244,7 +1417,7 @@ func TestBuildXGatewayGCPProviderSelector(t *testing.T) {
 			gw := newGateway("edge", "wg-system", nil, nil)
 			gw.Spec.Provider = tt.provider
 
-			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards)
+			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildXGatewayGCP: %v", err)
 			}
@@ -1390,12 +1563,12 @@ func TestEffectiveTrafficPolicy(t *testing.T) {
 // TestLinkIdentityOf pins that an identity exists only once a Local Gateway's id is
 // allocated, so no Local workload is built before that id is persisted.
 func TestLinkIdentityOf(t *testing.T) {
-	ident3 := link.NewIdentity(3)
+	ident3 := link.NewGatewayIdentity(3)
 	tests := []struct {
 		name   string
 		policy wgnetv1alpha1.TrafficPolicy
 		id     int32
-		want   *link.Identity
+		want   *link.GatewayIdentity
 	}{
 		{"cluster has no identity", wgnetv1alpha1.TrafficPolicyCluster, 0, nil},
 		{"cluster ignores a stale id", wgnetv1alpha1.TrafficPolicyCluster, 3, nil},
@@ -1438,7 +1611,7 @@ func TestBuildXGatewayGCPTrafficPolicy(t *testing.T) {
 			gw := newGateway("edge", "wg-system", nil, nil)
 			gw.Spec.TrafficPolicy = tt.policy
 
-			u, err := buildXGatewayGCP(gw, testConfig(), nil)
+			u, err := buildXGatewayGCP(gw, testConfig(), nil, false, nil, clusterHealthPort)
 			if err != nil {
 				t.Fatalf("buildXGatewayGCP: %v", err)
 			}
@@ -1463,7 +1636,7 @@ func TestBuildLinkConfigMapLocal(t *testing.T) {
 		{Forward: gw.Spec.Forwards[1], BackendPort: 5432, ServicePortName: "postgres"},
 	}
 
-	cm, err := buildLinkConfigMap(gw, "203.0.113.5", backends, linkIdentityOf(gw))
+	cm, err := buildLinkConfigMap(gw, "203.0.113.5", backends, linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw))
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -1483,11 +1656,11 @@ func TestBuildLinkConfigMapLocal(t *testing.T) {
 	if rc.Identity == nil {
 		t.Fatal("identity = nil, want the identity derived from id 3")
 	}
-	if want := link.NewIdentity(3); *rc.Identity != want {
+	if want := link.NewGatewayIdentity(3); *rc.Identity != want {
 		t.Errorf("identity = %+v, want %+v", *rc.Identity, want)
 	}
-	if !slices.Equal(rc.WireGuard.Peer.AllowedIPs, []string{"0.0.0.0/0"}) {
-		t.Errorf("peer.allowedIPs = %v, want [0.0.0.0/0]", rc.WireGuard.Peer.AllowedIPs)
+	if !slices.Equal(rc.WireGuard.Peers[0].AllowedIPs, []string{"0.0.0.0/0"}) {
+		t.Errorf("peer.allowedIPs = %v, want [0.0.0.0/0]", rc.WireGuard.Peers[0].AllowedIPs)
 	}
 	if !maps.Equal(rc.PodSelector, linkSelectorLabels(gw)) {
 		t.Errorf("podSelector = %v, want %v", rc.PodSelector, linkSelectorLabels(gw))
@@ -1511,8 +1684,8 @@ func TestBuildLinkConfigMapPodSelector(t *testing.T) {
 		want   map[string]string
 		wantID bool
 	}{
-		{name: "cluster"},
-		{name: "local", local: true, wantID: true},
+		{name: "renders no pod selector or identity for cluster traffic"},
+		{name: "renders the pod selector and identity for local traffic", local: true, wantID: true},
 	}
 
 	for _, tt := range tests {
@@ -1526,7 +1699,7 @@ func TestBuildLinkConfigMapPodSelector(t *testing.T) {
 				endpoint = "203.0.113.5"
 			}
 
-			cm, err := buildLinkConfigMap(gw, endpoint, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw))
+			cm, err := buildLinkConfigMap(gw, endpoint, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw))
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -1591,7 +1764,7 @@ func TestBuildLinkDaemonSet(t *testing.T) {
 		{"container ports", len(c.Ports), 0},
 		{"probe host", c.ReadinessProbe.HTTPGet.Host, "127.0.0.1"},
 		{"probe port", c.ReadinessProbe.HTTPGet.Port, intstr.FromInt32(27003)},
-		{"health addr", env["GATEWAY_HEALTH_ADDR"], "127.0.0.1:27003"},
+		{"health addr", env["GATEWAY_HEALTH_ADDR"], ":27003"},
 		{"host proc mount path", mounts["host-proc-sys-net"].MountPath, link.HostProcSysNetPath},
 		{"host proc mount writable", mounts["host-proc-sys-net"].ReadOnly, false},
 		{"host proc hostPath", volumes["host-proc-sys-net"].HostPath.Path, "/proc/sys/net"},
@@ -1785,8 +1958,8 @@ func TestLinkPodSpecHealthAddr(t *testing.T) {
 		want   string
 	}{
 		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, ":8080"},
-		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, "127.0.0.1:27001"},
-		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, "127.0.0.1:27007"},
+		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, ":27001"},
+		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, ":27007"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
