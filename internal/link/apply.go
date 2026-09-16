@@ -3,6 +3,7 @@ package link
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -59,14 +60,6 @@ const (
 // rulePriority places the per-Gateway ip rule ahead of the main table (32766).
 const rulePriority = "10000"
 
-// interfaceName is the tunnel device the mode programs.
-func interfaceName(rc RuntimeConfig) string {
-	if rc.isLocal() {
-		return rc.Identity.Interface
-	}
-	return clusterInterface
-}
-
 // nftTableName is the inet table the mode programs.
 func nftTableName(rc RuntimeConfig) string {
 	if rc.isLocal() {
@@ -75,41 +68,64 @@ func nftTableName(rc RuntimeConfig) string {
 	return clusterNftTable
 }
 
-// buildApplyCommands returns the ordered apply plan, idempotent under replace semantics. The
-// sysctl, route and rule steps are Local-only, where those objects are node-global.
-func buildApplyCommands(rc RuntimeConfig, wgConfPath, nftRuleset string, ifaceExists bool, localForwards []ResolvedForward) []command {
-	iface := interfaceName(rc)
+// slotPlan is one slot's ordered command list. Cluster mode always has exactly one, keyed by
+// slot 0, for its single wg0 interface; Local mode has one per configured peer's slot.
+type slotPlan struct {
+	Slot int
+	Cmds []command
+}
 
-	linkSet := []string{"link", "set", iface}
-	if rc.WireGuard.MTU > 0 {
-		linkSet = append(linkSet, "mtu", strconv.Itoa(rc.WireGuard.MTU))
+// buildApplyCommands builds per-slot plans and their shared final nft step.
+func buildApplyCommands(rc RuntimeConfig, wgConfPaths map[int]string, nftRuleset string, ifaceExists map[int]bool, localForwards []ResolvedForward) ([]slotPlan, command) {
+	final := command{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset}
+
+	linkSetFor := func(iface string) []string {
+		linkSet := []string{"link", "set", iface}
+		if rc.WireGuard.MTU > 0 {
+			linkSet = append(linkSet, "mtu", strconv.Itoa(rc.WireGuard.MTU))
+		}
+		return append(linkSet, "up")
 	}
-	linkSet = append(linkSet, "up")
 
-	var cmds []command
-	if !ifaceExists {
-		cmds = append(cmds, command{name: "ip", args: []string{"link", "add", iface, "type", "wireguard"}})
-	}
-	cmds = append(cmds,
-		command{name: "wg", args: []string{"syncconf", iface, wgConfPath}},
-		command{name: "ip", args: []string{"addr", "replace", rc.WireGuard.Address, "dev", iface}},
-		command{name: "ip", args: linkSet},
-	)
-
-	if rc.isLocal() {
+	if !rc.isLocal() {
+		iface := clusterInterface
+		var cmds []command
+		if !ifaceExists[0] {
+			cmds = append(cmds, command{name: "ip", args: []string{"link", "add", iface, "type", "wireguard"}})
+		}
 		cmds = append(cmds,
-			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + iface + "/rp_filter", writeValue: "0"},
-			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + iface + "/forwarding", writeValue: "1"},
+			command{name: "wg", args: []string{"syncconf", iface, wgConfPaths[0]}},
+			command{name: "ip", args: []string{"addr", "replace", rc.WireGuard.Address, "dev", iface}},
+			command{name: "ip", args: linkSetFor(iface)},
 		)
-		cmds = append(cmds, localRouteCommands(*rc.Identity, localThrowTargets(localForwards))...)
+		return []slotPlan{{Slot: 0, Cmds: cmds}}, final
 	}
 
-	return append(cmds, command{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset})
+	targets := localThrowTargets(localForwards)
+	plans := make([]slotPlan, 0, len(rc.WireGuard.Peers))
+	for _, p := range rc.WireGuard.Peers {
+		id := NewSlotIdentity(rc.Identity.ID, p.Slot)
+
+		var cmds []command
+		if !ifaceExists[p.Slot] {
+			cmds = append(cmds, command{name: "ip", args: []string{"link", "add", id.Interface, "type", "wireguard"}})
+		}
+		cmds = append(cmds,
+			command{name: "wg", args: []string{"syncconf", id.Interface, wgConfPaths[p.Slot]}},
+			command{name: "ip", args: []string{"addr", "replace", rc.WireGuard.Address, "dev", id.Interface}},
+			command{name: "ip", args: linkSetFor(id.Interface)},
+			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/rp_filter", writeValue: "0"},
+			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/forwarding", writeValue: "1"},
+		)
+		cmds = append(cmds, localRouteCommands(id, targets)...)
+		plans = append(plans, slotPlan{Slot: p.Slot, Cmds: cmds})
+	}
+	return plans, final
 }
 
 // localRouteCommands builds the Local route plan from sorted, unique targets: default route, throw
 // routes re-added each apply so stale ones are pruned, and the fwmark rule with EEXIST tolerated.
-func localRouteCommands(id Identity, targets []string) []command {
+func localRouteCommands(id SlotIdentity, targets []string) []command {
 	table := strconv.Itoa(id.RouteTable)
 	fwmark := id.Mark + "/" + id.MarkMask
 
@@ -138,7 +154,7 @@ type RouteStep struct {
 // LocalRouteCommands returns the ip(8) steps a Local apply programs for id's route table and rule,
 // in order, given sorted and deduplicated DNAT targets. It lets an out-of-process harness install
 // the product's own route plan instead of restating it.
-func LocalRouteCommands(id Identity, targets []string) []RouteStep {
+func LocalRouteCommands(id SlotIdentity, targets []string) []RouteStep {
 	cmds := localRouteCommands(id, targets)
 	steps := make([]RouteStep, 0, len(cmds))
 	for _, c := range cmds {
@@ -159,27 +175,86 @@ func localThrowTargets(forwards []ResolvedForward) []string {
 	return slices.Sorted(maps.Keys(targets))
 }
 
-// Apply programs the tunnel interface and the nftables ruleset from rc. It mutates node- or
-// pod-global network state and must not run concurrently. It is idempotent: a re-apply
-// reconciles an already-up interface in place, so an established handshake survives. A failed
-// step aborts the plan; nothing is rolled back. resolve serves Cluster mode, localForwards Local.
-func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey, peerPubKey string, resolve func(ctx context.Context, host string) (string, error), localForwards []ResolvedForward, log *zap.SugaredLogger) error {
-	wgConfPath, nftRuleset, cleanup, err := renderConfig(ctx, rc, privKey, peerPubKey, resolve, localForwards)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
+// ResolveFunc resolves a Cluster-mode forward's backend Service to a concrete address.
+type ResolveFunc func(ctx context.Context, host string) (string, error)
 
-	exists, err := ifaceExists(ctx, run, interfaceName(rc))
+// SlotResult is one slot's apply outcome.
+type SlotResult struct {
+	Slot    int
+	Applied bool
+	Err     error // nil when Applied
+}
+
+// Apply programs network state without concurrent calls. Local slot failures return in SlotResult.
+func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (results []SlotResult, err error) {
+	wgConfPaths, nftRuleset, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, log)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, c := range buildApplyCommands(rc, wgConfPath, nftRuleset, exists, localForwards) {
-		if err := runStep(ctx, run, c, log); err != nil {
-			return err
+	defer func() {
+		if cleanupErr := cleanup(err != nil); cleanupErr != nil {
+			err = fmt.Errorf("remove wg conf temp files: %w", cleanupErr)
+		}
+	}()
+
+	exists := map[int]bool{}
+	if !rc.isLocal() {
+		ok, err := ifaceExists(ctx, run, clusterInterface)
+		if err != nil {
+			return nil, err
+		}
+		exists[0] = ok
+	} else {
+		for _, p := range rc.WireGuard.Peers {
+			ok, err := ifaceExists(ctx, run, NewSlotIdentity(rc.Identity.ID, p.Slot).Interface)
+			if err != nil {
+				return nil, err
+			}
+			exists[p.Slot] = ok
 		}
 	}
-	return nil
+
+	plans, final := buildApplyCommands(rc, wgConfPaths, nftRuleset, exists, localForwards)
+
+	if !rc.isLocal() {
+		for _, c := range plans[0].Cmds {
+			if err := runStep(ctx, run, c, log); err != nil {
+				return nil, err
+			}
+		}
+		if err := runStep(ctx, run, final, log); err != nil {
+			return nil, fmt.Errorf("apply nftables ruleset: %w", err)
+		}
+		return nil, nil
+	}
+
+	results = make([]SlotResult, 0, len(plans))
+	for _, sp := range plans {
+		var stepErr error
+		for _, c := range sp.Cmds {
+			if stepErr = runStep(ctx, run, c, log); stepErr != nil {
+				break
+			}
+		}
+		results = append(results, SlotResult{Slot: sp.Slot, Applied: stepErr == nil, Err: stepErr})
+	}
+	if err := runStep(ctx, run, final, log); err != nil {
+		err = fmt.Errorf("apply nftables ruleset: %w", err)
+		return unapplied(results, err), err
+	}
+	return results, nil
+}
+
+// unapplied marks a pass whose final ruleset failed: no slot is admitted, though each created
+// node state its holder tears down on departure. A slot that already failed keeps its error.
+func unapplied(results []SlotResult, err error) []SlotResult {
+	for i := range results {
+		results[i].Applied = false
+		if results[i].Err == nil {
+			results[i].Err = err
+		}
+	}
+	return results
 }
 
 // runStep executes one plan step. A tolerateExists step failing with EEXIST found its object
@@ -194,51 +269,90 @@ func runStep(ctx context.Context, run runner, c command, log *zap.SugaredLogger)
 	return err
 }
 
-// renderConfig writes the wg(8) config to a 0600 temp file (it holds the private key) and renders
-// the nftables ruleset for rc's mode. The caller must defer cleanup to remove the temp file.
-func renderConfig(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string, resolve func(ctx context.Context, host string) (string, error), localForwards []ResolvedForward) (wgConfPath, nftRuleset string, cleanup func(), err error) {
-	wgConf, err := os.CreateTemp("", "gateway-wg-*.conf")
-	if err != nil {
-		return "", "", nil, fmt.Errorf("create wg conf temp file: %w", err)
+// renderConfig writes 0600 per-slot configs and renders the shared ruleset.
+func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (wgConfPaths map[int]string, nftRuleset string, cleanup func(logFailures bool) error, err error) {
+	wgConfPaths = map[int]string{}
+	var paths []string
+	cleanup = func(logFailures bool) error {
+		var errs []error
+		for _, p := range paths {
+			if removeErr := os.Remove(p); removeErr != nil {
+				if logFailures {
+					log.Warnw("remove wg conf temp file", "path", p, "error", removeErr)
+				} else {
+					errs = append(errs, fmt.Errorf("remove %s: %w", p, removeErr))
+				}
+			}
+		}
+		return errors.Join(errs...)
 	}
-	wgConfPath = wgConf.Name()
-	cleanup = func() { _ = os.Remove(wgConfPath) }
 
-	if err := wgConf.Chmod(0o600); err != nil {
-		wgConf.Close()
-		cleanup()
-		return "", "", nil, fmt.Errorf("chmod wg conf %s: %w", wgConfPath, err)
+	writeWGConf := func(slot int, rcForSlot RuntimeConfig) error {
+		text, err := RenderWGConf(rcForSlot, privKey)
+		if err != nil {
+			return fmt.Errorf("render wg conf for slot %d: %w", slot, err)
+		}
+		f, err := os.CreateTemp("", "gateway-wg-*.conf")
+		if err != nil {
+			return fmt.Errorf("create wg conf temp file: %w", err)
+		}
+		path := f.Name()
+		paths = append(paths, path)
+		if err := f.Chmod(0o600); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				log.Warnw("close wg conf temp file", "path", path, "error", closeErr)
+			}
+			return fmt.Errorf("chmod wg conf %s: %w", path, err)
+		}
+		if _, err := f.WriteString(text); err != nil {
+			if closeErr := f.Close(); closeErr != nil {
+				log.Warnw("close wg conf temp file", "path", path, "error", closeErr)
+			}
+			return fmt.Errorf("write wg conf %s: %w", path, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("close wg conf %s: %w", path, err)
+		}
+		wgConfPaths[slot] = path
+		return nil
 	}
-	wgConfText, err := RenderWGConf(rc, privKey, peerPubKey)
-	if err != nil {
-		wgConf.Close()
-		cleanup()
-		return "", "", nil, fmt.Errorf("render wg conf %s: %w", wgConfPath, err)
-	}
-	if _, err := wgConf.WriteString(wgConfText); err != nil {
-		wgConf.Close()
-		cleanup()
-		return "", "", nil, fmt.Errorf("write wg conf %s: %w", wgConfPath, err)
-	}
-	if err := wgConf.Close(); err != nil {
-		cleanup()
-		return "", "", nil, fmt.Errorf("close wg conf %s: %w", wgConfPath, err)
+
+	if rc.isLocal() {
+		for _, p := range rc.WireGuard.Peers {
+			slotRC := rc
+			slotRC.WireGuard.Peers = []Peer{p}
+			if err := writeWGConf(p.Slot, slotRC); err != nil {
+				if cleanupErr := cleanup(true); cleanupErr != nil {
+					log.Warnw("remove wg conf temp files", "error", cleanupErr)
+				}
+				return nil, "", nil, err
+			}
+		}
+	} else if err := writeWGConf(0, rc); err != nil {
+		if cleanupErr := cleanup(true); cleanupErr != nil {
+			log.Warnw("remove wg conf temp files", "error", cleanupErr)
+		}
+		return nil, "", nil, err
 	}
 
 	resolved := localForwards
 	if !rc.isLocal() {
 		resolved, err = resolveForwards(ctx, rc.Forwards, resolve)
 		if err != nil {
-			cleanup()
-			return "", "", nil, fmt.Errorf("resolve forwards: %w", err)
+			if cleanupErr := cleanup(true); cleanupErr != nil {
+				log.Warnw("remove wg conf temp files", "error", cleanupErr)
+			}
+			return nil, "", nil, fmt.Errorf("resolve forwards: %w", err)
 		}
 	}
 	nftRuleset, err = RenderNftables(rc, resolved)
 	if err != nil {
-		cleanup()
-		return "", "", nil, fmt.Errorf("render nftables ruleset: %w", err)
+		if cleanupErr := cleanup(true); cleanupErr != nil {
+			log.Warnw("remove wg conf temp files", "error", cleanupErr)
+		}
+		return nil, "", nil, fmt.Errorf("render nftables ruleset: %w", err)
 	}
-	return wgConfPath, nftRuleset, cleanup, nil
+	return wgConfPaths, nftRuleset, cleanup, nil
 }
 
 // ifaceExists reports whether iface is present. Only ip(8)'s "does not exist" answer means absent;

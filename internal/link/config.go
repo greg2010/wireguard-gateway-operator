@@ -14,11 +14,9 @@ type Config struct {
 	// ConfigPath is the on-disk path to the JSON RuntimeConfig. Its parent dir is
 	// watched so in-place updates are picked up without a restart.
 	ConfigPath string `envconfig:"GATEWAY_CONFIG_PATH" default:"/etc/gateway/config/config.json"`
-	// WGKeyPath is the WireGuard private key path, kept out of the RuntimeConfig so
-	// the key Secret and the config ConfigMap rotate independently.
+	// WGKeyPath stays separate so key Secrets and config ConfigMaps rotate independently.
+	// Peer public keys are inline in RuntimeConfig.WireGuard.Peers.
 	WGKeyPath string `envconfig:"GATEWAY_WG_KEY_PATH" default:"/etc/gateway/wg/private"`
-	// PeerPubKeyPath is the path to the gateway's WireGuard public key.
-	PeerPubKeyPath string `envconfig:"GATEWAY_WG_PEER_PUBKEY_PATH" default:"/etc/gateway/wg/peerPublicKey"`
 	// HealthAddr is the listen address for the readiness HTTP server.
 	HealthAddr string `envconfig:"GATEWAY_HEALTH_ADDR" default:":8080"`
 	// ReconcileInterval backstops the fsnotify-driven reload loop in case a
@@ -54,7 +52,11 @@ type RuntimeConfig struct {
 
 	// Identity is present in Local mode only. Its absence tells the link it is a Cluster-mode
 	// replica, and makes Forward.Service and Forward.TargetPort required instead of the Local set.
-	Identity *Identity `json:"identity,omitempty"`
+	Identity *GatewayIdentity `json:"identity,omitempty"`
+
+	// HealthPort is required in Local mode and must equal Identity.HealthPort.
+	// The fence renders the identity's value.
+	HealthPort int `json:"healthPort,omitempty"`
 
 	// PodSelector matches this Gateway's link pods, and is what the election's liveness table
 	// watches by. Local mode only, and required there.
@@ -64,26 +66,33 @@ type RuntimeConfig struct {
 	Forwards  []Forward `json:"forwards"`
 }
 
-// WireGuard describes the local wg0 interface and the single gateway peer the
-// link dials out to.
+// WireGuard describes the local tunnel interface(s) and the fleet member peers the link dials
+// out to: one peer on the single wg0 in Cluster mode, one peer per slot interface in Local.
 type WireGuard struct {
-	// Address is the wg0 address in CIDR form (e.g. 10.99.0.2/32).
+	// Address is the tunnel address in CIDR form (e.g. 10.99.0.2/32), shared by every
+	// slot interface in Local mode: every member DNATs to this one address.
 	Address string `json:"address"`
 	// ListenPort is the optional local UDP listen port; 0 picks an ephemeral port.
 	ListenPort int `json:"listenPort"`
-	// MTU is the optional wg0 MTU; 0 leaves the kernel default.
-	MTU  int  `json:"mtu"`
-	Peer Peer `json:"peer"`
+	// MTU is the optional tunnel MTU; 0 leaves the kernel default.
+	MTU int `json:"mtu"`
+	// Peers use Slot as node-global identity, preserving identities across list gaps.
+	// An empty list is a valid pending fleet.
+	Peers []Peer `json:"peers"`
 }
 
-// Peer is the gateway endpoint the link connects to. The peer's public key is
-// read from Config.PeerPubKeyPath at apply time, not carried here.
+// Peer is one fleet member's WireGuard peer entry, shared verbatim by both modes.
 type Peer struct {
-	// Endpoint is the gateway's public host:port. Optional on disk: the operator's
-	// observation of the gateway address may trail the link's start; the reload loop waits.
+	// Slot is the node-global source of every per-slot name, not the list position.
+	// It preserves identities across list gaps.
+	Slot int `json:"slot"`
+	// PublicKey is inline: the mounted Secret carries only the link's own private key now.
+	PublicKey string `json:"publicKey"`
+	// Endpoint is the member's promoted static external IP:listenPort. Optional on disk: the
+	// operator's observation may trail the link's start; the reload loop waits.
 	Endpoint string `json:"endpoint"`
-	// AllowedIPs is the set of source ranges accepted from and routed to the peer,
-	// typically the wg0 subnet.
+	// AllowedIPs is the set of source ranges accepted from and routed to the peer: the
+	// member's tunnel /32 in Cluster, 0.0.0.0/0 in Local.
 	AllowedIPs []string `json:"allowedIPs"`
 	// PersistentKeepalive in seconds keeps the NAT pinhole open; 0 disables it.
 	PersistentKeepalive int `json:"persistentKeepalive"`
@@ -152,6 +161,26 @@ func (rc *RuntimeConfig) validate() error {
 	}
 	if rc.Identity != nil && len(rc.PodSelector) == 0 {
 		return fmt.Errorf("traffic policy %s requires a non-empty podSelector", rc.TrafficPolicy)
+	}
+	// The data plane renders its INPUT admission and its reply-mark restoration from this value
+	// while the fence renders them from the identity's, so the two disagreeing drops the probe.
+	if rc.Identity != nil && rc.HealthPort != rc.Identity.HealthPort {
+		return fmt.Errorf("healthPort %d must equal this gateway identity's health port %d (identity %+v)",
+			rc.HealthPort, rc.Identity.HealthPort, *rc.Identity)
+	}
+	seenSlots := make(map[int]bool, len(rc.WireGuard.Peers))
+	for i := range rc.WireGuard.Peers {
+		p := &rc.WireGuard.Peers[i]
+		if p.PublicKey == "" {
+			return fmt.Errorf("peer slot %d: publicKey is required", p.Slot)
+		}
+		if p.Slot < 0 || p.Slot > 255 {
+			return fmt.Errorf("peer slot %d: must be in 0..255", p.Slot)
+		}
+		if seenSlots[p.Slot] {
+			return fmt.Errorf("peer slot %d: duplicate slot", p.Slot)
+		}
+		seenSlots[p.Slot] = true
 	}
 
 	type key struct {

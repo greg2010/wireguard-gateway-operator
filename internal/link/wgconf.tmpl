@@ -3,9 +3,10 @@ PrivateKey = {{ .PrivKey }}
 {{- if gt .ListenPort 0 }}
 ListenPort = {{ .ListenPort }}
 {{- end }}
-
+{{ range .Peers }}
 [Peer]
-PublicKey = {{ .PeerPubKey }}
+PublicKey = {{ .PublicKey }}
 Endpoint = {{ .Endpoint }}
 AllowedIPs = {{ .AllowedIPs }}
 PersistentKeepalive = {{ .PersistentKeepalive }}
+{{ end -}}

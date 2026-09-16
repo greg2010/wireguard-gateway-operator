@@ -3,31 +3,51 @@ flush table inet {{ .Table }}
 table inet {{ .Table }} {
 	chain premark {
 		type filter hook prerouting priority mangle; policy accept;
-		iifname "{{ .Interface }}" ct state new counter ct mark set ct mark and {{ .KeepMask }} or {{ .Mark }}
-		ct direction reply ct mark and {{ .MarkMask }} == {{ .Mark }} counter meta mark set meta mark and {{ .KeepMask }} or {{ .Mark }}
+{{- range $s := .Slots }}
+		iifname "{{ $s.Interface }}" ct state new counter ct mark set ct mark and {{ $s.KeepMask }} or {{ $s.Mark }}
+		ct direction reply ct mark and {{ $s.MarkMask }} == {{ $s.Mark }} counter meta mark set meta mark and {{ $s.KeepMask }} or {{ $s.Mark }}
+{{- end }}
+	}
+
+	chain output {
+		type route hook output priority mangle; policy accept;
+{{- range $s := .Slots }}
+{{- if gt $.HealthPort 0 }}
+		tcp sport {{ $.HealthPort }} ct direction reply ct mark and {{ $s.MarkMask }} == {{ $s.Mark }} counter meta mark set meta mark and {{ $s.KeepMask }} or {{ $s.Mark }}
+{{- end }}
+{{- end }}
 	}
 
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
-{{- range $f := .Forwards }}
-		iifname "{{ $.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
+{{- range $s := .Slots }}
+{{- range $f := $.Forwards }}
+		iifname "{{ $s.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
+{{- end }}
 {{- end }}
 	}
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;
-		oifname "{{ .Interface }}" tcp flags syn counter tcp option maxseg size set rt mtu
-		iifname "{{ .Interface }}" ct state established,related counter accept
-{{- range $f := .Forwards }}
-		iifname "{{ $.Interface }}" ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} ct state new counter accept
+{{- range $s := .Slots }}
+		oifname "{{ $s.Interface }}" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "{{ $s.Interface }}" ct state established,related counter accept
+{{- range $f := $.Forwards }}
+		iifname "{{ $s.Interface }}" ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} ct state new counter accept
 {{- end }}
-		iifname "{{ .Interface }}" counter drop
-		oifname "{{ .Interface }}" ct state established,related counter accept
-		oifname "{{ .Interface }}" counter drop
+		iifname "{{ $s.Interface }}" counter drop
+		oifname "{{ $s.Interface }}" ct state established,related counter accept
+		oifname "{{ $s.Interface }}" counter drop
+{{- end }}
 	}
 
 	chain input {
 		type filter hook input priority filter; policy accept;
-		iifname "{{ .Interface }}" counter drop
+{{- range $s := .Slots }}
+{{- if gt $.HealthPort 0 }}
+		iifname "{{ $s.Interface }}" tcp dport {{ $.HealthPort }} counter accept
+{{- end }}
+		iifname "{{ $s.Interface }}" counter drop
+{{- end }}
 	}
 }

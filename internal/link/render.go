@@ -26,24 +26,36 @@ var wgConfTemplateText string
 
 var wgConfTemplate = template.Must(template.New("wgconf").Parse(wgConfTemplateText))
 
-// RenderWGConf renders a wg(8) setconf config; Address and MTU are omitted because ip(8) applies
-// those. PersistentKeepalive is always emitted, including 0, so wg syncconf clears a dropped value.
-func RenderWGConf(rc RuntimeConfig, privKey, peerPubKey string) (string, error) {
-	p := rc.WireGuard.Peer
+// wgConfPeerData is one [Peer] stanza's render input.
+type wgConfPeerData struct {
+	PublicKey           string
+	Endpoint            string
+	AllowedIPs          string
+	PersistentKeepalive int
+}
+
+// RenderWGConf renders a wg(8) setconf config: one [Interface] block and one [Peer] block per
+// entry in rc.WireGuard.Peers, in order. Address and MTU are omitted because ip(8) applies those.
+// PersistentKeepalive is always emitted, including 0, so wg syncconf clears a dropped value.
+func RenderWGConf(rc RuntimeConfig, privKey string) (string, error) {
+	peers := make([]wgConfPeerData, 0, len(rc.WireGuard.Peers))
+	for _, p := range rc.WireGuard.Peers {
+		peers = append(peers, wgConfPeerData{
+			PublicKey:           p.PublicKey,
+			Endpoint:            p.Endpoint,
+			AllowedIPs:          strings.Join(p.AllowedIPs, ", "),
+			PersistentKeepalive: p.PersistentKeepalive,
+		})
+	}
+
 	data := struct {
-		PrivKey             string
-		ListenPort          int
-		PeerPubKey          string
-		Endpoint            string
-		AllowedIPs          string
-		PersistentKeepalive int
+		PrivKey    string
+		ListenPort int
+		Peers      []wgConfPeerData
 	}{
-		PrivKey:             privKey,
-		ListenPort:          rc.WireGuard.ListenPort,
-		PeerPubKey:          peerPubKey,
-		Endpoint:            p.Endpoint,
-		AllowedIPs:          strings.Join(p.AllowedIPs, ", "),
-		PersistentKeepalive: p.PersistentKeepalive,
+		PrivKey:    privKey,
+		ListenPort: rc.WireGuard.ListenPort,
+		Peers:      peers,
 	}
 
 	var b strings.Builder
@@ -73,21 +85,33 @@ func keepMask(markMask string) (string, error) {
 	return fmt.Sprintf("0x%08x", ^uint32(v)), nil
 }
 
-// nftablesData is the render input both rulesets share. Mark, MarkMask and KeepMask are empty in
-// Cluster mode, which programs no connmark; KeepMask is MarkMask's complement.
+// nftablesData is the render input for Cluster's single-interface ruleset. HealthPort is 0 when
+// no health port is configured, which omits the INPUT admission rule entirely.
 type nftablesData struct {
+	Interface  string
+	Table      string
+	HealthPort int
+	Forwards   []ResolvedForward
+}
+
+// localSlotData is one Local slot's connmark identity, feeding its own premark/prerouting/forward
+// block in the rendered ruleset.
+type localSlotData struct {
 	Interface string
-	Table     string
 	Mark      string
 	MarkMask  string
 	KeepMask  string
-	Forwards  []ResolvedForward
 }
 
-// RenderNftables renders the ruleset for rc's mode: the Cluster inet table DNATing public ports to
-// ClusterIPs and masquerading tunnel egress, or the per-Gateway Local table DNATing to pod IPs and
-// marking tunnel-ingress connections for the return route, masquerading nothing. Output is sorted
-// by public port then protocol. A mark mask that cannot be parsed into a keep-mask is an error.
+// nftablesLocalData is the render input for Local's per-Gateway table, holding one block per slot.
+type nftablesLocalData struct {
+	Table      string
+	HealthPort int
+	Slots      []localSlotData
+	Forwards   []ResolvedForward
+}
+
+// RenderNftables renders the nftables document for the runtime configuration.
 func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward) (string, error) {
 	sorted := slices.Clone(forwards)
 	slices.SortFunc(sorted, func(a, b ResolvedForward) int {
@@ -97,25 +121,42 @@ func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward) (string, error
 		return strings.Compare(a.Protocol, b.Protocol)
 	})
 
-	data := nftablesData{
-		Interface: interfaceName(rc),
-		Table:     nftTableName(rc),
-		Forwards:  sorted,
-	}
-	tmpl := nftablesTemplate
 	if rc.isLocal() {
-		data.Mark = rc.Identity.Mark
-		data.MarkMask = rc.Identity.MarkMask
-		keep, err := keepMask(rc.Identity.MarkMask)
-		if err != nil {
-			return "", err
+		slots := make([]localSlotData, 0, len(rc.WireGuard.Peers))
+		for _, p := range rc.WireGuard.Peers {
+			id := NewSlotIdentity(rc.Identity.ID, p.Slot)
+			keep, err := keepMask(id.MarkMask)
+			if err != nil {
+				return "", err
+			}
+			slots = append(slots, localSlotData{
+				Interface: id.Interface,
+				Mark:      id.Mark,
+				MarkMask:  id.MarkMask,
+				KeepMask:  keep,
+			})
 		}
-		data.KeepMask = keep
-		tmpl = nftablesLocalTemplate
+		data := nftablesLocalData{
+			Table:      rc.Identity.NftTable,
+			HealthPort: rc.HealthPort,
+			Slots:      slots,
+			Forwards:   sorted,
+		}
+		var b strings.Builder
+		if err := nftablesLocalTemplate.Execute(&b, data); err != nil {
+			return "", fmt.Errorf("render nftables config: %w", err)
+		}
+		return b.String(), nil
 	}
 
+	data := nftablesData{
+		Interface:  clusterInterface,
+		Table:      clusterNftTable,
+		HealthPort: rc.HealthPort,
+		Forwards:   sorted,
+	}
 	var b strings.Builder
-	if err := tmpl.Execute(&b, data); err != nil {
+	if err := nftablesTemplate.Execute(&b, data); err != nil {
 		return "", fmt.Errorf("render nftables config: %w", err)
 	}
 	return b.String(), nil

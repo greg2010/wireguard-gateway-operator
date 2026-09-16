@@ -18,13 +18,12 @@ import (
 // interval is non-positive, so time.NewTicker can never panic.
 const defaultReconcileInterval = 10 * time.Second
 
-// applyFunc programs the tunnel and nftables from rc and the caller's endpoint snapshot, so the
-// loop's digest and the applied ruleset describe the same one; both are nil in Cluster mode.
-type applyFunc func(ctx context.Context, rc RuntimeConfig, privKey, peerPubKey string, forwards []ResolvedForward, unsatisfied []unsatisfiedForward) error
+// applyFunc applies the current runtime configuration.
+type applyFunc func(ctx context.Context, rc RuntimeConfig, privKey string, forwards []ResolvedForward, unsatisfied []unsatisfiedForward) ([]SlotResult, error)
 
 // watchAndReload re-applies on config or endpoint change, keyed on a second digest over the
 // ruleset and the unsatisfied set, which no ruleset shows. keptDataPlane seeds appliedForwards.
-func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identity *Identity, keptDataPlane bool, privKey, peerPubKey string, reconcile applyFunc, log *zap.SugaredLogger) error {
+func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identity *GatewayIdentity, keptDataPlane bool, privKey string, reconcile applyFunc, log *zap.SugaredLogger) error {
 	var changes <-chan struct{}
 	if ew != nil {
 		var cancelChanges func()
@@ -86,12 +85,17 @@ func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identi
 			return
 		}
 
-		if rc.WireGuard.Peer.Endpoint == "" {
-			log.Infow("waiting for gateway endpoint in config", "path", cfg.ConfigPath)
+		if slices.ContainsFunc(rc.WireGuard.Peers, func(p Peer) bool { return p.Endpoint == "" }) {
+			log.Infow("waiting for every peer's endpoint in config", "path", cfg.ConfigPath)
 			return
 		}
-		if err := reconcile(ctx, rc, privKey, peerPubKey, forwards, unsatisfied); err != nil {
-			log.Warnw("apply tunnel config", "endpoint", rc.WireGuard.Peer.Endpoint, "error", err)
+		results, err := reconcile(ctx, rc, privKey, forwards, unsatisfied)
+		if err != nil {
+			log.Warnw("apply tunnel config", "peers", len(rc.WireGuard.Peers), "error", err)
+			return
+		}
+		if slices.ContainsFunc(results, func(result SlotResult) bool { return !result.Applied }) {
+			log.Infow("retrying tunnel config for down slots", "peers", len(rc.WireGuard.Peers))
 			return
 		}
 		lastConfigDigest = cfgDigest
@@ -99,7 +103,7 @@ func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identi
 			lastRulesetDigest = rulesetDig
 		}
 		appliedForwards = forwardNames(rc.Forwards, pending)
-		log.Infow("applied tunnel config", "endpoint", rc.WireGuard.Peer.Endpoint)
+		log.Infow("applied tunnel config", "peers", len(rc.WireGuard.Peers))
 	}
 
 	return watchConfigDir(ctx, cfg, changes, log, apply)
@@ -118,9 +122,9 @@ func forwardNames(forwards []Forward, pending []string) map[string]bool {
 	return names
 }
 
-// watchLocalForwards keeps ew's forward set equal to the config on disk, so a spec.forwards edit
-// reaches every replica's election inputs. A failed load retries; only an unusable watcher errors.
-func watchLocalForwards(ctx context.Context, cfg Config, ew *endpointWatcher, identity *Identity, log *zap.SugaredLogger) error {
+// watchLocalForwards tracks Local backends for reconciliation.
+func watchLocalForwards(ctx context.Context, cfg Config, ew *endpointWatcher, identity *GatewayIdentity,
+	onConfig func(context.Context, RuntimeConfig), log *zap.SugaredLogger) error {
 	return watchConfigDir(ctx, cfg, nil, log, func() {
 		rc, err := loadRuntimeConfigMatching(cfg.ConfigPath, identity)
 		if err != nil {
@@ -128,12 +132,13 @@ func watchLocalForwards(ctx context.Context, cfg Config, ew *endpointWatcher, id
 			return
 		}
 		ew.setForwards(rc.Forwards)
+		onConfig(ctx, rc)
 	})
 }
 
 // loadRuntimeConfigMatching loads the RuntimeConfig at path and rejects one whose mode or identity
 // differs from startup's: the watcher, RBAC, netns and fence names are fixed at process start.
-func loadRuntimeConfigMatching(path string, startup *Identity) (RuntimeConfig, error) {
+func loadRuntimeConfigMatching(path string, startup *GatewayIdentity) (RuntimeConfig, error) {
 	rc, err := LoadRuntimeConfig(path)
 	if err != nil {
 		return rc, err

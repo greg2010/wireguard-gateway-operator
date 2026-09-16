@@ -50,14 +50,18 @@ func newApplyRecorder() *applyRecorder {
 	return &applyRecorder{calls: make(chan string, 16)}
 }
 
-func (r *applyRecorder) apply(_ context.Context, rc RuntimeConfig, _, _ string, forwards []ResolvedForward, unsatisfied []unsatisfiedForward) error {
+func (r *applyRecorder) apply(_ context.Context, rc RuntimeConfig, _ string, forwards []ResolvedForward, unsatisfied []unsatisfiedForward) ([]SlotResult, error) {
+	ep := ""
+	if len(rc.WireGuard.Peers) > 0 {
+		ep = rc.WireGuard.Peers[0].Endpoint
+	}
 	r.mu.Lock()
-	r.endpoints = append(r.endpoints, rc.WireGuard.Peer.Endpoint)
+	r.endpoints = append(r.endpoints, ep)
 	r.forwards = append(r.forwards, forwards)
 	r.unsatisfied = append(r.unsatisfied, unsatisfied)
 	r.mu.Unlock()
-	r.calls <- rc.WireGuard.Peer.Endpoint
-	return nil
+	r.calls <- ep
+	return nil, nil
 }
 
 func (r *applyRecorder) snapshot() []string {
@@ -119,8 +123,8 @@ func configJSON(endpoint, service string) string {
 	if endpoint != "" {
 		ep = `"endpoint":"` + endpoint + `",`
 	}
-	return `{"wireguard":{"address":"10.99.0.2/32","peer":{` + ep +
-		`"allowedIPs":["10.99.0.1/32"],"persistentKeepalive":25}},` +
+	return `{"wireguard":{"address":"10.99.0.2/32","peers":[{"slot":0,"publicKey":"PUB=",` + ep +
+		`"allowedIPs":["10.99.0.1/32"],"persistentKeepalive":25}]},` +
 		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","service":"` + service +
 		`","targetPort":8443}]}`
 }
@@ -143,7 +147,7 @@ func startWatchAndReload(t *testing.T, body string, r *applyRecorder) (string, c
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", "pub", r.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", r.apply, testLogger(t))
 	}()
 	return path, cancel, done
 }
@@ -236,6 +240,33 @@ func TestWatchAndReloadEmptyEndpointWaits(t *testing.T) {
 	}
 }
 
+// TestWatchAndReloadZeroPeersApplies pins that a pending fleet's config is applied and its digest
+// recorded, and that the first member's arrival applies again.
+func TestWatchAndReloadZeroPeersApplies(t *testing.T) {
+	const zeroPeers = `{"wireguard":{"address":"10.99.0.2/32","peers":[]},` +
+		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","service":"web.default.svc","targetPort":8443}]}`
+
+	rec := newApplyRecorder()
+	path, cancel, done := startWatchAndReload(t, zeroPeers, rec)
+	defer cancel()
+
+	if ep := waitApply(t, rec); ep != "" {
+		t.Fatalf("zero-peer apply endpoint = %q, want empty", ep)
+	}
+	// The digest of the config just applied suppresses the safety-net ticks' re-applies.
+	assertNoApply(t, rec, 100*time.Millisecond)
+
+	writeConfig(t, path, configJSON("203.0.113.5:51820", "web.default.svc"))
+	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
+		t.Fatalf("apply endpoint after the first member appears = %q, want 203.0.113.5:51820", ep)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
 func TestWatchAndReloadCancelReturnsNil(t *testing.T) {
 	rec := newApplyRecorder()
 	_, cancel, done := startWatchAndReload(t, configJSON("203.0.113.5:51820", "web.default.svc"), rec)
@@ -260,11 +291,13 @@ func TestConfigDigestStableAndSensitive(t *testing.T) {
 	base := RuntimeConfig{
 		WireGuard: WireGuard{
 			Address: "10.99.0.2/32",
-			Peer: Peer{
+			Peers: []Peer{{
+				Slot:                0,
+				PublicKey:           "PUB=",
 				Endpoint:            "203.0.113.5:51820",
 				AllowedIPs:          []string{"10.99.0.1/32"},
 				PersistentKeepalive: 25,
-			},
+			}},
 		},
 		Forwards: []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web", TargetPort: 8443}},
 	}
@@ -282,7 +315,7 @@ func TestConfigDigestStableAndSensitive(t *testing.T) {
 	}
 
 	changed := base
-	changed.WireGuard.Peer.Endpoint = "203.0.113.9:51820"
+	changed.WireGuard.Peers[0].Endpoint = "203.0.113.9:51820"
 	dc, err := configDigest(changed)
 	if err != nil {
 		t.Fatalf("configDigest: %v", err)
@@ -295,7 +328,8 @@ func TestConfigDigestStableAndSensitive(t *testing.T) {
 func TestRulesetDigestStableAndSensitive(t *testing.T) {
 	rc := RuntimeConfig{
 		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      new(NewIdentity(3)),
+		Identity:      new(NewGatewayIdentity(3)),
+		WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
 	}
 	forwards := []ResolvedForward{
 		{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080},
@@ -349,8 +383,8 @@ func TestWatchAndReloadReactsToEndpointChange(t *testing.T) {
 
 	rec := newApplyRecorder()
 	path := filepath.Join(t.TempDir(), "config.json")
-	body := `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},` +
-		`"wireguard":{"address":"10.244.1.7/32","peer":{"endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}},` +
+	body := `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},` +
+		`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}]},` +
 		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
 	writeConfig(t, path, body)
 
@@ -359,7 +393,7 @@ func TestWatchAndReloadReactsToEndpointChange(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", "pub", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
 	}()
 
 	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
@@ -418,7 +452,7 @@ func TestWatchAndReloadReAddsWatchOnDirRemoval(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", "pub", rec.apply, log)
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", rec.apply, log)
 	}()
 
 	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
@@ -468,18 +502,18 @@ func waitRecoveryApply(t testing.TB, r *applyRecorder, want string) string {
 
 // localConfigJSON is a Local-mode RuntimeConfig body for one forward against the
 // default/web Service.
-const localConfigJSON = `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},` +
-	`"wireguard":{"address":"10.244.1.7/32","peer":{"endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}},` +
+const localConfigJSON = `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},` +
+	`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}]},` +
 	`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
 
 // localConfigIdentity is the identity every Local config body in these tests encodes.
-func localConfigIdentity() *Identity { return new(NewIdentity(3)) }
+func localConfigIdentity() *GatewayIdentity { return new(NewGatewayIdentity(3)) }
 
 // localConfigJSONIdentity is the one-forward Local config body under the identity
 // derived for id, so a test can put a config of another identity on disk.
 func localConfigJSONIdentity(t *testing.T, id int) string {
 	t.Helper()
-	ident, err := json.Marshal(NewIdentity(id))
+	ident, err := json.Marshal(NewGatewayIdentity(id))
 	if err != nil {
 		t.Fatalf("marshal identity %d: %v", id, err)
 	}
@@ -545,7 +579,7 @@ func TestWatchAndReloadAppliesTheSnapshotItDigested(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", "pub", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
 	}()
 
 	waitApply(t, rec)
@@ -582,8 +616,8 @@ func localConfigJSONEndpoint(endpoint string, services ...string) string {
 			`{"name":"%s","publicPort":%d,"protocol":"tcp","namespace":"default","serviceName":"%s"}`,
 			svc, 443+i, svc))
 	}
-	return `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},` +
-		`"wireguard":{"address":"10.244.1.7/32","peer":{"endpoint":"` + endpoint + `","allowedIPs":["0.0.0.0/0"]}},` +
+	return `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},` +
+		`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"` + endpoint + `","allowedIPs":["0.0.0.0/0"]}]},` +
 		`"forwards":[` + strings.Join(forwards, ",") + `]}`
 }
 
@@ -663,7 +697,7 @@ func TestWatchAndReloadPendingForwardDefersOnlyWhenApplied(t *testing.T) {
 			cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 			done := make(chan error, 1)
 			go func() {
-				done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", "pub", rec.apply, testLogger(t))
+				done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
 			}()
 
 			applyMatching(t, rec, 0, localConfigEndpoint, "web")
@@ -707,7 +741,7 @@ func TestWatchAndReloadTracksAddedForward(t *testing.T) {
 	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", "pub", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
 	}()
 
 	// The first apply can precede the web informer's initial list, which resolves
@@ -763,7 +797,7 @@ func startLocalWatchAndReload(ctx context.Context, t *testing.T, ew *endpointWat
 	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), keptDataPlane, "priv", "pub", rec.apply, log)
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), keptDataPlane, "priv", rec.apply, log)
 	}()
 	return logs, done
 }
@@ -882,9 +916,21 @@ func TestWatchLocalForwards(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	writeConfig(t, path, localConfigJSONWith("web"))
 	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
+	var acceptedMu sync.Mutex
+	var acceptedForwards int
+	onConfig := func(_ context.Context, rc RuntimeConfig) {
+		acceptedMu.Lock()
+		acceptedForwards = len(rc.Forwards)
+		acceptedMu.Unlock()
+	}
+	lastAccepted := func() int {
+		acceptedMu.Lock()
+		defer acceptedMu.Unlock()
+		return acceptedForwards
+	}
 	done := make(chan error, 1)
 	go func() {
-		done <- watchLocalForwards(ctx, cfg, ew, localConfigIdentity(), testLogger(t))
+		done <- watchLocalForwards(ctx, cfg, ew, localConfigIdentity(), onConfig, testLogger(t))
 	}()
 
 	tcs := []struct {
@@ -905,6 +951,9 @@ func TestWatchLocalForwards(t *testing.T) {
 			// process the write before the count is read as evidence.
 			time.Sleep(100 * time.Millisecond)
 			eventually(t, func() bool { return ew.evaluate().forwardCount == tc.wantCount }, "the watcher to track "+tc.name)
+			if got := lastAccepted(); got != tc.wantCount {
+				t.Errorf("last config handed to onConfig carries %d forwards, want %d", got, tc.wantCount)
+			}
 			select {
 			case err := <-done:
 				t.Fatalf("watchLocalForwards returned early: %v", err)
@@ -940,10 +989,10 @@ func TestWatchAndReloadRefusesMismatchedConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := newApplyRecorder()
 			var ew *endpointWatcher
-			var identity *Identity
+			var identity *GatewayIdentity
 			if tc.local {
 				ew = newWatcherFromIndexers("node-a", nil, nil)
-				identity = new(NewIdentity(1))
+				identity = new(NewGatewayIdentity(1))
 			}
 
 			path := filepath.Join(t.TempDir(), "config.json")
@@ -953,7 +1002,7 @@ func TestWatchAndReloadRefusesMismatchedConfig(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				done <- watchAndReload(ctx, cfg, ew, identity, false, "priv", "pub", rec.apply, testLogger(t))
+				done <- watchAndReload(ctx, cfg, ew, identity, false, "priv", rec.apply, testLogger(t))
 			}()
 
 			assertNoApply(t, rec, 100*time.Millisecond)

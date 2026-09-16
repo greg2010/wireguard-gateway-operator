@@ -65,75 +65,74 @@ func TestResolveForwardsError(t *testing.T) {
 	}
 }
 
-func TestBuildApplyCommands(t *testing.T) {
-	const wgConfPath = "/tmp/gateway-wg.conf"
-	const nftRuleset = "table inet gateway { }"
+// testLocalIdentity is the GatewayIdentity every Local RuntimeConfig fixture in this file uses.
+func testLocalIdentity() *GatewayIdentity { return new(NewGatewayIdentity(3)) }
 
-	localRC := RuntimeConfig{
-		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      new(NewIdentity(3)),
-		WireGuard:     WireGuard{Address: "10.244.1.7/32"},
-	}
+func TestBuildApplyCommands(t *testing.T) {
+	const nftRuleset = "table inet gateway { }"
 
 	tcs := []struct {
 		name          string
 		rc            RuntimeConfig
-		ifaceExists   bool
+		wgConfPaths   map[int]string
+		ifaceExists   map[int]bool
 		localForwards []ResolvedForward
-		want          []command
+		wantPlans     []slotPlan
 	}{
 		{
-			name: "cluster_with_mtu_absent",
-			rc: RuntimeConfig{
-				WireGuard: WireGuard{Address: "10.99.0.2/32", MTU: 1380},
-			},
-			ifaceExists: false,
-			want: []command{
+			name:        "cluster_with_mtu_absent",
+			rc:          RuntimeConfig{WireGuard: WireGuard{Address: "10.99.0.2/32", MTU: 1380}},
+			wgConfPaths: map[int]string{0: "/tmp/gateway-wg.conf"},
+			ifaceExists: map[int]bool{0: false},
+			wantPlans: []slotPlan{{Slot: 0, Cmds: []command{
 				{name: "ip", args: []string{"link", "add", "wg0", "type", "wireguard"}},
-				{name: "wg", args: []string{"syncconf", "wg0", wgConfPath}},
+				{name: "wg", args: []string{"syncconf", "wg0", "/tmp/gateway-wg.conf"}},
 				{name: "ip", args: []string{"addr", "replace", "10.99.0.2/32", "dev", "wg0"}},
 				{name: "ip", args: []string{"link", "set", "wg0", "mtu", "1380", "up"}},
-				{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
-			},
+			}}},
 		},
 		{
-			name: "cluster_no_mtu_absent",
-			rc: RuntimeConfig{
-				WireGuard: WireGuard{Address: "10.99.0.2/32"},
-			},
-			ifaceExists: false,
-			want: []command{
+			name:        "cluster_no_mtu_absent",
+			rc:          RuntimeConfig{WireGuard: WireGuard{Address: "10.99.0.2/32"}},
+			wgConfPaths: map[int]string{0: "/tmp/gateway-wg.conf"},
+			ifaceExists: map[int]bool{0: false},
+			wantPlans: []slotPlan{{Slot: 0, Cmds: []command{
 				{name: "ip", args: []string{"link", "add", "wg0", "type", "wireguard"}},
-				{name: "wg", args: []string{"syncconf", "wg0", wgConfPath}},
+				{name: "wg", args: []string{"syncconf", "wg0", "/tmp/gateway-wg.conf"}},
 				{name: "ip", args: []string{"addr", "replace", "10.99.0.2/32", "dev", "wg0"}},
 				{name: "ip", args: []string{"link", "set", "wg0", "up"}},
-				{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
-			},
+			}}},
 		},
 		{
-			name: "cluster_with_mtu_present_no_link_add",
-			rc: RuntimeConfig{
-				WireGuard: WireGuard{Address: "10.99.0.2/32", MTU: 1380},
-			},
-			ifaceExists: true,
-			want: []command{
-				{name: "wg", args: []string{"syncconf", "wg0", wgConfPath}},
+			name:        "cluster_with_mtu_present_no_link_add",
+			rc:          RuntimeConfig{WireGuard: WireGuard{Address: "10.99.0.2/32", MTU: 1380}},
+			wgConfPaths: map[int]string{0: "/tmp/gateway-wg.conf"},
+			ifaceExists: map[int]bool{0: true},
+			wantPlans: []slotPlan{{Slot: 0, Cmds: []command{
+				{name: "wg", args: []string{"syncconf", "wg0", "/tmp/gateway-wg.conf"}},
 				{name: "ip", args: []string{"addr", "replace", "10.99.0.2/32", "dev", "wg0"}},
 				{name: "ip", args: []string{"link", "set", "wg0", "mtu", "1380", "up"}},
-				{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
-			},
+			}}},
 		},
 		{
-			name:        "local_with_mtu_absent",
-			rc:          RuntimeConfig{TrafficPolicy: TrafficPolicyLocal, Identity: new(NewIdentity(3)), WireGuard: WireGuard{Address: "10.244.1.7/32", MTU: 1380}},
-			ifaceExists: false,
+			name: "local_with_mtu_absent",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard: WireGuard{
+					Address: "10.244.1.7/32", MTU: 1380,
+					Peers: []Peer{{Slot: 0, PublicKey: "PUB="}},
+				},
+			},
+			wgConfPaths: map[int]string{0: "/tmp/gateway-wg-0.conf"},
+			ifaceExists: map[int]bool{0: false},
 			localForwards: []ResolvedForward{
 				{Name: "tcp-8443", PublicPort: 8443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080},
 				{Name: "udp-8443", PublicPort: 8443, Protocol: "udp", Target: "10.244.1.7", TargetPort: 9080},
 			},
-			want: []command{
+			wantPlans: []slotPlan{{Slot: 0, Cmds: []command{
 				{name: "ip", args: []string{"link", "add", "wg-gw3", "type", "wireguard"}},
-				{name: "wg", args: []string{"syncconf", "wg-gw3", wgConfPath}},
+				{name: "wg", args: []string{"syncconf", "wg-gw3", "/tmp/gateway-wg-0.conf"}},
 				{name: "ip", args: []string{"addr", "replace", "10.244.1.7/32", "dev", "wg-gw3"}},
 				{name: "ip", args: []string{"link", "set", "wg-gw3", "mtu", "1380", "up"}},
 				{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter", writeValue: "0"},
@@ -142,37 +141,76 @@ func TestBuildApplyCommands(t *testing.T) {
 				{name: "ip", args: []string{"route", "flush", "table", "100003", "type", "throw"}},
 				{name: "ip", args: []string{"route", "replace", "throw", "10.244.1.7/32", "table", "100003"}},
 				{name: "ip", args: []string{"rule", "add", "fwmark", "0x00030000/0xffff0000", "lookup", "100003", "priority", "10000"}, tolerateExists: true},
-				{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
-			},
+			}}},
 		},
 		{
-			name:        "local_with_mtu_present",
-			rc:          localRC,
-			ifaceExists: true,
-			localForwards: []ResolvedForward{
-				{Name: "b", PublicPort: 8444, Protocol: "tcp", Target: "10.244.1.9", TargetPort: 9081},
-				{Name: "a", PublicPort: 8443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080},
+			name: "local_zero_slots",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Address: "10.244.1.7/32", Peers: []Peer{}},
 			},
-			want: []command{
-				{name: "wg", args: []string{"syncconf", "wg-gw3", wgConfPath}},
-				{name: "ip", args: []string{"addr", "replace", "10.244.1.7/32", "dev", "wg-gw3"}},
-				{name: "ip", args: []string{"link", "set", "wg-gw3", "up"}},
-				{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter", writeValue: "0"},
-				{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding", writeValue: "1"},
-				{name: "ip", args: []string{"route", "replace", "default", "dev", "wg-gw3", "table", "100003"}},
-				{name: "ip", args: []string{"route", "flush", "table", "100003", "type", "throw"}},
-				{name: "ip", args: []string{"route", "replace", "throw", "10.244.1.7/32", "table", "100003"}},
-				{name: "ip", args: []string{"route", "replace", "throw", "10.244.1.9/32", "table", "100003"}},
-				{name: "ip", args: []string{"rule", "add", "fwmark", "0x00030000/0xffff0000", "lookup", "100003", "priority", "10000"}, tolerateExists: true},
-				{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset},
+			wgConfPaths: map[int]string{},
+			ifaceExists: map[int]bool{},
+			wantPlans:   []slotPlan{},
+		},
+		{
+			name: "local_two_slots",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard: WireGuard{
+					Address: "10.244.1.7/32",
+					Peers:   []Peer{{Slot: 0, PublicKey: "A="}, {Slot: 2, PublicKey: "B="}},
+				},
+			},
+			wgConfPaths: map[int]string{0: "/tmp/gateway-wg-0.conf", 2: "/tmp/gateway-wg-2.conf"},
+			ifaceExists: map[int]bool{0: true, 2: false},
+			localForwards: []ResolvedForward{
+				{Name: "a", PublicPort: 8443, Protocol: "tcp", Target: "10.244.1.9", TargetPort: 9080},
+			},
+			wantPlans: []slotPlan{
+				{Slot: 0, Cmds: []command{
+					{name: "wg", args: []string{"syncconf", "wg-gw3", "/tmp/gateway-wg-0.conf"}},
+					{name: "ip", args: []string{"addr", "replace", "10.244.1.7/32", "dev", "wg-gw3"}},
+					{name: "ip", args: []string{"link", "set", "wg-gw3", "up"}},
+					{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter", writeValue: "0"},
+					{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding", writeValue: "1"},
+					{name: "ip", args: []string{"route", "replace", "default", "dev", "wg-gw3", "table", "100003"}},
+					{name: "ip", args: []string{"route", "flush", "table", "100003", "type", "throw"}},
+					{name: "ip", args: []string{"route", "replace", "throw", "10.244.1.9/32", "table", "100003"}},
+					{name: "ip", args: []string{"rule", "add", "fwmark", "0x00030000/0xffff0000", "lookup", "100003", "priority", "10000"}, tolerateExists: true},
+				}},
+				{Slot: 2, Cmds: []command{
+					{name: "ip", args: []string{"link", "add", "wg-gw3-2", "type", "wireguard"}},
+					{name: "wg", args: []string{"syncconf", "wg-gw3-2", "/tmp/gateway-wg-2.conf"}},
+					{name: "ip", args: []string{"addr", "replace", "10.244.1.7/32", "dev", "wg-gw3-2"}},
+					{name: "ip", args: []string{"link", "set", "wg-gw3-2", "up"}},
+					{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3-2/rp_filter", writeValue: "0"},
+					{writePath: HostProcSysNetPath + "/ipv4/conf/wg-gw3-2/forwarding", writeValue: "1"},
+					{name: "ip", args: []string{"route", "replace", "default", "dev", "wg-gw3-2", "table", "100515"}},
+					{name: "ip", args: []string{"route", "flush", "table", "100515", "type", "throw"}},
+					{name: "ip", args: []string{"route", "replace", "throw", "10.244.1.9/32", "table", "100515"}},
+					{name: "ip", args: []string{"rule", "add", "fwmark", "0x02030000/0xffff0000", "lookup", "100515", "priority", "10000"}, tolerateExists: true},
+				}},
 			},
 		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			cmds := buildApplyCommands(tc.rc, wgConfPath, nftRuleset, tc.ifaceExists, tc.localForwards)
-			assertCommandPlan(t, cmds, tc.want)
+			plans, final := buildApplyCommands(tc.rc, tc.wgConfPaths, nftRuleset, tc.ifaceExists, tc.localForwards)
+			if len(plans) != len(tc.wantPlans) {
+				t.Fatalf("plan count = %d, want %d\ngot: %+v", len(plans), len(tc.wantPlans), plans)
+			}
+			for i, want := range tc.wantPlans {
+				if plans[i].Slot != want.Slot {
+					t.Errorf("plan[%d].Slot = %d, want %d", i, plans[i].Slot, want.Slot)
+				}
+				assertCommandPlan(t, plans[i].Cmds, want.Cmds)
+			}
+			wantFinal := command{name: "nft", args: []string{"-f", "-"}, stdin: nftRuleset}
+			assertCommandPlan(t, []command{final}, []command{wantFinal})
 		})
 	}
 }
@@ -247,22 +285,24 @@ func TestApplyIsIdempotent(t *testing.T) {
 
 	rc := RuntimeConfig{
 		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      new(NewIdentity(3)),
+		Identity:      testLocalIdentity(),
 		WireGuard: WireGuard{
 			Address: "10.244.1.7/32",
-			Peer: Peer{
+			Peers: []Peer{{
+				Slot:                0,
+				PublicKey:           "PUB=",
 				Endpoint:            "203.0.113.5:51820",
 				AllowedIPs:          []string{"0.0.0.0/0"},
 				PersistentKeepalive: 25,
-			},
+			}},
 		},
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	if err := Apply(context.Background(), rec.run, rc, "priv", "pub", resolve, nil, testLogger(t)); err != nil {
+	if _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t)); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if err := Apply(context.Background(), rec.run, rc, "priv", "pub", resolve, nil, testLogger(t)); err != nil {
+	if _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t)); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
 
@@ -332,21 +372,198 @@ func TestApplyFailsOnProbeError(t *testing.T) {
 
 	rc := RuntimeConfig{
 		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      new(NewIdentity(3)),
+		Identity:      testLocalIdentity(),
 		WireGuard: WireGuard{
 			Address: "10.244.1.7/32",
-			Peer: Peer{
+			Peers: []Peer{{
+				Slot:                0,
+				PublicKey:           "PUB=",
 				Endpoint:            "203.0.113.5:51820",
 				AllowedIPs:          []string{"0.0.0.0/0"},
 				PersistentKeepalive: 25,
-			},
+			}},
 		},
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	err := Apply(context.Background(), rec.run, rc, "priv", "pub", resolve, nil, testLogger(t))
+	_, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("Apply = %v, want one wrapping %v", err, probeErr)
+	}
+}
+
+// TestApplyOneFailingSlotOthersContinue keeps healthy slots running after one fails.
+func TestApplyOneFailingSlotOthersContinue(t *testing.T) {
+	rec := &runRecorder{hook: func(c command) error {
+		if c.writePath != "" && strings.Contains(c.writePath, "wg-gw3-1") {
+			return fmt.Errorf("write %s: permission denied", c.writePath)
+		}
+		return nil
+	}}
+
+	rc := RuntimeConfig{
+		TrafficPolicy: TrafficPolicyLocal,
+		Identity:      testLocalIdentity(),
+		WireGuard: WireGuard{
+			Address: "10.244.1.7/32",
+			Peers: []Peer{
+				{Slot: 0, PublicKey: "A=", Endpoint: "203.0.113.5:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+				{Slot: 1, PublicKey: "B=", Endpoint: "203.0.113.6:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+			},
+		},
+	}
+	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
+
+	results, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2 entries", results)
+	}
+	var slot0, slot1 SlotResult
+	for _, r := range results {
+		switch r.Slot {
+		case 0:
+			slot0 = r
+		case 1:
+			slot1 = r
+		}
+	}
+	if !slot0.Applied || slot0.Err != nil {
+		t.Errorf("slot 0 = %+v, want Applied=true Err=nil", slot0)
+	}
+	if slot1.Applied || slot1.Err == nil {
+		t.Errorf("slot 1 = %+v, want Applied=false with a non-nil Err", slot1)
+	}
+
+	wantSteps := []string{
+		"ip link show wg-gw3",
+		"ip link show wg-gw3-1",
+		"wg syncconf wg-gw3 " + wgConfArg,
+		"ip addr replace 10.244.1.7/32 dev wg-gw3",
+		"ip link set wg-gw3 up",
+		"write " + HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter=0",
+		"write " + HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding=1",
+		"ip route replace default dev wg-gw3 table 100003",
+		"ip route flush table 100003 type throw",
+		"ip rule add fwmark 0x00030000/0xffff0000 lookup 100003 priority 10000",
+		"wg syncconf wg-gw3-1 " + wgConfArg,
+		"ip addr replace 10.244.1.7/32 dev wg-gw3-1",
+		"ip link set wg-gw3-1 up",
+		"write " + HostProcSysNetPath + "/ipv4/conf/wg-gw3-1/rp_filter=0",
+		"nft -f -",
+	}
+	if steps := stepLines(t, rec.snapshot()); !slices.Equal(steps, wantSteps) {
+		t.Errorf("executed steps =\n%s\nwant\n%s", strings.Join(steps, "\n"), strings.Join(wantSteps, "\n"))
+	}
+}
+
+// wgConfArg stands for the per-slot wg(8) config path in a compared step list: os.CreateTemp
+// names it afresh every run.
+const wgConfArg = "<wg.conf>"
+
+// stepLines renders every recorded step as one comparable line, a process as its argv and a
+// sysctl as "write <path>=<value>", with each slot's wg config path replaced by wgConfArg.
+func stepLines(t *testing.T, cmds []command) []string {
+	t.Helper()
+	pattern := filepath.Join(os.TempDir(), "gateway-wg-*.conf")
+	lines := make([]string, 0, len(cmds))
+	for _, c := range cmds {
+		if c.writePath != "" {
+			lines = append(lines, fmt.Sprintf("write %s=%s", c.writePath, c.writeValue))
+			continue
+		}
+		args := slices.Clone(c.args)
+		for i, a := range args {
+			match, err := filepath.Match(pattern, a)
+			if err != nil {
+				t.Fatalf("match %q against %q: %v", a, pattern, err)
+			}
+			if match {
+				args[i] = wgConfArg
+			}
+		}
+		lines = append(lines, strings.Join(append([]string{c.name}, args...), " "))
+	}
+	return lines
+}
+
+// TestApplyRulesetFailureHoldsEveryAttemptedSlot pins the final nft -f failing: a Gateway-wide
+// error and one unapplied result per attempted slot, so the caller holds the state they created.
+func TestApplyRulesetFailureHoldsEveryAttemptedSlot(t *testing.T) {
+	nftErr := fmt.Errorf("nft -f -: exit status 1: Error: syntax error")
+	slotErr := fmt.Errorf("ip [link set wg-gw3-2 up]: exit status 2: Operation not permitted")
+
+	tcs := []struct {
+		name string
+		// failSlotStep fails slot 2's link set step, the per-slot failure the ruleset failure
+		// must not overwrite.
+		failSlotStep bool
+		wantErrs     []error
+	}{
+		{
+			name:     "both_slots_carry_the_ruleset_error",
+			wantErrs: []error{nftErr, nftErr},
+		},
+		{
+			name:         "a_slot_that_failed_its_own_step_keeps_its_error",
+			failSlotStep: true,
+			wantErrs:     []error{nftErr, slotErr},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &runRecorder{hook: func(c command) error {
+				if c.name == "nft" {
+					return nftErr
+				}
+				if tc.failSlotStep && c.name == "ip" && slices.Equal(c.args, []string{"link", "set", "wg-gw3-2", "up"}) {
+					return slotErr
+				}
+				return nil
+			}}
+
+			rc := RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard: WireGuard{
+					Address: "10.244.1.7/32",
+					Peers: []Peer{
+						{Slot: 0, PublicKey: "A=", Endpoint: "203.0.113.5:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+						{Slot: 2, PublicKey: "B=", Endpoint: "203.0.113.6:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+					},
+				},
+			}
+			resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
+
+			results, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
+			if err == nil || !errors.Is(err, nftErr) {
+				t.Fatalf("Apply error = %v, want one wrapping %v", err, nftErr)
+			}
+			wantSlots := []int{0, 2}
+			if len(results) != len(wantSlots) {
+				t.Fatalf("results = %+v, want one entry per attempted slot %v", results, wantSlots)
+			}
+			for i, want := range wantSlots {
+				if results[i].Slot != want || results[i].Applied {
+					t.Errorf("results[%d] = {slot %d applied %t}, want {slot %d applied false}",
+						i, results[i].Slot, results[i].Applied, want)
+				}
+				if !errors.Is(results[i].Err, tc.wantErrs[i]) {
+					t.Errorf("results[%d].Err = %v, want one wrapping %v", i, results[i].Err, tc.wantErrs[i])
+				}
+			}
+
+			d := newDataPlane(rc)
+			d.mu.Lock()
+			d.record(results)
+			d.mu.Unlock()
+			if held := d.heldSlots(); !slices.Equal(held, wantSlots) {
+				t.Errorf("held slots after the failed pass = %v, want %v", held, wantSlots)
+			}
+		})
 	}
 }
 
@@ -392,28 +609,25 @@ func TestRunStep(t *testing.T) {
 func TestRulePlanShape(t *testing.T) {
 	rc := RuntimeConfig{
 		TrafficPolicy: TrafficPolicyLocal,
-		Identity:      new(NewIdentity(3)),
-		WireGuard:     WireGuard{Address: "10.244.1.7/32"},
+		Identity:      testLocalIdentity(),
+		WireGuard: WireGuard{
+			Address: "10.244.1.7/32",
+			Peers:   []Peer{{Slot: 0, PublicKey: "PUB="}},
+		},
 	}
 
-	apply := buildApplyCommands(rc, "/tmp/wg.conf", "table inet gw3 { }", true, nil)
-	adds, dels := countRuleSteps(apply)
+	plans, _ := buildApplyCommands(rc, map[int]string{0: "/tmp/wg.conf"}, "table inet gw3 { }", map[int]bool{0: true}, nil)
+	if len(plans) != 1 {
+		t.Fatalf("plan count = %d, want 1", len(plans))
+	}
+	adds, dels := countRuleSteps(plans[0].Cmds)
 	if adds != 1 || dels != 0 {
 		t.Errorf("apply plan has %d rule add and %d rule del steps, want 1 and 0", adds, dels)
 	}
-	for _, c := range apply {
+	for _, c := range plans[0].Cmds {
 		if isRuleStep(c, "add") && !c.tolerateExists {
 			t.Error("the apply plan's rule add does not tolerate an already-present rule")
 		}
-	}
-
-	rec := &runRecorder{}
-	if err := Teardown(context.Background(), rec.run, rc); err != nil {
-		t.Fatalf("Teardown: %v", err)
-	}
-	adds, dels = countRuleSteps(rec.snapshot())
-	if adds != 0 || dels != 1 {
-		t.Errorf("teardown plan has %d rule add and %d rule del steps, want 0 and 1", adds, dels)
 	}
 }
 
@@ -805,8 +1019,8 @@ func TestRenderConfigModeBranch(t *testing.T) {
 			name: "local_renders_supplied_forwards_without_resolving",
 			rc: RuntimeConfig{
 				TrafficPolicy: TrafficPolicyLocal,
-				Identity:      new(NewIdentity(3)),
-				WireGuard:     WireGuard{Address: "10.99.0.2/32"},
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Address: "10.99.0.2/32", Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
 				Forwards: []Forward{
 					{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443},
 				},
@@ -826,7 +1040,7 @@ func TestRenderConfigModeBranch(t *testing.T) {
 		{
 			name: "cluster_by_default_renders_resolved_targets",
 			rc: RuntimeConfig{
-				WireGuard: WireGuard{Address: "10.99.0.2/32"},
+				WireGuard: WireGuard{Address: "10.99.0.2/32", Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
 				Forwards: []Forward{
 					{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443},
 					{Name: "game", PublicPort: 30000, Protocol: "udp", Service: "game.default.svc", TargetPort: 9000},
@@ -843,7 +1057,7 @@ func TestRenderConfigModeBranch(t *testing.T) {
 			name: "cluster_explicit_policy_renders_resolved_targets",
 			rc: RuntimeConfig{
 				TrafficPolicy: TrafficPolicyCluster,
-				WireGuard:     WireGuard{Address: "10.99.0.2/32"},
+				WireGuard:     WireGuard{Address: "10.99.0.2/32", Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
 				Forwards: []Forward{
 					{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443},
 					{Name: "game", PublicPort: 30000, Protocol: "udp", Service: "game.default.svc", TargetPort: 9000},
@@ -861,11 +1075,15 @@ func TestRenderConfigModeBranch(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls []string
-			_, ruleset, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", "pub", tc.resolve(t, &calls), tc.localForwards)
+			_, ruleset, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", tc.resolve(t, &calls), tc.localForwards, testLogger(t))
 			if err != nil {
 				t.Fatalf("renderConfig: %v", err)
 			}
-			defer cleanup()
+			defer func() {
+				if err := cleanup(false); err != nil {
+					t.Errorf("cleanup: %v", err)
+				}
+			}()
 
 			if got := dnatTargets(ruleset); !slices.Equal(got, tc.wantDNAT) {
 				t.Errorf("rendered DNAT targets = %v, want %v\n--- ruleset ---\n%s", got, tc.wantDNAT, ruleset)

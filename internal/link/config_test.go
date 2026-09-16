@@ -3,6 +3,7 @@ package link
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -12,11 +13,9 @@ const validRuntimeJSON = `{
     "address": "10.99.0.2/32",
     "listenPort": 51820,
     "mtu": 1380,
-    "peer": {
-      "endpoint": "gateway.example:51820",
-      "allowedIPs": ["10.99.0.1/32"],
-      "persistentKeepalive": 25
-    }
+    "peers": [
+      {"slot": 0, "publicKey": "PEERPUB=", "endpoint": "gateway.example:51820", "allowedIPs": ["10.99.0.1/32"], "persistentKeepalive": 25}
+    ]
   },
   "forwards": [
     {"name": "web", "publicPort": 443, "protocol": "TCP", "service": "web.default.svc", "targetPort": 8443},
@@ -44,8 +43,11 @@ func TestLoadRuntimeConfigHappyPath(t *testing.T) {
 	if rc.WireGuard.Address != "10.99.0.2/32" {
 		t.Errorf("address = %q, want 10.99.0.2/32", rc.WireGuard.Address)
 	}
-	if rc.WireGuard.Peer.PersistentKeepalive != 25 {
-		t.Errorf("keepalive = %d, want 25", rc.WireGuard.Peer.PersistentKeepalive)
+	if len(rc.WireGuard.Peers) != 1 {
+		t.Fatalf("peers len = %d, want 1", len(rc.WireGuard.Peers))
+	}
+	if rc.WireGuard.Peers[0].PersistentKeepalive != 25 {
+		t.Errorf("keepalive = %d, want 25", rc.WireGuard.Peers[0].PersistentKeepalive)
 	}
 	if len(rc.Forwards) != 2 {
 		t.Fatalf("forwards len = %d, want 2", len(rc.Forwards))
@@ -59,6 +61,7 @@ func TestLoadRuntimeConfigHappyPath(t *testing.T) {
 }
 
 func TestLoadRuntimeConfigValidation(t *testing.T) {
+	const onePeer = `"peers":[{"slot":0,"publicKey":"PUB=","endpoint":"h:1"}]`
 	tcs := []struct {
 		name    string
 		body    string
@@ -76,36 +79,36 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 		},
 		{
 			name:    "empty_address",
-			body:    `{"wireguard":{"address":"","peer":{"endpoint":"h:1"}}}`,
+			body:    `{"wireguard":{"address":"",` + onePeer + `}}`,
 			wantErr: "wireguard address is required",
 		},
 		{
 			name: "bad_protocol",
-			body: `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"sctp","service":"s","targetPort":80}]}`,
 			wantErr: "protocol must be tcp or udp",
 		},
 		{
 			name: "public_port_out_of_range",
-			body: `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":70000,"protocol":"tcp","service":"s","targetPort":80}]}`,
 			wantErr: "public port must be in 1..65535",
 		},
 		{
 			name: "target_port_out_of_range",
-			body: `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","service":"s","targetPort":0}]}`,
 			wantErr: "target port must be in 1..65535",
 		},
 		{
 			name: "empty_service",
-			body: `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","service":"","targetPort":80}]}`,
 			wantErr: "service is required",
 		},
 		{
 			name: "duplicate_port_protocol",
-			body: `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[
 			          {"name":"a","publicPort":80,"protocol":"TCP","service":"s1","targetPort":80},
 			          {"name":"b","publicPort":80,"protocol":"tcp","service":"s2","targetPort":81}
@@ -114,54 +117,107 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 		},
 		{
 			name: "local_identity_with_namespace_and_service_name_valid",
-			body: `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`,
+			wantErr: "",
+		},
+		{
+			name: "local_health_port_omitted_invalid",
+			body: `{"trafficPolicy":"Local","identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "healthPort 0 must equal this gateway identity's health port 27003",
+		},
+		{
+			name: "local_health_port_mismatched_invalid",
+			body: `{"trafficPolicy":"Local","healthPort":8080,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "healthPort 8080 must equal this gateway identity's health port 27003",
+		},
+		{
+			name: "local_health_port_equal_to_identity_valid",
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: "",
 		},
 		{
 			name: "unknown_traffic_policy_invalid",
 			body: `{"trafficPolicy":"Regional",
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}}}`,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: `unknown traffic policy "Regional"`,
 		},
 		{
 			name: "cluster_traffic_policy_valid",
 			body: `{"trafficPolicy":"Cluster",
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}}}`,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: "",
 		},
 		{
 			name: "local_policy_without_identity_invalid",
 			body: `{"trafficPolicy":"Local",
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}}}`,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: "carries no identity block",
 		},
 		{
 			name: "identity_with_cluster_policy_invalid",
-			body: `{"identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}}}`,
+			body: `{"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: "Local-only",
 		},
 		{
 			name: "local_identity_without_pod_selector_invalid",
-			body: `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`,
 			wantErr: "requires a non-empty podSelector",
 		},
 		{
 			name: "local_forward_missing_service_name_invalid",
-			body: `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","namespace":"default"}]}`,
 			wantErr: "serviceName is required",
 		},
 		{
 			name: "local_forward_empty_service_port_name_valid",
-			body: `{"trafficPolicy":"Local","identity":{"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},"podSelector":{"app":"gateway-link"},
-			        "wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `},
 			        "forwards":[{"name":"x","publicPort":80,"protocol":"tcp","namespace":"default","serviceName":"web","servicePortName":""}]}`,
+			wantErr: "",
+		},
+		{
+			name:    "peer_missing_public_key_invalid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"endpoint":"h:1"}]}}`,
+			wantErr: "publicKey is required",
+		},
+		{
+			name:    "peer_slot_below_range_invalid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":-1,"publicKey":"A=","endpoint":"h:1"}]}}`,
+			wantErr: "must be in 0..255",
+		},
+		{
+			name:    "peer_slot_zero_valid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"publicKey":"A=","endpoint":"h:1"}]}}`,
+			wantErr: "",
+		},
+		{
+			name:    "peer_slot_255_valid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":255,"publicKey":"A=","endpoint":"h:1"}]}}`,
+			wantErr: "",
+		},
+		{
+			name:    "peer_slot_above_range_invalid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":256,"publicKey":"A=","endpoint":"h:1"}]}}`,
+			wantErr: "must be in 0..255",
+		},
+		{
+			name:    "duplicate_peer_slot_invalid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":1,"publicKey":"A=","endpoint":"h:1"},{"slot":1,"publicKey":"B=","endpoint":"h:2"}]}}`,
+			wantErr: "duplicate slot",
+		},
+		{
+			name:    "peer_list_gap_valid",
+			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"publicKey":"A=","endpoint":"h:1"},{"slot":2,"publicKey":"B=","endpoint":"h:2"}]}}`,
 			wantErr: "",
 		},
 	}
@@ -192,30 +248,77 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 	}
 }
 
+// TestLoadRuntimeConfigZeroPeers pins that a pending fleet — a load-balanced Gateway whose
+// members' VMs do not exist yet — loads in both modes, as the one-peer config minus the peer.
+func TestLoadRuntimeConfigZeroPeers(t *testing.T) {
+	tcs := []struct {
+		name string
+		body string
+		want RuntimeConfig
+	}{
+		{
+			name: "cluster_zero_peers",
+			body: `{"wireguard":{"address":"10.99.0.2/32","listenPort":51820,"mtu":1380,"peers":[]},
+			        "forwards":[{"name":"web","publicPort":443,"protocol":"TCP","service":"web.default.svc","targetPort":8443}]}`,
+			want: RuntimeConfig{
+				WireGuard: WireGuard{Address: "10.99.0.2/32", ListenPort: 51820, MTU: 1380, Peers: []Peer{}},
+				Forwards:  []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443}},
+			},
+		},
+		{
+			name: "local_zero_peers",
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},
+			        "podSelector":{"app":"gateway-link"},
+			        "wireguard":{"address":"10.99.0.2/32","peers":[]},
+			        "forwards":[{"name":"web","publicPort":443,"protocol":"TCP","namespace":"default","serviceName":"web"}]}`,
+			want: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      new(NewGatewayIdentity(3)),
+				HealthPort:    27003,
+				PodSelector:   map[string]string{"app": "gateway-link"},
+				WireGuard:     WireGuard{Address: "10.99.0.2/32", Peers: []Peer{}},
+				Forwards:      []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Namespace: "default", ServiceName: "web"}},
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rc, err := LoadRuntimeConfig(writeRuntimeConfig(t, tc.body))
+			if err != nil {
+				t.Fatalf("LoadRuntimeConfig: %v", err)
+			}
+			if !reflect.DeepEqual(rc, tc.want) {
+				t.Errorf("loaded config = %+v, want %+v", rc, tc.want)
+			}
+		})
+	}
+}
+
 func TestEmptyPeerEndpointAllowed(t *testing.T) {
-	// The operator writes the endpoint once it observes the gateway address, so an absent
-	// endpoint must still validate; the wg0 address is required regardless.
-	body := `{"wireguard":{"address":"10.0.0.2/32","peer":{"allowedIPs":["10.99.0.1/32"]}}}`
+	// The operator writes the endpoint once it observes the member's promoted address, so an
+	// absent endpoint must still validate; the wg0 address and each peer's public key are not.
+	body := `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"publicKey":"PUB=","allowedIPs":["10.99.0.1/32"]}]}}`
 	path := writeRuntimeConfig(t, body)
 	rc, err := LoadRuntimeConfig(path)
 	if err != nil {
 		t.Fatalf("empty peer endpoint should validate: %v", err)
 	}
-	if rc.WireGuard.Peer.Endpoint != "" {
-		t.Errorf("endpoint = %q, want empty", rc.WireGuard.Peer.Endpoint)
+	if rc.WireGuard.Peers[0].Endpoint != "" {
+		t.Errorf("endpoint = %q, want empty", rc.WireGuard.Peers[0].Endpoint)
 	}
 }
 
 const validLocalRuntimeJSON = `{
   "trafficPolicy": "Local",
-  "identity": {"id":3,"interface":"wg-gw3","nftTable":"gw3","mark":"0x00030000","markMask":"0xffff0000","routeTable":100003,"healthPort":27003},
+  "healthPort": 27003,
+  "identity": {"id":3,"healthPort":27003,"nftTable":"gw3"},
   "podSelector": {"app": "gateway-link", "gateway": "gw1"},
   "wireguard": {
     "address": "10.99.0.2/32",
-    "peer": {
-      "endpoint": "gateway.example:51820",
-      "allowedIPs": ["0.0.0.0/0"]
-    }
+    "peers": [
+      {"slot": 0, "publicKey": "PUB=", "endpoint": "gateway.example:51820", "allowedIPs": ["0.0.0.0/0"]}
+    ]
   },
   "forwards": [
     {"name": "web", "publicPort": 443, "protocol": "TCP", "namespace": "default", "serviceName": "web"}
@@ -236,7 +339,7 @@ func TestLoadRuntimeConfigLocalHappyPath(t *testing.T) {
 	if rc.Identity == nil {
 		t.Fatalf("identity = nil, want non-nil")
 	}
-	if want := NewIdentity(3); *rc.Identity != want {
+	if want := NewGatewayIdentity(3); *rc.Identity != want {
 		t.Errorf("identity = %+v, want %+v", *rc.Identity, want)
 	}
 	wantSelector := map[string]string{"app": "gateway-link", "gateway": "gw1"}
@@ -251,7 +354,7 @@ func TestLoadRuntimeConfigLocalHappyPath(t *testing.T) {
 }
 
 func TestDuplicatePortDifferentProtocolAllowed(t *testing.T) {
-	body := `{"wireguard":{"address":"10.0.0.2/32","peer":{"endpoint":"h:1"}},
+	body := `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"h:1"}]},
 	          "forwards":[
 	            {"name":"a","publicPort":80,"protocol":"tcp","service":"s1","targetPort":80},
 	            {"name":"b","publicPort":80,"protocol":"udp","service":"s2","targetPort":81}

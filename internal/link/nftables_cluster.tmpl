@@ -24,6 +24,9 @@ table inet {{ .Table }} {
 
 	chain input {
 		type filter hook input priority filter; policy accept;
+{{- if gt .HealthPort 0 }}
+		iif "{{ .Interface }}" tcp dport {{ .HealthPort }} accept
+{{- end }}
 		iif "{{ .Interface }}" drop
 	}
 }
