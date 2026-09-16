@@ -45,7 +45,7 @@ func TestIgnitionStorageFiles(t *testing.T) {
 		contains []string
 	}{
 		{
-			name: "OS Login authorized-keys drop-in",
+			name: "renders the os login authorized keys drop-in",
 			path: "/etc/ssh/sshd_config.d/10-google-oslogin.conf",
 			mode: 420,
 			// Sorting before the image's own 20-systemd-userdb.conf is what makes
@@ -53,19 +53,19 @@ func TestIgnitionStorageFiles(t *testing.T) {
 			contains: []string{"google_authorized_keys", "AuthorizedKeysCommandUser root"},
 		},
 		{
-			name:     "keyfetch boot script",
+			name:     "renders the keyfetch boot script",
 			path:     "/opt/gateway/keyfetch.sh",
 			mode:     493,
-			contains: []string{"fetch_metadata_attr"},
+			contains: []string{"fetch_metadata_attr", "fetch_instance_attr"},
 		},
 		{
-			name:     "nftables ruleset template",
+			name:     "renders the nftables ruleset template",
 			path:     "/etc/nftables/gateway.nft",
 			mode:     420,
 			contains: []string{"table inet gateway"},
 		},
 		{
-			name:     "forwarding sysctls",
+			name:     "renders the forwarding sysctls",
 			path:     "/etc/sysctl.d/50-gateway-forward.conf",
 			mode:     420,
 			contains: []string{"net.ipv4.ip_forward"},
@@ -179,10 +179,15 @@ func helmTemplate(t *testing.T) string {
 
 func readChartFile(t *testing.T, relPath string) string {
 	t.Helper()
-	path := filepath.Join(chartDir(t), relPath)
+	return readRepoFile(t, filepath.Join("k8s", "charts", "wireguard-gateway-operator", relPath))
+}
+
+func readRepoFile(t *testing.T, relPath string) string {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), relPath)
 	b, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read chart file %s: %v", path, err)
+		t.Fatalf("read repository file %s: %v", path, err)
 	}
 	return string(b)
 }
