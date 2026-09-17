@@ -976,7 +976,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 					"maxUnavailableFixed":        float64(2),
 					"instanceRedistributionType": "NONE",
 				}
-				if got := nestedMap(t, mig, "spec", "forProvider", "updatePolicy"); !reflect.DeepEqual(got, wantPolicy) {
+				if got := nestedMap(t, mig, "spec", "initProvider", "updatePolicy"); !reflect.DeepEqual(got, wantPolicy) {
 					t.Errorf("mig updatePolicy = %v, want %v", got, wantPolicy)
 				}
 				zones := nestedSlice(t, mig, "spec", "forProvider", "distributionPolicyZones")
@@ -1000,6 +1000,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got, want := nestedMap(t, mig, "spec", "forProvider"), expectedMIGForProvider(nil); !reflect.DeepEqual(got, want) {
 					t.Errorf("mig forProvider = %v, want %v", got, want)
 				}
+				if got, want := nestedMap(t, mig, "spec", "initProvider"), expectedMIGInitProvider(); !reflect.DeepEqual(got, want) {
+					t.Errorf("mig initProvider = %v, want %v", got, want)
+				}
 			},
 		},
 		{
@@ -1019,6 +1022,9 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				}
 				if got, want := nestedMap(t, mig, "spec", "forProvider"), expectedMIGForProvider(autoHealingPolicies); !reflect.DeepEqual(got, want) {
 					t.Errorf("mig forProvider = %v, want %v", got, want)
+				}
+				if got, want := nestedMap(t, mig, "spec", "initProvider"), expectedMIGInitProvider(); !reflect.DeepEqual(got, want) {
+					t.Errorf("mig initProvider = %v, want %v", got, want)
 				}
 			},
 		},
@@ -1918,13 +1924,6 @@ func expectedMIGForProvider(autoHealingPolicies map[string]any) map[string]any {
 		"targetSize":                  float64(1),
 		"listManagedInstancesResults": "PAGINATED",
 		"version":                     []any{map[string]any{"instanceTemplate": templateSelfLink(lbTemplateRevision)}},
-		"updatePolicy": map[string]any{
-			"type":                       "PROACTIVE",
-			"replacementMethod":          "RECREATE",
-			"maxSurgeFixed":              float64(0),
-			"maxUnavailableFixed":        float64(1),
-			"instanceRedistributionType": "NONE",
-		},
 		"statefulExternalIp": []any{map[string]any{
 			"interfaceName": "nic0",
 			"deleteRule":    "ON_PERMANENT_INSTANCE_DELETION",
@@ -1935,6 +1934,18 @@ func expectedMIGForProvider(autoHealingPolicies map[string]any) map[string]any {
 		forProvider["autoHealingPolicies"] = autoHealingPolicies
 	}
 	return forProvider
+}
+
+func expectedMIGInitProvider() map[string]any {
+	return map[string]any{
+		"updatePolicy": map[string]any{
+			"type":                       "PROACTIVE",
+			"replacementMethod":          "RECREATE",
+			"maxSurgeFixed":              float64(0),
+			"maxUnavailableFixed":        float64(1),
+			"instanceRedistributionType": "NONE",
+		},
+	}
 }
 
 func templateResourceName(revision string) string {

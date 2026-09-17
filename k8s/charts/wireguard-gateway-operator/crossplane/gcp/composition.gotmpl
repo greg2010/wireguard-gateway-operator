@@ -393,12 +393,6 @@ spec:
     listManagedInstancesResults: PAGINATED
     version:
       - instanceTemplate: {{ $migTemplateSelfLink | quote }}
-    updatePolicy:
-      type: PROACTIVE
-      replacementMethod: RECREATE
-      maxSurgeFixed: 0
-      maxUnavailableFixed: {{ len $zones }}
-      instanceRedistributionType: NONE
     statefulExternalIp:
       - interfaceName: nic0
         deleteRule: ON_PERMANENT_INSTANCE_DELETION
@@ -409,6 +403,13 @@ spec:
       healthCheck: {{ $healthCheckMigSelfLink | quote }}
       initialDelaySec: 900
     {{- end }}
+  initProvider:
+    updatePolicy:
+      type: PROACTIVE
+      replacementMethod: RECREATE
+      maxSurgeFixed: 0
+      maxUnavailableFixed: {{ len $zones }}
+      instanceRedistributionType: NONE
   providerConfigRef:
     name: {{ $providerConfig | quote }}
     kind: ClusterProviderConfig
