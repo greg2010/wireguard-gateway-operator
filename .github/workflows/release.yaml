@@ -34,9 +34,21 @@ jobs:
             exit 1
           fi
       - run: |
-          conclusion="$(gh run list --workflow=ci.yaml --commit "$GITHUB_SHA" --json conclusion --jq '.[0].conclusion')"
-          if [ "$conclusion" != "success" ]; then
-            echo "CI workflow has not concluded success for $GITHUB_SHA (got: ${conclusion:-none})" >&2
+          run_id="$(gh run list --workflow=ci.yaml --commit "$GITHUB_SHA" --json databaseId --jq '.[0].databaseId')"
+          if [ -z "$run_id" ]; then
+            echo "no ci.yaml run found for $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          failures="$(gh run view "$run_id" --json jobs --jq '[.jobs[] | select(.name != "e2e") | select(.conclusion != "success")] | map("\(.name)=\(.conclusion // "null")") | join(", ")')"
+          if [ -n "$failures" ]; then
+            echo "ci.yaml run $run_id has non-successful jobs (excluding e2e): $failures" >&2
+            exit 1
+          fi
+
+          build_push_count="$(gh run view "$run_id" --json jobs --jq '[.jobs[] | select(.name | startswith("build-push"))] | length')"
+          if [ "$build_push_count" -eq 0 ]; then
+            echo "ci.yaml run $run_id has no build-push job" >&2
             exit 1
           fi
 
