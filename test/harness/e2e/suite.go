@@ -81,6 +81,9 @@ func (s *Suite) Client() *hk8s.Client { return s.client }
 // outside Start.
 func (s *Suite) Env() Env { return s.env }
 
+// Nodes returns the kind node container names for tests that need node-level faults.
+func (s *Suite) Nodes() ([]string, error) { return s.cluster.Nodes() }
+
 // KillContainerOnNode SIGKILLs the pod's containers on a kind node through crictl, the
 // ungraceful loss a pod delete cannot produce: kubelet grants a SIGTERM window even at
 // grace period 0, which is enough for the link to tear down. It is scoped to one pod

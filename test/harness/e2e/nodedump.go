@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -67,7 +68,22 @@ func (s *Suite) dumpLocalDataPlane(ctx context.Context, t *testing.T, stack *Sta
 		s.log.Warn("dump local data plane: gateway reports no status.link.id")
 		return
 	}
-	id := link.NewIdentity(status.LinkID)
+	identity := link.NewGatewayIdentity(status.LinkID)
+	slots := []int{0}
+	if raw, err := s.client.ConfigMapData(ctx, stack.Namespace, linkConfigMapName(stack.GatewayName), linkConfigMapKey); err != nil {
+		s.log.Warn("dump local data plane: read runtime config", zap.Error(err))
+	} else {
+		var config link.RuntimeConfig
+		if err := json.Unmarshal([]byte(raw), &config); err != nil {
+			s.log.Warn("dump local data plane: decode runtime config", zap.Error(err))
+		} else {
+			for _, peer := range config.WireGuard.Peers {
+				if peer.Slot != 0 {
+					slots = append(slots, peer.Slot)
+				}
+			}
+		}
+	}
 
 	node, err := s.client.PodNode(ctx, stack.Namespace, holder)
 	if err != nil {
@@ -75,11 +91,14 @@ func (s *Suite) dumpLocalDataPlane(ctx context.Context, t *testing.T, stack *Sta
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "holder=%s node=%s id=%d interface=%s nftTable=%s routeTable=%d mark=%s/%s\n",
-		holder, node, id.ID, id.Interface, id.NftTable, id.RouteTable, id.Mark, id.MarkMask)
+	fmt.Fprintf(&b, "holder=%s node=%s id=%d nftTable=%s\n", holder, node, identity.ID, identity.NftTable)
 
-	for _, c := range localNodeCaptures(id) {
-		fmt.Fprintf(&b, "-- %s --\n%s\n", c.label, s.captureInLinkPod(ctx, stack.Namespace, holder, c.argv))
+	for _, slot := range slots {
+		id := link.NewSlotIdentity(identity.ID, slot)
+		fmt.Fprintf(&b, "slot=%d interface=%s routeTable=%d mark=%s/%s\n", slot, id.Interface, id.RouteTable, id.Mark, id.MarkMask)
+		for _, c := range localNodeCaptures(identity, id) {
+			fmt.Fprintf(&b, "-- %s --\n%s\n", c.label, s.captureInLinkPod(ctx, stack.Namespace, holder, c.argv))
+		}
 	}
 	fmt.Fprintf(&b, "-- conntrack tcp dport %d (node %s) --\n%s\n",
 		stack.TCPPublicPort, node, s.captureConntrack(ctx, node, stack.TCPPublicPort))
@@ -89,10 +108,10 @@ func (s *Suite) dumpLocalDataPlane(ctx context.Context, t *testing.T, stack *Sta
 
 // localNodeCaptures derives the plan from the identity in status.link.id, and reads sysctls
 // through the link's own mount. On a disagreement, dump.go's link ConfigMap section decides.
-func localNodeCaptures(id link.Identity) []nodeCapture {
+func localNodeCaptures(gateway link.GatewayIdentity, id link.SlotIdentity) []nodeCapture {
 	confPath := link.HostProcSysNetPath + "/ipv4/conf/" + id.Interface
 	return []nodeCapture{
-		cmd("nft", "list", "table", "inet", id.NftTable),
+		cmd("nft", "list", "table", "inet", gateway.NftTable),
 		cmd("ip", "rule", "show"),
 		cmd("ip", "route", "show", "table", strconv.Itoa(id.RouteTable)),
 		cmd("ip", "route", "show", "table", "main"),

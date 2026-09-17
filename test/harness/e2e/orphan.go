@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,16 +28,14 @@ type resourceCount struct {
 	names string
 }
 
-// assertNoOrphans polls every GCP resource family the gateway provisions until all
-// reach zero or the deadline elapses, returning an error naming any leak. Compute
-// resources match namePrefix; the operator-derived SA and Secret match the gw- ID.
-func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, namePrefix string, timeout time.Duration, log *zap.Logger) error {
+// assertNoOrphans reports GCP resources left by the test.
+func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, gatewayUID, namePrefix string, timeout time.Duration, log *zap.Logger) error {
 	derivedID := gcpID(namespace, gatewayName)
 	start := time.Now()
 	deadline := start.Add(timeout)
 	var last []resourceCount
 	for {
-		counts, err := countResources(ctx, auth, namePrefix, derivedID)
+		counts, err := countResources(ctx, auth, namePrefix, derivedID, gatewayUID)
 		if err != nil {
 			return fmt.Errorf("count gcp resources: %w", err)
 		}
@@ -59,9 +58,7 @@ func assertNoOrphans(ctx context.Context, auth gcpAuth, namespace, gatewayName, 
 	}
 }
 
-// serialConsoleOutput returns the gateway VM's serial-port-1 console output, where
-// the keyfetch boot unit logs. It is best-effort diagnostics: a missing instance
-// yields a descriptive string rather than an error.
+// serialConsoleOutput fetches VM serial output for diagnostics.
 func serialConsoleOutput(ctx context.Context, auth gcpAuth, zone, namePrefix string) (string, error) {
 	names, err := listNames(ctx, auth,
 		[]string{"compute", "instances", "list"}, "name~^"+namePrefix, "name")
@@ -96,10 +93,9 @@ func gcpID(namespace, name string) string {
 	return id
 }
 
-// countResources returns the per-family counts of every GCP resource family the
-// gateway provisions. Compute resources match namePrefix; the operator-derived
-// ServiceAccount and Secret match derivedID.
-func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID string) ([]resourceCount, error) {
+// countResources counts resources matching the supplied filter.
+func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID, gatewayUID string) ([]resourceCount, error) {
+	secretFilter := "name~^projects/" + regexp.QuoteMeta(auth.projectID) + "/secrets/(" + regexp.QuoteMeta(derivedID) + "$|gw-" + regexp.QuoteMeta(gatewayUID) + "-" + regexp.QuoteMeta(auth.projectID) + "-)"
 	queries := []struct {
 		kind       string
 		args       []string
@@ -113,8 +109,13 @@ func countResources(ctx context.Context, auth gcpAuth, namePrefix, derivedID str
 		{"firewall-rule", []string{"compute", "firewall-rules", "list"}, "name~^" + namePrefix, "name"},
 		{"network", []string{"compute", "networks", "list"}, "name~^" + namePrefix, "name"},
 		{"subnetwork", []string{"compute", "networks", "subnets", "list"}, "name~^" + namePrefix, "name"},
+		{"instance-template", []string{"compute", "instance-templates", "list"}, "name~^" + namePrefix, "name"},
+		{"region-instance-group-manager", []string{"compute", "instance-groups", "managed", "list"}, "name~^" + namePrefix, "name"},
+		{"region-backend-service", []string{"compute", "backend-services", "list"}, "name~^" + namePrefix, "name"},
+		{"forwarding-rule", []string{"compute", "forwarding-rules", "list"}, "name~^" + namePrefix, "name"},
+		{"region-health-check", []string{"compute", "health-checks", "list"}, "name~^" + namePrefix, "name"},
 		{"service-account", []string{"iam", "service-accounts", "list"}, "email~^" + derivedID + "@", "email"},
-		{"secret", []string{"secrets", "list"}, "name~/secrets/" + derivedID + "$", "name"},
+		{"secret", []string{"secrets", "list"}, secretFilter, "name"},
 	}
 
 	var out []resourceCount
@@ -150,14 +151,10 @@ func listNames(ctx context.Context, auth gcpAuth, args []string, filter, field s
 	return names, nil
 }
 
-// gcloudCallTimeout bounds a single gcloud invocation. A slow or wedged call
-// (auth stall, API hiccup) must not block to the suite's global deadline and
-// starve the teardown drain; it fails fast so the caller can surface or retry.
+// gcloudCallTimeout prevents stalled calls from blocking teardown until the suite deadline.
 const gcloudCallTimeout = 30 * time.Second
 
-// runGcloud invokes gcloud with the service-account key activated per call via
-// CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE, so it does not mutate the operator's
-// active gcloud configuration. Each call is bounded by gcloudCallTimeout.
+// runGcloud isolates service-account authentication from the active gcloud configuration.
 func runGcloud(ctx context.Context, auth gcpAuth, args ...string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, gcloudCallTimeout)
 	defer cancel()

@@ -7,20 +7,18 @@ import (
 	"strings"
 )
 
-// SharedNetworkName mirrors the chart's release-derived VPC name (wgnet-<release>) for the e2e operator install.
+// SharedNetworkName matches the chart's release-derived VPC name for e2e installs.
 const SharedNetworkName = "wgnet-" + operatorRelease
 
-// FirewallRule is the slice of a GCP firewall rule the isolation assertion reads,
-// decoded from `gcloud compute firewall-rules list --format=json` (GCP's REST
-// resource shape, hence the json tags).
+// FirewallRule is the GCP firewall-rule shape read by the isolation assertion.
+// JSON tags follow the `gcloud compute firewall-rules list --format=json` REST shape.
 type FirewallRule struct {
 	// Name starts with the gateway's NamePrefix, the basis the orphan check filters
 	// on.
 	Name    string            `json:"name"`
 	Allowed []FirewallAllowed `json:"allowed"`
-	// TargetServiceAccounts scopes the rule to a gateway's own VM, so two gateways
-	// in one shared VPC do not admit each other's ports. An empty list applies the
-	// rule VPC-wide.
+	// TargetServiceAccounts limits a rule to a gateway VM, preventing port admission across gateways.
+	// An empty list applies VPC-wide.
 	TargetServiceAccounts []string `json:"targetServiceAccounts"`
 }
 
@@ -33,9 +31,8 @@ type FirewallAllowed struct {
 	Ports []string `json:"ports"`
 }
 
-// SharedNetworkCount returns 1 if the VPC named SharedNetworkName exists, else 0. It
-// uses the strongly-consistent `networks describe`, not the eventually-consistent
-// list API that can enumerate a just-deleted network and false-fail a post-teardown drain.
+// SharedNetworkCount returns 1 if SharedNetworkName exists, else 0.
+// It avoids the eventually consistent list API after teardown.
 func (s *Suite) SharedNetworkCount(ctx context.Context) (int, error) {
 	auth := gcpAuth{projectID: s.env.ProjectID, credsFile: s.env.CredsFile}
 	out, err := runGcloud(ctx, auth,
@@ -52,9 +49,8 @@ func (s *Suite) SharedNetworkCount(ctx context.Context) (int, error) {
 	return 1, nil
 }
 
-// isNotFound reports whether a gcloud error signals the queried resource does not
-// exist. The match is case-insensitive and covers gcloud's "was not found" wording
-// and a bare "not found"/404.
+// isNotFound matches case-insensitive gcloud "not found" or 404 errors.
+// A nil error does not match.
 func isNotFound(err error) bool {
 	if err == nil {
 		return false
@@ -63,9 +59,8 @@ func isNotFound(err error) bool {
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "404")
 }
 
-// GatewayFirewallTargets returns the firewall rules whose names start with namePrefix,
-// with their allow list and service-account scoping, so a caller can assert
-// per-gateway firewall isolation in the shared VPC.
+// GatewayFirewallTargets returns rules with names starting with namePrefix.
+// Their allow lists and service-account scopes support shared-VPC isolation assertions.
 func (s *Suite) GatewayFirewallTargets(ctx context.Context, namePrefix string) ([]FirewallRule, error) {
 	auth := gcpAuth{projectID: s.env.ProjectID, credsFile: s.env.CredsFile}
 	out, err := runGcloud(ctx, auth,
@@ -84,9 +79,13 @@ func (s *Suite) GatewayFirewallTargets(ctx context.Context, namePrefix string) (
 	return rules, nil
 }
 
-// GatewayServiceAccountEmail returns the SA email the operator scopes the named
-// Gateway's firewall rule to. An empty result with a nil error means the composite
-// has not yet observed the SA, distinct from a missing composite, which errors.
+// GatewayServiceAccountEmail returns the service-account email scoped to the Gateway firewall rule.
+// An empty result without error means the composite has not observed the service account.
 func (s *Suite) GatewayServiceAccountEmail(ctx context.Context, namespace, name string) (string, error) {
 	return s.client.GetXGatewayGCPServiceAccountEmail(ctx, namespace, name)
+}
+
+// GatewaySharedNetworkName returns the VPC network the Gateway's composite declares.
+func (s *Suite) GatewaySharedNetworkName(ctx context.Context, namespace, name string) (string, error) {
+	return s.client.GetXGatewayGCPSharedNetworkName(ctx, namespace, name)
 }

@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-integration test-e2e build clean lint lint-fix mocks helm-lint setup-gcp setup-gcp-sa gcp-creds docker-build crossplane-models generate manifests envtest
+.PHONY: test test-unit test-integration test-e2e build clean lint lint-fix mocks helm-lint setup-gcp setup-gcp-sa gcp-creds docker-build crossplane-models provider-crds generate manifests envtest
 
 E2E_PARALLEL ?= 8
 
@@ -11,11 +11,27 @@ lint-fix:
 	$(MAKE) lint LINT_ARGS="--fix $(LINT_ARGS)"
 
 mocks:
-	docker run -v "$(CURDIR)":/src -w /src docker.io/vektra/mockery:3
+	docker run --user $$(id -u):$$(id -g) -e HOME=/tmp -v "$(CURDIR)":/src -w /src docker.io/vektra/mockery:3
 
 # Regenerate the typed XGatewayGCP spec/status views from the XRD's openAPIV3Schema.
 crossplane-models:
 	go run ./tools/xrdgen -xrd k8s/charts/wireguard-gateway-operator/crossplane/gcp/xgateway-xrd.yaml -out internal/crossplane/gcp
+
+provider-crds:
+	go run ./tools/providercrds -values k8s/infra/crossplane/crossplane-providers/values.yaml -out test/integration/crossplane/testdata/provider-crds \
+		addresses.compute.gcp.m.upbound.io \
+		firewalls.compute.gcp.m.upbound.io \
+		forwardingrules.compute.gcp.m.upbound.io \
+		instances.compute.gcp.m.upbound.io \
+		instancetemplates.compute.gcp.m.upbound.io \
+		networks.compute.gcp.m.upbound.io \
+		regionbackendservices.compute.gcp.m.upbound.io \
+		regionhealthchecks.compute.gcp.m.upbound.io \
+		regioninstancegroupmanagers.compute.gcp.m.upbound.io \
+		serviceaccounts.cloudplatform.gcp.m.upbound.io \
+		secrets.secretmanager.gcp.m.upbound.io \
+		secretiammembers.secretmanager.gcp.m.upbound.io \
+		secretversions.secretmanager.gcp.m.upbound.io
 
 # Generate DeepCopy methods for API types.
 generate:
@@ -53,10 +69,10 @@ test-unit:
 	go test -race -timeout=600s -coverprofile=coverage.out $$(go list ./... | grep -vE '/test/(integration|e2e)(/|$$)')
 
 test-integration:
-	GATEWAY_INTEGRATION=1 go test -timeout 10m -count=1 ./test/integration/...
+	KUBEBUILDER_ASSETS="$$(go tool setup-envtest use -p path $(ENVTEST_K8S_VERSION))" GATEWAY_INTEGRATION=1 go test -timeout 10m -count=1 ./test/integration/...
 
 test-e2e:
-	GATEWAY_E2E=1 go test -v -timeout 15m -parallel $(E2E_PARALLEL) -count=1 ./test/e2e/...
+	GATEWAY_E2E=1 go test -v -timeout 120m -parallel $(E2E_PARALLEL) -count=1 ./test/e2e/...
 
 build:
 	go build -o bin/gateway-link ./cmd/gateway-link

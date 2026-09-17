@@ -381,6 +381,11 @@ const (
 	TrafficPolicyLocal   = "Local"
 )
 
+// GatewayGCPLoadBalancer is the load-balanced Gateway configuration exposed to harness callers.
+type GatewayGCPLoadBalancer struct {
+	SessionAffinity string
+}
+
 // GatewaySpec is the subset of a Gateway CR's spec the suite sets when creating
 // the resource the operator reconciles.
 type GatewaySpec struct {
@@ -400,6 +405,12 @@ type GatewaySpec struct {
 	// Replicas sets spec.link.replicas. Zero omits the field so the CRD default (1)
 	// applies; a value >1 runs a hot standby behind leader election.
 	Replicas int32
+	// GCPReplicas sets spec.gcp.replicas. Zero omits the field so the CRD default applies.
+	GCPReplicas int32
+	// GCPZones sets spec.gcp.zones. Empty omits the field.
+	GCPZones []string
+	// GCPLoadBalancer sets spec.gcp.loadBalancer. Nil selects the single-Instance path.
+	GCPLoadBalancer *GatewayGCPLoadBalancer
 	// TrafficPolicy sets spec.trafficPolicy. Empty omits the field so the CRD default
 	// (Cluster) applies; "Local" runs the host-network DaemonSet data path.
 	TrafficPolicy string
@@ -433,6 +444,23 @@ func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec Gatewa
 	}
 	if spec.MachineType != "" {
 		gcp["machineType"] = spec.MachineType
+	}
+	if spec.GCPReplicas > 0 {
+		gcp["replicas"] = int64(spec.GCPReplicas)
+	}
+	if len(spec.GCPZones) > 0 {
+		zones := make([]any, 0, len(spec.GCPZones))
+		for _, zone := range spec.GCPZones {
+			zones = append(zones, zone)
+		}
+		gcp["zones"] = zones
+	}
+	if spec.GCPLoadBalancer != nil {
+		loadBalancer := map[string]any{}
+		if spec.GCPLoadBalancer.SessionAffinity != "" {
+			loadBalancer["sessionAffinity"] = spec.GCPLoadBalancer.SessionAffinity
+		}
+		gcp["loadBalancer"] = loadBalancer
 	}
 	gatewaySpec := map[string]any{
 		"gcp":      gcp,
@@ -476,6 +504,19 @@ func (c *Client) CreateGateway(ctx context.Context, ns, name string, spec Gatewa
 	return nil
 }
 
+// GatewayUID returns the immutable Kubernetes UID of the named Gateway.
+func (c *Client) GatewayUID(ctx context.Context, namespace, name string) (string, error) {
+	obj, err := c.dynamic.Resource(gatewayGVR).Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get gateway %s/%s: %w", namespace, name, err)
+	}
+	uid := string(obj.GetUID())
+	if uid == "" {
+		return "", fmt.Errorf("gateway %s/%s has empty uid", namespace, name)
+	}
+	return uid, nil
+}
+
 // GatewayStatus is the slice of Gateway status the data-path test gates on.
 type GatewayStatus struct {
 	// Address is status.address, mirrored by the operator from the XGatewayGCP's
@@ -490,6 +531,13 @@ type GatewayStatus struct {
 	// LinkID is status.link.id, the allocated per-Gateway link id every Local-mode
 	// node-global name derives from. Zero in Cluster mode and before allocation.
 	LinkID int
+	// GCPMembers is status.gcp.members. It is empty for the single-Instance path.
+	GCPMembers []GatewayGCPMember
+}
+
+// GatewayGCPMember holds a member name published in status.gcp.members.
+type GatewayGCPMember struct {
+	Name string
 }
 
 // GetGatewayStatus reads the named Gateway in ns and extracts the address and
@@ -502,11 +550,22 @@ func (c *Client) GetGatewayStatus(ctx context.Context, ns, name string) (Gateway
 	address, _, _ := unstructured.NestedString(obj.Object, "status", "address")
 	activeNode, _, _ := unstructured.NestedString(obj.Object, "status", "link", "activeNode")
 	linkID, _, _ := unstructured.NestedInt64(obj.Object, "status", "link", "id")
+	members, _, _ := unstructured.NestedSlice(obj.Object, "status", "gcp", "members")
+	gcpMembers := make([]GatewayGCPMember, 0, len(members))
+	for _, raw := range members {
+		member, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(member, "name")
+		gcpMembers = append(gcpMembers, GatewayGCPMember{Name: name})
+	}
 	return GatewayStatus{
 		Address:    address,
 		ActiveNode: activeNode,
 		Ready:      readyCondition(obj),
 		LinkID:     int(linkID),
+		GCPMembers: gcpMembers,
 	}, nil
 }
 
@@ -547,6 +606,16 @@ func (c *Client) WaitGatewayConditionMessage(ctx context.Context, ns, name, cond
 	return c.waitGatewayCondition(ctx, ns, name, condType, status, reason, messageSubstring, timeout)
 }
 
+// GetGatewayCondition returns the named Gateway condition's fields when it is present.
+func (c *Client) GetGatewayCondition(ctx context.Context, ns, name, condType string) (status, reason, message string, found bool, err error) {
+	obj, err := c.dynamic.Resource(gatewayGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", "", "", false, fmt.Errorf("get gateway %s/%s: %w", ns, name, err)
+	}
+	condition, found := currentGatewayCondition(obj, condType)
+	return condition.status, condition.reason, condition.message, found, nil
+}
+
 func (c *Client) waitGatewayCondition(ctx context.Context, ns, name, condType, status, reason, messageSubstring string, timeout time.Duration) error {
 	c.log.Info("waiting for gateway condition",
 		zap.String("namespace", ns), zap.String("name", name),
@@ -561,7 +630,7 @@ func (c *Client) waitGatewayCondition(ctx context.Context, ns, name, condType, s
 		if err != nil {
 			return false, fmt.Errorf("get gateway %s/%s: %w", ns, name, err)
 		}
-		last = readCondition(obj, condType)
+		last, _ = gatewayCondition(obj, condType)
 		return hasCondition(obj, condType, status, reason) && strings.Contains(last.message, messageSubstring), nil
 	})
 	if err != nil {
@@ -574,17 +643,18 @@ func (c *Client) waitGatewayCondition(ctx context.Context, ns, name, condType, s
 // conditionSnapshot is one status condition as last observed, so a wait that times out
 // can name what the Gateway actually reported.
 type conditionSnapshot struct {
-	status  string
-	reason  string
-	message string
+	status                  string
+	reason                  string
+	message                 string
+	observedGeneration      int64
+	observedGenerationFound bool
+	observedGenerationErr   error
 }
 
-// readCondition returns the named condition; a Gateway not carrying condType reads back
-// the zero snapshot.
-func readCondition(obj *unstructured.Unstructured, condType string) conditionSnapshot {
+func gatewayCondition(obj *unstructured.Unstructured, condType string) (conditionSnapshot, bool) {
 	conds, _, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil {
-		return conditionSnapshot{}
+		return conditionSnapshot{}, false
 	}
 	for _, raw := range conds {
 		cond, ok := raw.(map[string]any)
@@ -598,9 +668,23 @@ func readCondition(obj *unstructured.Unstructured, condType string) conditionSna
 		got.status, _, _ = unstructured.NestedString(cond, "status")
 		got.reason, _, _ = unstructured.NestedString(cond, "reason")
 		got.message, _, _ = unstructured.NestedString(cond, "message")
-		return got
+		got.observedGeneration, got.observedGenerationFound, got.observedGenerationErr =
+			unstructured.NestedInt64(cond, "observedGeneration")
+		return got, true
 	}
-	return conditionSnapshot{}
+	return conditionSnapshot{}, false
+}
+
+func currentGatewayCondition(obj *unstructured.Unstructured, condType string) (conditionSnapshot, bool) {
+	condition, found := gatewayCondition(obj, condType)
+	if !found || condition.observedGenerationErr != nil {
+		return conditionSnapshot{}, false
+	}
+	generation, _, _ := unstructured.NestedInt64(obj.Object, "metadata", "generation")
+	if condition.observedGenerationFound && condition.observedGeneration < generation {
+		return conditionSnapshot{}, false
+	}
+	return condition, true
 }
 
 // UpdateGateway applies a read-modify-write to the named Gateway's spec via mutate,
@@ -892,6 +976,67 @@ func (c *Client) GetXGatewayGCPServiceAccountEmail(ctx context.Context, ns, name
 	return email, nil
 }
 
+// GetXGatewayGCPSharedNetworkName reads spec.sharedNetworkName from the named
+// XGatewayGCP composite. An empty string with a nil error means it is not yet set.
+func (c *Client) GetXGatewayGCPSharedNetworkName(ctx context.Context, ns, name string) (string, error) {
+	return c.xgatewayGCPString(ctx, ns, name, "spec", "sharedNetworkName")
+}
+
+// GetXGatewayGCPTemplateRevision reads spec.templateRevision from the named XGatewayGCP
+// composite: the revision the composition appends to the composite's name to name the
+// instance template. Empty with a nil error until the operator writes it.
+func (c *Client) GetXGatewayGCPTemplateRevision(ctx context.Context, ns, name string) (string, error) {
+	return c.xgatewayGCPString(ctx, ns, name, "spec", "templateRevision")
+}
+
+// WaitXGatewayGCPMIGName polls until the composite publishes a non-empty status.migName.
+func (c *Client) WaitXGatewayGCPMIGName(ctx context.Context, ns, name string, timeout time.Duration) (string, error) {
+	return c.waitXGatewayGCPString(ctx, ns, name, timeout, published, "status", "migName")
+}
+
+// WaitXGatewayGCPTemplateRevisionChanges polls until spec.templateRevision is non-empty and
+// differs from previous, so a caller never names a template revision it guessed.
+func (c *Client) WaitXGatewayGCPTemplateRevisionChanges(ctx context.Context, ns, name, previous string,
+	timeout time.Duration) (string, error) {
+	changed := func(value string) bool { return published(value) && value != previous }
+	return c.waitXGatewayGCPString(ctx, ns, name, timeout, changed, "spec", "templateRevision")
+}
+
+// published is the settled predicate of a field a caller only reads once written.
+func published(value string) bool { return value != "" }
+
+func (c *Client) xgatewayGCPString(ctx context.Context, ns, name string, path ...string) (string, error) {
+	obj, err := c.dynamic.Resource(xgatewayGCPGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get xgatewaygcp %s/%s: %w", ns, name, err)
+	}
+	value, _, err := unstructured.NestedString(obj.Object, path...)
+	if err != nil {
+		return "", fmt.Errorf("read xgatewaygcp %s/%s %s: %w", ns, name, strings.Join(path, "."), err)
+	}
+	return value, nil
+}
+
+func (c *Client) waitXGatewayGCPString(ctx context.Context, ns, name string, timeout time.Duration,
+	settled func(value string) bool, path ...string) (string, error) {
+	var value string
+	err := c.poll(ctx, timeout, 5*time.Second, func(ctx context.Context) (bool, error) {
+		got, err := c.xgatewayGCPString(ctx, ns, name, path...)
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		value = got
+		return settled(value), nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("wait xgatewaygcp %s/%s %s: %w", ns, name, strings.Join(path, "."), err)
+	}
+	return value, nil
+}
+
 // readyCondition reports whether obj carries a status condition of type Ready
 // with status True.
 func readyCondition(obj *unstructured.Unstructured) bool {
@@ -901,32 +1046,8 @@ func readyCondition(obj *unstructured.Unstructured) bool {
 // hasCondition reports whether obj carries a status condition matching condType, status and (when
 // non-empty) reason, ignoring one whose observedGeneration is behind obj's generation.
 func hasCondition(obj *unstructured.Unstructured, condType, status, reason string) bool {
-	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
-	if err != nil || !found {
-		return false
-	}
-	generation, _, _ := unstructured.NestedInt64(obj.Object, "metadata", "generation")
-	for _, raw := range conds {
-		cond, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if cond["type"] != condType || cond["status"] != status {
-			continue
-		}
-		if reason != "" && cond["reason"] != reason {
-			continue
-		}
-		observed, found, err := unstructured.NestedInt64(cond, "observedGeneration")
-		if err != nil {
-			continue
-		}
-		if found && observed < generation {
-			continue
-		}
-		return true
-	}
-	return false
+	condition, found := currentGatewayCondition(obj, condType)
+	return found && condition.status == status && (reason == "" || condition.reason == reason)
 }
 
 // podReady reports whether pod carries a Ready condition of True.

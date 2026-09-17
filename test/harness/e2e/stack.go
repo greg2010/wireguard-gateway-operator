@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,8 @@ type Stack struct {
 	// GatewayName is the Gateway CR name; the operator names the XGatewayGCP
 	// composite after it.
 	GatewayName string
+	// GatewayUID identifies this Gateway's cloud records during teardown.
+	GatewayUID string
 	// Address is the gateway's observed public IP, the host-side probe target.
 	Address       string
 	TCPPublicPort int
@@ -80,8 +83,32 @@ type Stack struct {
 	// deletes them.
 	extraNamespaces []string
 
+	// addresses holds this stack's external-address permit until the Gateway is gone.
+	addresses     *addressSlots
+	addressWeight int64
+	releaseOnce   sync.Once
+
 	suite *Suite
 	log   *zap.Logger
+}
+
+// gatewayOutcome determines whether a stack returns its external-address permit.
+type gatewayOutcome int
+
+const (
+	// gatewayConfirmedGone: the Gateway object no longer exists, either because the
+	// drain confirmed its deletion or because it was never created.
+	gatewayConfirmedGone gatewayOutcome = iota
+	// gatewayStillLive: the Gateway is up and holding GCP quota, kept for debugging or
+	// left behind by a drain that did not confirm.
+	gatewayStillLive
+)
+
+func (s *Stack) releaseAddressPermitFor(outcome gatewayOutcome) {
+	if outcome != gatewayConfirmedGone {
+		return
+	}
+	s.releaseOnce.Do(func() { s.addresses.release(s.addressWeight) })
 }
 
 // LocalBackendRefs are the Local shard's three backends, the set every forward needs a
@@ -108,6 +135,9 @@ type startConfig struct {
 	// trafficPolicy overrides the data-path mode. Empty uses the CRD default
 	// (Cluster).
 	trafficPolicy string
+	gcpReplicas   int32
+	gcpZones      []string
+	loadBalancer  *hk8s.GatewayGCPLoadBalancer
 }
 
 // WithWireguardListenPort overrides the stack's WireGuard UDP listen port so coexisting
@@ -126,6 +156,23 @@ func WithLinkReplicas(n int32) StartOption {
 // "Local". Local preserves the client's source address end to end.
 func WithTrafficPolicy(policy string) StartOption {
 	return func(c *startConfig) { c.trafficPolicy = policy }
+}
+
+// WithGCPReplicas configures the regional MIG member count.
+func WithGCPReplicas(n int32) StartOption {
+	return func(c *startConfig) { c.gcpReplicas = n }
+}
+
+// WithGCPZones configures the regional MIG's zones.
+func WithGCPZones(zones []string) StartOption {
+	return func(c *startConfig) { c.gcpZones = append([]string(nil), zones...) }
+}
+
+// WithLoadBalancer selects the load-balanced Gateway path and configures affinity.
+func WithLoadBalancer(sessionAffinity string) StartOption {
+	return func(c *startConfig) {
+		c.loadBalancer = &hk8s.GatewayGCPLoadBalancer{SessionAffinity: sessionAffinity}
+	}
 }
 
 // Start wraps StartE for the common single-gateway shard, failing the test on error.
@@ -272,11 +319,27 @@ func (s *Suite) StartE(ctx context.Context, t *testing.T, opts ...StartOption) (
 		suite:                  s,
 		log:                    log,
 	}
+	addresses, err := liveAddresses()
+	if err != nil {
+		return nil, err
+	}
+	addressWeight := stackAddressWeight(cfg)
+	if err := addresses.acquire(ctx, addressWeight); err != nil {
+		return nil, err
+	}
+	stack.addresses = addresses
+	stack.addressWeight = addressWeight
 	s.registerTeardown(t, stack)
 
-	if err := s.client.CreateGateway(ctx, ns, stack.GatewayName, gatewaySpec(s.env, echo, nodePortEcho, crossNSEcho, wgPort, cfg.linkReplicas, cfg.trafficPolicy)); err != nil {
+	if err := s.client.CreateGateway(ctx, ns, stack.GatewayName, gatewaySpec(s.env, echo, nodePortEcho, crossNSEcho, wgPort, cfg.linkReplicas, cfg.trafficPolicy, cfg.gcpReplicas, cfg.gcpZones, cfg.loadBalancer)); err != nil {
+		stack.releaseAddressPermitFor(gatewayConfirmedGone)
 		return nil, fmt.Errorf("create gateway: %w", err)
 	}
+	gatewayUID, err := s.client.GatewayUID(ctx, ns, stack.GatewayName)
+	if err != nil {
+		return nil, fmt.Errorf("read gateway uid: %w", err)
+	}
+	stack.GatewayUID = gatewayUID
 
 	status, err := s.client.WaitGatewayReady(ctx, ns, stack.GatewayName, gatewayReadyTimeout)
 	if err != nil {
@@ -318,7 +381,7 @@ const (
 
 // gatewaySpec builds the Gateway CR spec. Local mode drops the NodePort forward, whose acceptance
 // path the policy does not change, and keeps the forwards whose backends sit on one worker.
-func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBackend, wgPort int, linkReplicas int32, trafficPolicy string) hk8s.GatewaySpec {
+func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBackend, wgPort int, linkReplicas int32, trafficPolicy string, gcpReplicas int32, gcpZones []string, loadBalancer *hk8s.GatewayGCPLoadBalancer) hk8s.GatewaySpec {
 	spec := hk8s.GatewaySpec{
 		ProjectID:   env.ProjectID,
 		Region:      env.Region,
@@ -366,11 +429,33 @@ func gatewaySpec(env Env, echo hk8s.EchoFixtures, nodePort, crossNS hk8s.EchoBac
 	if linkReplicas > 0 {
 		spec.Replicas = linkReplicas
 	}
+	if gcpReplicas > 0 {
+		spec.GCPReplicas = gcpReplicas
+	}
+	if len(gcpZones) > 0 {
+		spec.GCPZones = append([]string(nil), gcpZones...)
+	}
+	if loadBalancer != nil {
+		spec.GCPLoadBalancer = &hk8s.GatewayGCPLoadBalancer{
+			SessionAffinity: loadBalancer.SessionAffinity,
+		}
+	}
 	return spec
 }
 
-// effectiveLinkReplicas mirrors the operator's unexported default of 1, so teardown can
-// tell whether the link PDB exists.
+const defaultGCPReplicas = 1 // GatewayGCPSpec.Replicas CRD default.
+
+func stackAddressWeight(cfg startConfig) int64 {
+	if cfg.loadBalancer == nil {
+		return 1
+	}
+	replicas := cfg.gcpReplicas
+	if replicas == 0 {
+		replicas = defaultGCPReplicas
+	}
+	return int64(replicas) + 1
+}
+
 func effectiveLinkReplicas(configured int32) int32 {
 	if configured == 0 {
 		return 1
@@ -393,9 +478,10 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 	t.Cleanup(func() {
 		if t.Failed() && os.Getenv("GATEWAY_E2E_PRESERVE") != "" {
 			s.log.Warn("test failed; preserving per-test resources", zap.String("ns", stack.Namespace))
+			stack.releaseAddressPermitFor(gatewayStillLive)
 			return
 		}
-		// Bounded under the whole-binary `go test -timeout 15m` so a slow drain is not
+		// Bounded under the whole-binary `go test -timeout 25m` so a slow drain is not
 		// SIGKILLed mid-flight and left leaking the VM.
 		cctx, cancel := context.WithTimeout(context.Background(), orphanDrainTimeout+3*time.Minute)
 		defer cancel()
@@ -424,6 +510,7 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 				zap.String("drain_hint", fmt.Sprintf(
 					"kubectl delete gateway %s -n %s  # then re-run to drain GCP",
 					stack.GatewayName, stack.Namespace)))
+			stack.releaseAddressPermitFor(gatewayStillLive)
 			return
 		}
 
@@ -435,7 +522,10 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 		// The Gateway disappearing signals the drain reached the cloud; the orphan check
 		// below is the authoritative zero.
 		if err := s.client.WaitGatewayGone(cctx, stack.Namespace, stack.GatewayName, orphanDrainTimeout); err != nil {
-			s.log.Error("wait gateway gone", zap.Error(err))
+			t.Errorf("wait for gateway %s/%s deletion within %s: %v", stack.Namespace, stack.GatewayName, orphanDrainTimeout, err)
+			stack.releaseAddressPermitFor(gatewayStillLive)
+		} else {
+			stack.releaseAddressPermitFor(gatewayConfirmedGone)
 		}
 		// A fast confirmation, not a second drain wait.
 		if err := s.client.WaitXGatewayGCPGone(cctx, stack.Namespace, stack.GatewayName, orphanDrainTimeout); err != nil {
@@ -445,7 +535,7 @@ func (s *Suite) registerTeardown(t *testing.T, stack *Stack) {
 		// ProviderConfigUsage each MR needs to release its resource.
 		s.log.Info("asserting no orphaned GCP resources after gateway deletion",
 			zap.String("prefix", stack.NamePrefix))
-		if err := assertNoOrphans(cctx, auth, stack.Namespace, stack.GatewayName, stack.NamePrefix, orphanDrainTimeout, s.log); err != nil {
+		if err := assertNoOrphans(cctx, auth, stack.Namespace, stack.GatewayName, stack.GatewayUID, stack.NamePrefix, orphanDrainTimeout, s.log); err != nil {
 			t.Errorf("orphaned GCP resources after teardown: %v", err)
 		}
 		// Checked while the namespace is alive: the delete below would mask a child left
