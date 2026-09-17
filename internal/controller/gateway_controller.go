@@ -102,6 +102,10 @@ const linkIDAnnotation = "wgnet.dev/link-id"
 // kept separate from RequeueInterval (zero in tests) so it cannot spin a hot loop.
 const validationRequeueAfter = 10 * time.Second
 
+// Poll before steady state so the Lease tunnel annotation is observed soon after PodReady.
+// The controller does not watch Leases.
+const tunnelReadyPollInterval = 3 * time.Second
+
 // KeyGenerator produces a WireGuard keypair. It is injected so tests can supply
 // deterministic key material; production binds it to wg.GenerateKeypair.
 type KeyGenerator func() (privateKey, publicKey string, err error)
@@ -371,6 +375,11 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	reconcileResult := ctrl.Result{RequeueAfter: r.steadyRequeue(loadBalanced)}
 	if anyTransientReason(invalid) {
 		reconcileResult.RequeueAfter = validationRequeueAfter
+	}
+	// Poll before steady state so the Lease tunnel annotation is observed soon after PodReady.
+	// The controller does not watch Leases.
+	if ls.PodReady && !ls.Active {
+		reconcileResult.RequeueAfter = tunnelReadyPollInterval
 	}
 
 	logger.V(1).Info("reconciled gateway",
@@ -1519,9 +1528,12 @@ func (r *GatewayReconciler) readXGatewayGCPStatus(ctx context.Context, gw *wgnet
 // linkStatus is what the operator observes about a Gateway's link from the Lease and
 // the pod holding it.
 type linkStatus struct {
-	// Active is true when a Lease holder pod exists and reports PodReady. Idle standbys
-	// report Ready too, so this gates on the holder, not workload availability.
+	// Active requires both holder PodReady and its tunnel-ready annotation; idle standbys
+	// are PodReady too, so readiness must use the Lease holder rather than availability.
 	Active bool
+	// PodReady is checked before the tunnel annotation; this window needs a faster requeue.
+	// The holder's first Lease write reports the tunnel after the probe latches ready.
+	PodReady bool
 	// Node is the holder pod's node name, empty when there is no readable holder.
 	Node string
 	// FaultReason and FaultMessage carry the holder's link-fault annotations.
@@ -1594,10 +1606,11 @@ func (r *GatewayReconciler) linkStatusOf(ctx context.Context, gw *wgnetv1alpha1.
 	ls.Node = holder.Spec.NodeName
 	for _, cond := range holder.Status.Conditions {
 		if cond.Type == corev1.PodReady {
-			ls.Active = cond.Status == corev1.ConditionTrue
+			ls.PodReady = cond.Status == corev1.ConditionTrue
 			break
 		}
 	}
+	ls.Active = ls.PodReady && lease.Annotations[link.LeaseTunnelReadyAnnotation] == "true"
 	return ls, nil
 }
 

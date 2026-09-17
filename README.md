@@ -485,7 +485,7 @@ EndpointSlice reads the link needs to find backend pods on its node. Kubernetes
 escalation prevention limits what it may grant to permissions it holds itself; the
 chart satisfies that with a `bind` grant on that one ClusterRole by name.
 
-A Gateway is `Ready=True` once its address is provisioned and the link pod that holds the Lease reports an established WireGuard tunnel. The pod's readiness probe succeeds only after a fresh handshake with a peer (in `Local` mode, on any one of its applied slots). Until then the condition is `Ready=False`; this table is in precedence order.
+A Gateway is `Ready=True` once its address is provisioned and the link pod that holds the Lease reports an established WireGuard tunnel. The pod's readiness probe succeeds only after a fresh handshake with a peer (in `Local` mode, on any one of its applied slots). The holder publishes the same tunnel state onto its Lease, in the `wgnet.dev/tunnel-ready` annotation, in the same write that renews `holderIdentity`; the operator requires both the holder pod's readiness and that annotation before it sets `Ready=True`, so a probe that latches ready before the holder has acquired the Lease cannot make the Gateway Ready on its own. Until then the condition is `Ready=False`; this table is in precedence order.
 
 | Reason | Policy | Meaning |
 | --- | --- | --- |

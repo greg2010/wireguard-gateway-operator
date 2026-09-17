@@ -675,6 +675,13 @@ func TestReadyKubeletContract(t *testing.T) {
 			if body != tc.wantBody {
 				t.Errorf("kubeletStatus body = %q, want %q", body, tc.wantBody)
 			}
+			// For leaders without gating faults, tunnelStatus must exactly match kubeletStatus because
+			// gatingFault is the only check kubeletStatus performs that tunnelStatus does not.
+			if tc.leader && tc.nodeFault == "" && tc.fault == "" {
+				if tsReady, tsBody := rd.tunnelStatus(context.Background()); tsReady != tc.want || tsBody != tc.wantBody {
+					t.Errorf("tunnelStatus = (%v, %q), want (%v, %q)", tsReady, tsBody, tc.want, tc.wantBody)
+				}
+			}
 		})
 	}
 }

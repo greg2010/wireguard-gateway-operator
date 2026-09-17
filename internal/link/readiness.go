@@ -141,6 +141,12 @@ func (r *readiness) kubeletStatus(ctx context.Context) (bool, string) {
 	if !r.isLeader() {
 		return true, ""
 	}
+	return r.tunnelStatus(ctx)
+}
+
+// tunnelStatus reports leader tunnel state for the Lease lock, independent of gating faults.
+// It mirrors kubeletStatus's leader path so operator readiness matches the probe.
+func (r *readiness) tunnelStatus(ctx context.Context) (bool, string) {
 	if !r.applied.Load() {
 		return false, bodyNoHandshake
 	}

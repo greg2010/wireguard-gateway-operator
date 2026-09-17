@@ -1175,15 +1175,19 @@ func setXGatewayGCPStatus(ctx context.Context, t *testing.T, cl client.Client, k
 	}
 }
 
-// setLinkLeaseActive points the link Lease holder at podName and sets that pod's PodReady
-// condition, which envtest's missing scheduler and kubelet leave unset.
+// Envtest lacks scheduler/kubelet updates, so this sets PodReady and simulates the holder's
+// tunnel-ready Lease annotation when ready.
 func setLinkLeaseActive(ctx context.Context, t *testing.T, cl client.Client, gwKey client.ObjectKey, podName string, ready bool, nodeName string) {
 	t.Helper()
 	leaseName := linkComponentName(&wgnetv1alpha1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{Name: gwKey.Name, Namespace: gwKey.Namespace},
 	})
 
-	upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: leaseName}, podName, nil)
+	var annotations map[string]string
+	if ready {
+		annotations = map[string]string{link.LeaseTunnelReadyAnnotation: "true"}
+	}
+	upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: leaseName}, podName, annotations)
 	upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: gwKey.Namespace, Name: podName}, ready, nodeName)
 }
 
@@ -1197,13 +1201,15 @@ func setLinkLeaseFault(ctx context.Context, t *testing.T, cl client.Client, gwKe
 	if err := cl.Get(ctx, leaseKey, &lease); err != nil {
 		t.Fatalf("get link lease %s: %v", leaseKey, err)
 	}
+	if lease.Annotations == nil {
+		lease.Annotations = map[string]string{}
+	}
 	if reason == "" {
-		lease.Annotations = nil
+		delete(lease.Annotations, link.LeaseFaultAnnotation)
+		delete(lease.Annotations, link.LeaseFaultMessageAnnotation)
 	} else {
-		lease.Annotations = map[string]string{
-			link.LeaseFaultAnnotation:        reason,
-			link.LeaseFaultMessageAnnotation: message,
-		}
+		lease.Annotations[link.LeaseFaultAnnotation] = reason
+		lease.Annotations[link.LeaseFaultMessageAnnotation] = message
 	}
 	if err := cl.Update(ctx, &lease); err != nil {
 		t.Fatalf("update link lease %s annotations: %v", leaseKey, err)
@@ -1470,10 +1476,13 @@ func TestLinkActiveReadyGate(t *testing.T) {
 
 	tests := []struct {
 		name string
-		// arrange sets up the lease/holder-pod state after the Gateway has provisioned and
-		// been given an address. holderName is the name the row may use for the holder pod.
+		// arrange sets state after provisioning and address assignment; holderName may identify the
+		// row's Lease holder pod.
 		arrange   func(t *testing.T, ns, holderName string)
 		wantReady metav1.ConditionStatus
+		// wantRequeueAfter is the requeue the row's reconcile pass must return; zero when the
+		// holder pod is left not Ready, since reconcileConfig sets a zero steady-state poll.
+		wantRequeueAfter time.Duration
 	}{
 		{
 			name: "holder pod ready, tunnel up",
@@ -1509,6 +1518,36 @@ func TestLinkActiveReadyGate(t *testing.T) {
 			},
 			wantReady: metav1.ConditionFalse,
 		},
+		{
+			name: "holder pod ready, tunnel annotation absent",
+			arrange: func(t *testing.T, ns, holderName string) {
+				// The kubelet probe latched PodReady before the holder's first Lease write:
+				// the Gateway must stay Ready=False and poll again inside the requeue floor.
+				upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, holderName, nil)
+				upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: holderName}, true, "node-a")
+			},
+			wantReady:        metav1.ConditionFalse,
+			wantRequeueAfter: tunnelReadyPollInterval,
+		},
+		{
+			name: "holder pod ready, tunnel annotation false",
+			arrange: func(t *testing.T, ns, holderName string) {
+				upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, holderName,
+					map[string]string{link.LeaseTunnelReadyAnnotation: "false"})
+				upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: holderName}, true, "node-a")
+			},
+			wantReady:        metav1.ConditionFalse,
+			wantRequeueAfter: tunnelReadyPollInterval,
+		},
+		{
+			name: "tunnel annotation true but holder pod not ready",
+			arrange: func(t *testing.T, ns, holderName string) {
+				upsertLeaseHolder(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, holderName,
+					map[string]string{link.LeaseTunnelReadyAnnotation: "true"})
+				upsertPodReady(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: holderName}, false, "node-a")
+			},
+			wantReady: metav1.ConditionFalse,
+		},
 	}
 
 	for i, tt := range tests {
@@ -1535,8 +1574,12 @@ func TestLinkActiveReadyGate(t *testing.T) {
 
 			// Every tunnel-gate case is a non-error outcome, so a failure here means
 			// linkStatusOf surfaced a NotFound as an error.
-			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+			if err != nil {
 				t.Fatalf("reconcile after arranging tunnel state: %v", err)
+			}
+			if res.RequeueAfter != tt.wantRequeueAfter {
+				t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, tt.wantRequeueAfter)
 			}
 
 			var got wgnetv1alpha1.Gateway

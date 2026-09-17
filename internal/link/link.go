@@ -22,7 +22,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 const shutdownTimeout = 5 * time.Second
@@ -67,18 +66,6 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	if err != nil {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
-	lock, err := resourcelock.New(
-		resourcelock.LeasesResourceLock,
-		cfg.PodNamespace,
-		cfg.LeaseName,
-		cs.CoreV1(),
-		cs.CoordinationV1(),
-		resourcelock.ResourceLockConfig{Identity: cfg.PodName},
-	)
-	if err != nil {
-		return fmt.Errorf("create lease lock: %w", err)
-	}
-
 	// Discovery holds every inherited Gateway slot so departed slots are torn down.
 	var inherited bool
 	if rc.isLocal() {
@@ -94,6 +81,12 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 		}
 	}
 	rd := newReadiness(rc.isLocal(), gatewayIDOf(rc), time.Now, wgShowHandshakes, log)
+	lock := newTunnelLeaseLock(cfg.PodNamespace, cfg.LeaseName, cs.CoordinationV1(), cfg.PodName, func(ctx context.Context) (bool, string) {
+		if !rd.isLeader() {
+			return false, "not leader"
+		}
+		return rd.tunnelStatus(ctx)
+	})
 
 	var preCheck preCheckFault
 	if rc.isLocal() {
