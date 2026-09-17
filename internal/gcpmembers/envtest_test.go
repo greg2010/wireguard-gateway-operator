@@ -256,20 +256,20 @@ func TestNameReuseResumesLiveRecord(t *testing.T) {
 	absent := &gcpdiscovery.Snapshot{}
 	present := &gcpdiscovery.Snapshot{Members: []gcpdiscovery.ListedMember{presentMember("vm-a", "1")}}
 
+	// Wait out the cache between passes: Reconcile's own label update reads through the
+	// cache, and a stale read here races its own prior write, not just the test's.
 	for i := range 3 {
 		if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 			t.Fatalf("Reconcile(...) pass %d returned unexpected error: %v", i, err)
 		}
+		waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == i+1 })
 	}
 
 	// Reappears before the removal pass's confirmation ever ran: resumes the same key.
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, present, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) returned unexpected error: %v", err)
 	}
-	resumed, found, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil || !found {
-		t.Fatalf("GetRecord(...) found=%v, err=%v; want the record still present", found, err)
-	}
+	resumed := waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return !r.PendingConfirmation })
 	if resumed.PrivateKey != priv || resumed.PublicKey != pub || resumed.Slot != 0 || resumed.PendingConfirmation {
 		t.Fatalf("GetRecord(...) = %+v, want the original key/slot resumed and PendingConfirmation false", resumed)
 	}
@@ -279,20 +279,21 @@ func TestNameReuseResumesLiveRecord(t *testing.T) {
 		if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 			t.Fatalf("Reconcile(...) pass %d returned unexpected error: %v", i, err)
 		}
+		waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == i+1 })
 	}
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) returned unexpected error: %v", err)
 	}
 	waitForRecordGone(ctx, t, deps, ns, gatewayName, "vm-a")
 
-	// Reappears after the record is truly gone: a fresh allocation, a new key.
+	// Reappears after the record is truly gone: a fresh allocation, a new key. DepartureCount
+	// 0 rules out a cache entry still trailing the delete.
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, present, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) returned unexpected error: %v", err)
 	}
-	fresh, found, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil || !found {
-		t.Fatalf("GetRecord(...) found=%v, err=%v; want a freshly allocated record", found, err)
-	}
+	fresh := waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool {
+		return r.DepartureCount == 0 && !r.PendingConfirmation
+	})
 	if fresh.PrivateKey == priv || fresh.PublicKey == pub {
 		t.Fatalf("GetRecord(...) = %+v, want a new key distinct from the original one", fresh)
 	}
@@ -398,10 +399,7 @@ func TestRecordDeletionPreconditions(t *testing.T) {
 	if err := deps.CreateRecord(ctx, ns, gatewayName, rec); err != nil {
 		t.Fatalf("CreateRecord(...) returned unexpected error: %v", err)
 	}
-	got, _, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil {
-		t.Fatalf("GetRecord(...) returned unexpected error: %v", err)
-	}
+	got := waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(Record) bool { return true })
 
 	if err := deps.DeleteRecord(ctx, ns, gatewayName, "vm-a", got.UID, "stale-resource-version"); err == nil {
 		t.Fatalf("DeleteRecord(...) with a stale resourceVersion precondition = nil error, want an error")
@@ -420,10 +418,7 @@ func TestRecordDeletionPreconditions(t *testing.T) {
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, names, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) returned unexpected error: %v", err)
 	}
-	next, found, err := deps.GetRecord(ctx, ns, gatewayName, "vm-b")
-	if err != nil || !found {
-		t.Fatalf("GetRecord(...) found=%v, err=%v; want a fresh record for vm-b", found, err)
-	}
+	next := waitForRecord(ctx, t, deps, ns, gatewayName, "vm-b", func(r Record) bool { return r.Slot == 0 })
 	if next.Slot != 0 || next.PrivateKey == priv {
 		t.Fatalf("GetRecord(...) = %+v, want Slot 0 with a key distinct from the original one", next)
 	}
@@ -449,10 +444,13 @@ func TestCollapsedConfirmationGating(t *testing.T) {
 		if err := deps.CreateRecord(ctx, ns, gatewayName, rec); err != nil {
 			t.Fatalf("CreateRecord(...) returned unexpected error: %v", err)
 		}
+		// Wait out the cache between passes: Reconcile's own label update reads through the
+		// cache, and a stale read here races its own prior write, not just the test's.
 		for i := range 3 {
 			if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 				t.Fatalf("Reconcile(...) pass %d returned unexpected error: %v", i, err)
 			}
+			waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == i+1 })
 		}
 		return deps, te, ns
 	}
@@ -529,33 +527,28 @@ func TestDebounceAcrossUsableAndUnusablePasses(t *testing.T) {
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) (absent) returned unexpected error: %v", err)
 	}
-	got, _, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil {
-		t.Fatalf("GetRecord(...) returned unexpected error: %v", err)
-	}
+	got := waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == 1 })
 	if got.DepartureCount != 1 {
 		t.Fatalf("GetRecord(...).DepartureCount = %d, want 1 after one absent pass", got.DepartureCount)
 	}
 
-	// An unusable pass in between neither advances nor resets the count.
+	// An unusable pass in between neither advances nor resets the count, and issues no
+	// write, so the wait above already establishes the state this read observes.
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, nil, 1, 1, nil, testGatewayAddress, 1, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) (unusable) returned unexpected error: %v", err)
 	}
-	got, _, err = deps.GetRecord(ctx, ns, gatewayName, "vm-a")
+	stillOne, _, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
 	if err != nil {
 		t.Fatalf("GetRecord(...) returned unexpected error: %v", err)
 	}
-	if got.DepartureCount != 1 {
-		t.Fatalf("GetRecord(...).DepartureCount = %d, want still 1 after an unusable pass", got.DepartureCount)
+	if stillOne.DepartureCount != 1 {
+		t.Fatalf("GetRecord(...).DepartureCount = %d, want still 1 after an unusable pass", stillOne.DepartureCount)
 	}
 
 	if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 		t.Fatalf("Reconcile(...) (absent) returned unexpected error: %v", err)
 	}
-	got, _, err = deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil {
-		t.Fatalf("GetRecord(...) returned unexpected error: %v", err)
-	}
+	got = waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == 2 })
 	if got.DepartureCount != 2 {
 		t.Fatalf("GetRecord(...).DepartureCount = %d, want 2 after a second absent pass", got.DepartureCount)
 	}
