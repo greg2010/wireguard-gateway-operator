@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# setup-gcp-sa.sh — create the provider-gcp service account and grant it the
-# roles the gateway's Crossplane compositions need.
-#
-# Reads config from $REPO_ROOT/.env (see .env.example). Idempotent: re-running
-# is safe. Run scripts/setup-gcp-project.sh first (the project and APIs must
-# exist); obtain credentials afterwards with scripts/get-gcp-creds.sh.
+# Reads config from $REPO_ROOT/.env; re-running is safe.
+# Run setup-gcp-project first, then get-gcp-creds after this script.
+# Creates the provider-gcp service account and grants the roles gateway
+# compositions need.
 
 set -euo pipefail
 
@@ -52,6 +50,7 @@ for role in \
   roles/compute.securityAdmin \
   roles/iam.serviceAccountAdmin \
   roles/iam.serviceAccountUser \
+  roles/logging.viewer \
   roles/secretmanager.admin; do
   echo "    ${role}"
   gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \

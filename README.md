@@ -251,6 +251,14 @@ default `default`): the gateway composition's GCP managed resources reference it
 as `providerConfigRef.name`. It and the provider CRDs must exist before any
 `Gateway` provisions.
 
+The operator reads the same `crossplane-system/gcp-creds` Secret directly for
+read-only membership discovery on load-balanced Gateways; no second Secret or
+additional RBAC is required. The existing ClusterRole already grants `get` on
+secrets cluster-wide. The operator's credential reading is configured via Helm
+`gcp.credentialsSecret` (namespace, name, key) and mapped to env vars
+`GATEWAY_GCP_CREDENTIALS_SECRET` and `GATEWAY_GCP_CREDENTIALS_KEY`, but the
+defaults match the standard provider setup.
+
 **4. The operator.**
 
 ```sh
@@ -280,7 +288,8 @@ and delete the old key.
    iam, cloudresourcemanager.
 2. Create a service account and grant it the roles the composition needs
    (`compute.instanceAdmin.v1`, `compute.networkAdmin`, `compute.securityAdmin`,
-   `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `secretmanager.admin`).
+   `iam.serviceAccountAdmin`, `iam.serviceAccountUser`, `logging.viewer`,
+   `secretmanager.admin`).
 3. Create a JSON key for that service account.
 4. Load the key into the cluster as the Secret above, using your cluster's
    declarative secret mechanism (External Secrets Operator, Sealed Secrets,
@@ -397,6 +406,51 @@ For `type: External`, the address must already exist in `spec.gcp.projectID` /
 address on its next reconcile. Set `address.type: Ephemeral` explicitly to keep
 the old behaviour.
 
+## Load balancing
+
+A Gateway can be deployed as a single instance (the default) or as a regional
+managed instance group (MIG) behind a passthrough network load balancer. The
+single-instance path carries no configuration: set `spec.gcp.replicas: 1` (or omit
+it) and no `spec.gcp.loadBalancer` field. On a single-instance Gateway,
+`diskSizeGB` is set at creation and immutable; a load-balanced Gateway rolls a
+disk-size change out as a template revision.
+
+To opt into load balancing, set `spec.gcp.loadBalancer` (at creation; it is
+immutable). The MIG spreads across zones specified in `spec.gcp.zones`; if omitted,
+a single zone is implied:
+
+```yaml
+spec:
+  gcp:
+    replicas: 2
+    zones:
+      - us-west1-a
+      - us-west1-b
+    loadBalancer:
+      sessionAffinity: NONE  # or: CLIENT_IP, CLIENT_IP_PROTO, CLIENT_IP_PORT_PROTO
+```
+
+The effective zone set (computed from `zones` if present, otherwise the single
+`zone`) is immutable: once created, the MIG cannot gain or lose zones, though
+`replicas` can scale within them. `replicas` is capped by the tunnel address capacity. A `/29` has five member slots: slot 0 takes `gatewayAddress`, and only the link address is excluded.
+
+The load balancer distributes traffic across live instances; `status.gcp.members`
+tracks each member's observed state:
+
+```yaml
+status:
+  gcp:
+    members:
+    - name: wgnet-gw-ab12cd-a      # instance name
+      zone: us-west1-a
+      slot: 0                       # member slot in the MIG
+      tunnelAddress: 10.99.0.3/29   # this member's tunnel address
+      externalAddress: 203.0.113.1  # its public IP
+      instanceID: "1234567890"      # GCP-assigned instance id
+      revision: "1"                 # template revision the member runs: the last path segment of the instance template named by the MIG version
+      state: Active                 # Pending, Active, Recreating, Departing, or Departed
+```
+
 ## Traffic policy
 
 `spec.trafficPolicy` selects the data path. It is immutable, because the gateway
@@ -431,13 +485,24 @@ EndpointSlice reads the link needs to find backend pods on its node. Kubernetes
 escalation prevention limits what it may grant to permissions it holds itself; the
 chart satisfies that with a `bind` grant on that one ClusterRole by name.
 
-`Ready=False` reasons the link itself publishes, and the policies each applies to:
+A Gateway is `Ready=True` once its address is provisioned and the link pod that holds the Lease reports an established WireGuard tunnel. The pod's readiness probe succeeds only after a fresh handshake with a peer (in `Local` mode, on any one of its applied slots). Until then the condition is `Ready=False`; this table is in precedence order.
 
 | Reason | Policy | Meaning |
 | --- | --- | --- |
+| `InvalidTunnelAddresses` | both | the subnet, gateway address, or link address is invalid, or the addresses are not distinct usable hosts in the subnet |
+| `TargetNamespaceNotFound` | both | the forward's target namespace does not exist |
+| `CrossNamespaceForwardDenied` | both | the target namespace does not allow cross-namespace forwards |
+| `ServiceNotFound` | both | the forward's backend Service does not exist |
+| `UnsupportedServiceType` | both | the backend Service is `ExternalName`, or is headless with `Cluster` policy; a forward accepts a ClusterIP Service or a headless Service with `Local` policy |
+| `TargetPortNotListening` | both | the backend Service does not publish the forward's protocol and port |
+| `ReservedHealthPort` | `Local` | a TCP forward uses the gateway's health port |
 | `NoLocalEndpoint` | `Local` | some forward has no ready backend pod on the active node; the message names each one |
 | `RPFilterStrict` | `Local` | the active node's `net.ipv4.conf.all.rp_filter` is neither 0 nor 2 |
 | `ApplyFailed` | both | the link could not program the data plane: a command failed or the health server would not bind. In `Local` mode it also covers a node whose `net.ipv4.ip_forward` is 0 or whose pre-check sysctls are unreadable |
+| `InsufficientTunnelAddresses` | load-balanced | the requested replicas exceed the tunnel-address capacity |
+| `MemberDiscoveryFailed` | load-balanced | member discovery cannot obtain a usable snapshot |
+| `MembersNotReady` | load-balanced | no fleet member observed yet, or members exist but the Lease-holder link pod is not Ready |
+| `Provisioning` | both | waiting for the address and an active tunnel; the cloud composite's status message follows when there is one |
 
 The `Local` node checks (`rp_filter`, `ip_forward`, sysctl readability) run once at link
 start, so after fixing a node restart its link pod for the fault to clear: delete the
@@ -537,9 +602,9 @@ firewall rule, leaving no login path at all.
 ## Development
 
 Run `make test` for the full suite (unit, integration, e2e) or the per-suite
-targets `make test-unit` / `make test-integration` / `make test-e2e`. The e2e
+targets `make test-unit` / `make test-integration` / `make test-e2e`. Composition integration tests dry-run server-side apply for every rendered composed resource against vendored provider CRDs; `make provider-crds` refreshes them from the packages pinned in `k8s/infra/crossplane/crossplane-providers/values.yaml`, and `make test-integration` fetches the envtest binaries it needs. The e2e
 suite self-provisions a kind cluster, the full Crossplane stack, and a real GCP
-gateway, so it requires the GCP configuration above. Local development needs
+gateway, so it requires the GCP configuration above. `E2E_MAX_ADDRESSES` defaults to 8; a fleet counts its members plus one, and a single-instance Gateway counts one. It must not exceed the region external address quota. Local development needs
 [Go](https://go.dev/doc/install), [kind](https://kind.sigs.k8s.io/docs/user/quick-start/),
 and a container runtime — [Docker](https://docs.docker.com/engine/install/) or
 [Podman](https://podman.io/docs/installation).
