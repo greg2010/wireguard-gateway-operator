@@ -264,7 +264,7 @@ defaults match the standard provider setup.
 ```sh
 helm install wireguard-gateway-operator \
   oci://ghcr.io/greg2010/wireguard-gateway-operator/charts/wireguard-gateway-operator \
-  --version 0.1.0 \
+  --version 0.8.0 \
   -n wireguard-gateway-operator --create-namespace
 ```
 
