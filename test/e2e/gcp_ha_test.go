@@ -165,7 +165,7 @@ const (
 	rolloutRecoveryTimeout = 20 * time.Minute
 	replacementTimeout     = migInitialDelay
 	// A RECREATE rollout with maxUnavailable 1 replaces the two members one after the other.
-	rolloutTimeout = 2 * migInitialDelay
+	rolloutTimeout = 3 * migInitialDelay
 )
 
 // gcpHAZones is how many zones the GCP HA test MIG spans, which the composition uses as
