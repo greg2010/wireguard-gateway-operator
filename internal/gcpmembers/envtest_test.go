@@ -31,6 +31,25 @@ func waitForRecordGone(ctx context.Context, t *testing.T, deps Deps, ns, gateway
 	t.Fatalf("timed out waiting for record %q to be observed gone", name)
 }
 
+// waitForRecord polls the cached GetRecord until ready is true: a write reaches the API server
+// before the informer cache, so a pass could otherwise read the state before its own update.
+func waitForRecord(ctx context.Context, t *testing.T, deps Deps, ns, gatewayName, name string, ready func(Record) bool) Record {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	var last Record
+	for time.Now().Before(deadline) {
+		if rec, found, err := deps.GetRecord(ctx, ns, gatewayName, name); err == nil && found {
+			last = *rec
+			if ready(last) {
+				return last
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for record %q to reach the expected state; last observed %+v", name, last)
+	return Record{}
+}
+
 func createNamespace(ctx context.Context, t *testing.T, te *testEnv) string {
 	t.Helper()
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "gcpmembers-test-"}}
@@ -181,19 +200,19 @@ func TestDepartureHoldsSlot(t *testing.T) {
 		t.Fatalf("CreateRecord(...) returned unexpected error: %v", err)
 	}
 
+	// Wait out the cache between passes: a tight loop can read the prior pass's state and
+	// under-count the debounce on a slow runner. Production passes are requeue-spaced.
 	absent := &gcpdiscovery.Snapshot{}
+	var got Record
 	for i := range 3 {
 		if _, err := Reconcile(ctx, deps, string(gatewayUID), ns, gatewayName, project, absent, 1, 1, nil, testGatewayAddress, 0, testBundle); err != nil {
 			t.Fatalf("Reconcile(...) pass %d returned unexpected error: %v", i, err)
 		}
+		wantCount := i + 1
+		got = waitForRecord(ctx, t, deps, ns, gatewayName, "vm-a", func(r Record) bool { return r.DepartureCount == wantCount })
 	}
-
-	got, found, err := deps.GetRecord(ctx, ns, gatewayName, "vm-a")
-	if err != nil || !found {
-		t.Fatalf("GetRecord(...) = %+v, found=%v, err=%v; want the record to still be held", got, found, err)
-	}
-	if got.Slot != 0 || !got.PendingConfirmation {
-		t.Fatalf("GetRecord(...) = %+v, want Slot 0 and PendingConfirmation true", got)
+	if got.Slot != 0 || got.DepartureCount != 3 || !got.PendingConfirmation {
+		t.Fatalf("GetRecord(...) = %+v, want Slot 0, DepartureCount 3 and PendingConfirmation true", got)
 	}
 
 	// A blocking managed resource still exists: confirmation must not release the record.
