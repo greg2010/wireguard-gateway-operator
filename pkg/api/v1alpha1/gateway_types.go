@@ -357,6 +357,7 @@ type GatewayStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Policy",type=string,JSONPath=`.spec.trafficPolicy`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.link.activeNode`,priority=1
+// +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.gcp) || !has(self.spec.gcp.loadBalancer) || size(self.metadata.name) <= 37",message="a load-balanced Gateway name is at most 37 characters: the instance template name prefix appends a 17-character revision suffix and GCP caps the prefix at 54"
 
 type Gateway struct {
 	metav1.TypeMeta   `json:",inline"`

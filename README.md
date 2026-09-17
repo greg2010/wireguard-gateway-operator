@@ -416,8 +416,10 @@ it) and no `spec.gcp.loadBalancer` field. On a single-instance Gateway,
 disk-size change out as a template revision.
 
 To opt into load balancing, set `spec.gcp.loadBalancer` (at creation; it is
-immutable). The MIG spreads across zones specified in `spec.gcp.zones`; if omitted,
-a single zone is implied:
+immutable). A load-balanced Gateway's `metadata.name` is at most 37 characters:
+the instance template name prefix appends a 17-character revision suffix and GCP
+caps the prefix at 54. The MIG spreads across zones specified in `spec.gcp.zones`;
+if omitted, a single zone is implied:
 
 ```yaml
 spec:

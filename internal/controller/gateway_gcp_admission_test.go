@@ -119,6 +119,47 @@ func TestGatewayGCPZonesReplicasAdmission(t *testing.T) {
 	}
 }
 
+// TestGatewayGCPNameLengthAdmission covers: the metadata.name bound of a load-balanced Gateway.
+func TestGatewayGCPNameLengthAdmission(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	const wantNameBound = "a load-balanced Gateway name is at most 37 characters"
+
+	tests := []struct {
+		name        string
+		build       func(ns string) *wgnetv1alpha1.Gateway
+		accept      bool
+		wantMessage string
+	}{
+		{
+			name:        "38 character name rejected with load balancer",
+			build:       func(ns string) *wgnetv1alpha1.Gateway { return gcpLBGateway(strings.Repeat("a", 38), ns) },
+			wantMessage: wantNameBound,
+		},
+		{
+			name:   "37 character name accepted with load balancer",
+			build:  func(ns string) *wgnetv1alpha1.Gateway { return gcpLBGateway(strings.Repeat("a", 37), ns) },
+			accept: true,
+		},
+		{
+			name:   "38 character name accepted without load balancer",
+			build:  func(ns string) *wgnetv1alpha1.Gateway { return newGateway(strings.Repeat("a", 38), ns, nil, nil) },
+			accept: true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("name-length-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+			obj := tt.build(ns)
+			assertAdmission(ctx, t, cl, obj, cl.Create(ctx, obj), tt.accept, tt.wantMessage)
+		})
+	}
+}
+
 func asUnstructuredGateway(t *testing.T, gw client.Object, mutate func(t *testing.T, u *unstructured.Unstructured)) *unstructured.Unstructured {
 	t.Helper()
 	raw, err := runtime.DefaultUnstructuredConverter.ToUnstructured(gw)

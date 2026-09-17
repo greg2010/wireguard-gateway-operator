@@ -495,6 +495,12 @@ spec:
                 type: string
             type: object
         type: object
+        x-kubernetes-validations:
+        - message: 'a load-balanced Gateway name is at most 37 characters: the instance
+            template name prefix appends a 17-character revision suffix and GCP caps
+            the prefix at 54'
+          rule: '!has(self.spec) || !has(self.spec.gcp) || !has(self.spec.gcp.loadBalancer)
+            || size(self.metadata.name) <= 37'
     served: true
     storage: true
     subresources:
