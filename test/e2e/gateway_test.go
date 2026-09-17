@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/greg2010/wireguard-gateway-operator/test/harness/shared"
+
 	"golang.org/x/sync/errgroup"
 	policyv1 "k8s.io/api/policy/v1"
 	utilexec "k8s.io/client-go/util/exec"
@@ -1388,8 +1390,8 @@ func TestGatewayTrafficPolicyLocal(t *testing.T) {
 			t.Fatal("link lease has no holder; no link pod programs the data plane")
 		}
 		for _, cmd := range [][]string{
-			{"ip", "link", "show", link.NewIdentity(status.LinkID).Interface},
-			{"nft", "list", "table", "inet", link.NewIdentity(status.LinkID).NftTable},
+			{"ip", "link", "show", link.NewSlotIdentity(status.LinkID, 0).Interface},
+			{"nft", "list", "table", "inet", link.NewGatewayIdentity(status.LinkID).NftTable},
 		} {
 			if _, stderr, err := client.ExecInPod(ctx, stack.Namespace, holder, cmd); err != nil {
 				t.Errorf("%v in holder %s: %v (stderr: %s); the id-derived name must exist on the holder", cmd, holder, err, strings.TrimSpace(stderr))
@@ -1783,7 +1785,7 @@ func TestGatewayTrafficPolicyLocalDisruption(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read gateway status after the roll: %v", err)
 		}
-		iface := link.NewIdentity(status.LinkID).Interface
+		iface := link.NewSlotIdentity(status.LinkID, 0).Interface
 		assertSingleIfaceOwner(ctx, t, client, stack.Namespace, selector, leaseName, iface, haFailoverTimeout)
 	})
 }
@@ -1819,7 +1821,7 @@ func localHolderState(ctx context.Context, t *testing.T, client *hk8s.Client, st
 	if status.LinkID < 1 {
 		t.Fatalf("status.link.id = %d, want an allocated id; the interface name derives from it", status.LinkID)
 	}
-	return holder, node, link.NewIdentity(status.LinkID).Interface
+	return holder, node, link.NewSlotIdentity(status.LinkID, 0).Interface
 }
 
 // assertActiveNode fails unless status.link.activeNode settles on want within timeout.
@@ -1909,4 +1911,133 @@ func otherWorker(t *testing.T, workers []string, current string) string {
 	}
 	t.Fatalf("no worker other than %q in %v; the handoff assertion needs two", current, workers)
 	return ""
+}
+
+func TestGatewaySingleInstanceRetainedReasons(t *testing.T) {
+	t.Parallel()
+
+	suite := getSuite(t)
+	ctx := context.Background()
+	stack, err := suite.Start(ctx, t)
+	if err != nil {
+		t.Fatalf("start stack: %v", err)
+	}
+	var serviceAccount string
+	if err := retryUntil(ctx, 2*time.Minute, func(ctx context.Context) error {
+		email, err := suite.GatewayServiceAccountEmail(ctx, stack.Namespace, stack.GatewayName)
+		if err != nil {
+			return err
+		}
+		serviceAccount = email
+		if serviceAccount == "" {
+			return errors.New("service account email is empty")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("wait for gateway service account email (last value %q): %v", serviceAccount, err)
+	}
+	network, err := suite.GatewaySharedNetworkName(ctx, stack.Namespace, stack.GatewayName)
+	if err != nil {
+		t.Fatalf("read gateway shared network name: %v", err)
+	}
+	if network == "" {
+		t.Fatal("gateway shared network name is empty")
+	}
+	denyGatewayWireGuard(ctx, t, suite, stack.NamePrefix, network, serviceAccount)
+	holder, err := suite.Client().GetLeaseHolder(ctx, stack.Namespace, linkLeaseName(stack.GatewayName))
+	if err != nil {
+		t.Fatalf("read lease holder: %v", err)
+	}
+	if holder == "" {
+		t.Fatal("link lease has no holder")
+	}
+	if err := suite.Client().DeletePod(ctx, stack.Namespace, holder); err != nil {
+		t.Fatalf("delete lease holder %s: %v", holder, err)
+	}
+	t.Logf("deleted holder link pod %s", holder)
+	if err := suite.Client().WaitGatewayCondition(ctx, stack.Namespace, stack.GatewayName,
+		"Ready", "False", "Provisioning", 6*time.Minute); err != nil {
+		t.Fatalf("wait for retained single-instance provisioning condition: %v", err)
+	}
+	status, err := suite.Client().GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+	if err != nil {
+		t.Fatalf("read gateway status: %v", err)
+	}
+	if !slices.Equal(status.GCPMembers, []hk8s.GatewayGCPMember{}) {
+		t.Errorf("single-instance status.gcp.members = %v, want exactly %v", status.GCPMembers, []hk8s.GatewayGCPMember{})
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	hold := time.NewTimer(90 * time.Second)
+	defer hold.Stop()
+	for {
+		select {
+		case <-hold.C:
+			return
+		case <-ticker.C:
+			conditionStatus, reason, message, found, err := suite.Client().GetGatewayCondition(ctx, stack.Namespace, stack.GatewayName, "Ready")
+			if err != nil {
+				t.Fatalf("read retained single-instance Ready condition: %v", err)
+			}
+			status, err := suite.Client().GetGatewayStatus(ctx, stack.Namespace, stack.GatewayName)
+			if err != nil {
+				t.Fatalf("read retained single-instance gateway status: %v", err)
+			}
+			if !found || conditionStatus != "False" || reason != "Provisioning" || !slices.Equal(status.GCPMembers, []hk8s.GatewayGCPMember{}) {
+				t.Fatalf("retained single-instance Ready condition: status=%q reason=%q message=%q found=%t members=%v, want status=%q reason=%q members=%v",
+					conditionStatus, reason, message, found, status.GCPMembers, "False", "Provisioning", []hk8s.GatewayGCPMember{})
+			}
+		}
+	}
+}
+
+func denyGatewayWireGuard(ctx context.Context, t *testing.T, suite *e2eharness.Suite, prefix, network, serviceAccount string) {
+	t.Helper()
+	env := suite.Env()
+	rules := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: prefix + "-deny-wg-in",
+			args: []string{
+				"compute", "firewall-rules", "create", prefix + "-deny-wg-in",
+				"--project", env.ProjectID, "--network", network, "--direction", "INGRESS",
+				"--action", "DENY", "--rules", "udp", "--priority", "100",
+				"--source-ranges", "0.0.0.0/0", "--target-service-accounts", serviceAccount, "--quiet",
+			},
+		},
+		{
+			name: prefix + "-deny-wg-out",
+			args: []string{
+				"compute", "firewall-rules", "create", prefix + "-deny-wg-out",
+				"--project", env.ProjectID, "--network", network, "--direction", "EGRESS",
+				"--action", "DENY", "--rules", "udp", "--priority", "100",
+				"--destination-ranges", "0.0.0.0/0", "--target-service-accounts", serviceAccount, "--quiet",
+			},
+		},
+	}
+	for _, rule := range rules {
+		createCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		_, err := shared.RunCmdStdout(createCtx,
+			[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile}, "gcloud", rule.args...)
+		cancel()
+		if err != nil {
+			t.Fatalf("create firewall rule %s: %v", rule.name, err)
+		}
+		t.Logf("created firewall rule %s", rule.name)
+		ruleName := rule.name
+		t.Cleanup(func() {
+			deleteCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			_, err := shared.RunCmdStdout(deleteCtx,
+				[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile},
+				"gcloud", "compute", "firewall-rules", "delete", ruleName,
+				"--project", env.ProjectID, "--quiet")
+			if err != nil {
+				t.Errorf("delete firewall rule %s: %v", ruleName, err)
+			}
+		})
+	}
 }
