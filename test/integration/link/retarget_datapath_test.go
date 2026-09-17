@@ -34,8 +34,8 @@ const (
 	dpProbeTimeout = 5 * time.Second
 )
 
-// TestNftablesRetargetDataPathFollowsClusterIP asserts a fresh flow reaches the new
-// target while an established flow stays pinned to the old one by conntrack.
+// TestNftablesRetargetDataPathFollowsClusterIP asserts a fresh flow reaches the new target and
+// that the production conntrack flush breaks an established flow pinned to the old one.
 func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
@@ -62,9 +62,19 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardB}))
 	assertClusterForwardRules(ctx, t, ctr, []link.ResolvedForward{forwardB}, "after retarget")
 
-	reused, err := held.request(ctx, t)
-	if err != nil || strings.TrimSpace(reused) != dpMarkerA {
-		t.Fatalf("after retarget: reused established connection bytes = %q, err = %v, want %q", []byte(reused), err, dpMarkerA)
+	// The production flush runs in the same netns the ruleset was loaded into (the container's
+	// root netns, per setupTopology): the same argv link.Apply would run after the nft -f - step.
+	if code, out := netns.Exec(ctx, t, ctr, append([]string{"conntrack"}, link.ConntrackFlushArgs(forwardA)...)...); code != 0 && !strings.Contains(out, "0 flow entries have been deleted") {
+		t.Fatalf("flush forward A's conntrack entries (exit %d):\n%s", code, out)
+	}
+
+	_, requestErr := held.request(ctx, t)
+	if requestErr == nil {
+		t.Fatal("after retarget: held connection's next request succeeded, want the deleted conntrack entry to break the flow (reset or timeout)")
+	}
+	t.Logf("observed held-connection error after retarget: %v", requestErr)
+	if !strings.Contains(requestErr.Error(), "held connection read:") {
+		t.Fatalf("held connection error = %v, want one reporting the script's own read failure, not a missing reply file", requestErr)
 	}
 
 	if got := probeOnce(ctx, t, ctr); got != dpMarkerB {
@@ -77,7 +87,7 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 func startDataPathContainer(ctx context.Context, t testing.TB) testcontainers.Container {
 	t.Helper()
 
-	ctr := netns.Start(ctx, t, "python3")
+	ctr := netns.Start(ctx, t, "python3", "conntrack-tools")
 	setupTopology(ctx, t, ctr)
 	startBackends(ctx, t, ctr)
 	return ctr

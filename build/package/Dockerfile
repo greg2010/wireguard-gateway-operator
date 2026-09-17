@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # Link runtime stage: alpine plus the CLIs gateway-link shells out to (ip, wg, nft).
 FROM alpine:3.21 AS link
 
-RUN apk add --no-cache iproute2 wireguard-tools nftables
+RUN apk add --no-cache iproute2 wireguard-tools nftables conntrack-tools
 
 COPY --from=builder /out/gateway-link /usr/local/bin/
 

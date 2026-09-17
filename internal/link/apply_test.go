@@ -299,10 +299,10 @@ func TestApplyIsIdempotent(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	if _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t)); err != nil {
+	if _, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t)); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t)); err != nil {
+	if _, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t)); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
 
@@ -322,6 +322,182 @@ func TestApplyIsIdempotent(t *testing.T) {
 	}
 	if ruleAdds != 2 {
 		t.Errorf("ip rule add count across both applies = %d, want 2 (one per apply)", ruleAdds)
+	}
+}
+
+// TestConntrackFlushCommands pins the tuple diff conntrackFlushCommands computes: a tuple previous
+// carries that current drops gets one flush command, in previous's order, duplicates collapsed.
+func TestConntrackFlushCommands(t *testing.T) {
+	a := ResolvedForward{Name: "a", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 8443}
+	aDup := ResolvedForward{Name: "a-dup", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 8443}
+	aRetargeted := ResolvedForward{Name: "a", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}
+	aPortChanged := ResolvedForward{Name: "a", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 9443}
+	aProtoChanged := ResolvedForward{Name: "a", PublicPort: 443, Protocol: "udp", Target: "10.96.1.10", TargetPort: 8443}
+	b := ResolvedForward{Name: "b", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.20", TargetPort: 9000}
+	bRetargeted := ResolvedForward{Name: "b", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.30", TargetPort: 9000}
+
+	cmdFor := func(f ResolvedForward) command {
+		return command{name: "conntrack", args: ConntrackFlushArgs(f), tolerateNoFlows: true}
+	}
+
+	tcs := []struct {
+		name     string
+		previous []ResolvedForward
+		current  []ResolvedForward
+		want     []command
+	}{
+		{name: "nil_previous", current: []ResolvedForward{a}},
+		{name: "identical_sets", previous: []ResolvedForward{a, b}, current: []ResolvedForward{a, b}},
+		{name: "target_changed", previous: []ResolvedForward{a}, current: []ResolvedForward{aRetargeted}, want: []command{cmdFor(a)}},
+		{name: "target_port_changed", previous: []ResolvedForward{a}, current: []ResolvedForward{aPortChanged}, want: []command{cmdFor(a)}},
+		{name: "protocol_changed", previous: []ResolvedForward{a}, current: []ResolvedForward{aProtoChanged}, want: []command{cmdFor(a)}},
+		{name: "forward_removed", previous: []ResolvedForward{a, b}, current: []ResolvedForward{b}, want: []command{cmdFor(a)}},
+		{name: "forward_added", previous: []ResolvedForward{a}, current: []ResolvedForward{a, b}},
+		{
+			name:     "two_forwards_retargeted",
+			previous: []ResolvedForward{a, b},
+			current:  []ResolvedForward{aRetargeted, bRetargeted},
+			want:     []command{cmdFor(a), cmdFor(b)},
+		},
+		{
+			name:     "same_tuple_twice_in_previous_collapses",
+			previous: []ResolvedForward{a, aDup},
+			want:     []command{cmdFor(a)},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			assertCommandPlan(t, conntrackFlushCommands(tc.previous, tc.current), tc.want)
+		})
+	}
+}
+
+// TestApplyFlushesRetargetedForwards runs Apply twice with a retargeted Cluster forward: the first
+// call's exact plan carries no conntrack step; the second's ends with the nft step then one flush.
+func TestApplyFlushesRetargetedForwards(t *testing.T) {
+	rc := RuntimeConfig{
+		WireGuard: WireGuard{Address: "10.99.0.2/32"},
+		Forwards:  []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443}},
+	}
+	targets := []string{"10.96.1.10", "10.96.1.20"}
+	call := 0
+	resolve := func(_ context.Context, _ string) (string, error) {
+		ip := targets[call]
+		call++
+		return ip, nil
+	}
+	forwardA := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 8443}
+	forwardB := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}
+
+	first := &runRecorder{}
+	_, applied1, err := Apply(context.Background(), first.run, rc, "priv", resolve, nil, nil, testLogger(t))
+	if err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if len(applied1) != 1 || applied1[0] != forwardA {
+		t.Fatalf("first applied = %+v, want [%+v]", applied1, forwardA)
+	}
+	cmds1 := first.snapshot()
+	nftA, err := RenderNftables(rc, []ResolvedForward{forwardA})
+	if err != nil {
+		t.Fatalf("RenderNftables A: %v", err)
+	}
+	assertCommandPlan(t, cmds1, []command{
+		{name: "ip", args: []string{"link", "show", "wg0"}},
+		{name: "wg", args: []string{"syncconf", "wg0", syncconfPath(t, cmds1)}},
+		{name: "ip", args: []string{"addr", "replace", "10.99.0.2/32", "dev", "wg0"}},
+		{name: "ip", args: []string{"link", "set", "wg0", "up"}},
+		{name: "nft", args: []string{"-f", "-"}, stdin: nftA},
+	})
+
+	second := &runRecorder{}
+	_, applied2, err := Apply(context.Background(), second.run, rc, "priv", resolve, applied1, nil, testLogger(t))
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if len(applied2) != 1 || applied2[0] != forwardB {
+		t.Fatalf("second applied = %+v, want [%+v]", applied2, forwardB)
+	}
+	cmds2 := second.snapshot()
+	nftB, err := RenderNftables(rc, []ResolvedForward{forwardB})
+	if err != nil {
+		t.Fatalf("RenderNftables B: %v", err)
+	}
+	assertCommandPlan(t, cmds2, []command{
+		{name: "ip", args: []string{"link", "show", "wg0"}},
+		{name: "wg", args: []string{"syncconf", "wg0", syncconfPath(t, cmds2)}},
+		{name: "ip", args: []string{"addr", "replace", "10.99.0.2/32", "dev", "wg0"}},
+		{name: "ip", args: []string{"link", "set", "wg0", "up"}},
+		{name: "nft", args: []string{"-f", "-"}, stdin: nftB},
+		{name: "conntrack", args: ConntrackFlushArgs(forwardA), tolerateNoFlows: true},
+	})
+}
+
+// syncconfPath returns the wg conf path a recorded wg syncconf step ran with, since
+// os.CreateTemp generates the path fresh on every Apply call.
+func syncconfPath(t *testing.T, cmds []command) string {
+	t.Helper()
+	for _, c := range cmds {
+		if c.name == "wg" && len(c.args) == 3 && c.args[0] == "syncconf" {
+			return c.args[2]
+		}
+	}
+	t.Fatal("no wg syncconf step found")
+	return ""
+}
+
+// TestApplyToleratesEmptyFlush pins that a zero-match conntrack deletion succeeds the apply, the
+// way EEXIST does for an ip rule add, and that any other conntrack failure fails it.
+func TestApplyToleratesEmptyFlush(t *testing.T) {
+	rc := RuntimeConfig{
+		WireGuard: WireGuard{Address: "10.99.0.2/32"},
+		Forwards:  []Forward{{Name: "web", PublicPort: 443, Protocol: "tcp", Service: "web.default.svc", TargetPort: 8443}},
+	}
+	forwardA := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 8443}
+	forwardB := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}
+	resolveB := func(_ context.Context, _ string) (string, error) { return "10.96.1.20", nil }
+
+	tcs := []struct {
+		name         string
+		conntrackErr error
+		wantErr      bool
+		wantErrSub   string
+	}{
+		{
+			name:         "zero_matches_is_success",
+			conntrackErr: fmt.Errorf("conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted"),
+		},
+		{
+			name:         "other_failure_fails_the_apply",
+			conntrackErr: fmt.Errorf("conntrack v1.4.8 (conntrack-tools): permission denied"),
+			wantErr:      true,
+			wantErrSub:   "flush conntrack",
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &runRecorder{hook: func(c command) error {
+				if c.name == "conntrack" {
+					return tc.conntrackErr
+				}
+				return nil
+			}}
+			_, applied, err := Apply(context.Background(), rec.run, rc, "priv", resolveB, []ResolvedForward{forwardA}, nil, testLogger(t))
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+					t.Fatalf("Apply error = %v, want one containing %q", err, tc.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			if len(applied) != 1 || applied[0] != forwardB {
+				t.Errorf("applied = %+v, want [%+v]", applied, forwardB)
+			}
+		})
 	}
 }
 
@@ -386,7 +562,7 @@ func TestApplyFailsOnProbeError(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	_, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
+	_, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("Apply = %v, want one wrapping %v", err, probeErr)
 	}
@@ -414,7 +590,7 @@ func TestApplyOneFailingSlotOthersContinue(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-	results, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
+	results, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -538,7 +714,7 @@ func TestApplyRulesetFailureHoldsEveryAttemptedSlot(t *testing.T) {
 			}
 			resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-			results, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, testLogger(t))
+			results, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
 			if err == nil || !errors.Is(err, nftErr) {
 				t.Fatalf("Apply error = %v, want one wrapping %v", err, nftErr)
 			}
@@ -794,6 +970,9 @@ func assertCommandPlan(t *testing.T, got, want []command) {
 		}
 		if got[i].tolerateExists != want[i].tolerateExists {
 			t.Errorf("cmd[%d] tolerateExists = %v, want %v", i, got[i].tolerateExists, want[i].tolerateExists)
+		}
+		if got[i].tolerateNoFlows != want[i].tolerateNoFlows {
+			t.Errorf("cmd[%d] tolerateNoFlows = %v, want %v", i, got[i].tolerateNoFlows, want[i].tolerateNoFlows)
 		}
 	}
 }
@@ -1075,7 +1254,7 @@ func TestRenderConfigModeBranch(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls []string
-			_, ruleset, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", tc.resolve(t, &calls), tc.localForwards, testLogger(t))
+			_, ruleset, _, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", tc.resolve(t, &calls), tc.localForwards, testLogger(t))
 			if err != nil {
 				t.Fatalf("renderConfig: %v", err)
 			}

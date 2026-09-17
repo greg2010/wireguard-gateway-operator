@@ -36,6 +36,10 @@ type command struct {
 	// tolerateExists marks a step whose object may already be installed, where the
 	// kernel's EEXIST is the idempotent outcome and not a failure.
 	tolerateExists bool
+
+	// tolerateNoFlows marks a conntrack deletion step whose flow may already be gone, where a
+	// zero-match deletion is the idempotent outcome and not a failure.
+	tolerateNoFlows bool
 }
 
 // existsMarker is ip(8)'s wording for the kernel's EEXIST. execCommand folds stderr into the
@@ -45,6 +49,10 @@ const existsMarker = "File exists"
 // absentMarker is ip(8)'s wording for the kernel's ENODEV. execCommand sets LC_ALL=C, so the
 // wording is stable and is matched on the returned error's text.
 const absentMarker = "does not exist"
+
+// noFlowsMarker is conntrack(8)'s wording for a deletion that matched nothing. execCommand sets
+// LC_ALL=C, so the wording is stable and is matched on the returned error's text.
+const noFlowsMarker = "0 flow entries have been deleted"
 
 // runner executes a single command. Tests inject a recorder to exercise the
 // command plan without shelling out.
@@ -175,6 +183,56 @@ func localThrowTargets(forwards []ResolvedForward) []string {
 	return slices.Sorted(maps.Keys(targets))
 }
 
+// ConntrackFlushArgs returns the conntrack(8) argv that deletes f's forward flows: original
+// direction destination port PublicPort, reply direction source address and port Target and
+// TargetPort. The four filters together select exactly f's flows and nothing else.
+func ConntrackFlushArgs(f ResolvedForward) []string {
+	return []string{
+		"-D",
+		"-p", f.Protocol,
+		"--orig-port-dst", strconv.Itoa(f.PublicPort),
+		"--reply-src", f.Target,
+		"--reply-port-src", strconv.Itoa(f.TargetPort),
+	}
+}
+
+// forwardTuple is the part of a ResolvedForward that identifies its programmed flows; Name is a
+// label and plays no part in it.
+type forwardTuple struct {
+	protocol   string
+	publicPort int
+	target     string
+	targetPort int
+}
+
+func tupleOf(f ResolvedForward) forwardTuple {
+	return forwardTuple{f.Protocol, f.PublicPort, f.Target, f.TargetPort}
+}
+
+// conntrackFlushCommands returns one conntrack deletion command per tuple in previous that current
+// no longer carries, in previous's order, with duplicate tuples in previous collapsed to one.
+func conntrackFlushCommands(previous, current []ResolvedForward) []command {
+	present := make(map[forwardTuple]struct{}, len(current))
+	for _, f := range current {
+		present[tupleOf(f)] = struct{}{}
+	}
+
+	var cmds []command
+	seen := make(map[forwardTuple]struct{}, len(previous))
+	for _, p := range previous {
+		t := tupleOf(p)
+		if _, ok := present[t]; ok {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		cmds = append(cmds, command{name: "conntrack", args: ConntrackFlushArgs(p), tolerateNoFlows: true})
+	}
+	return cmds
+}
+
 // ResolveFunc resolves a Cluster-mode forward's backend Service to a concrete address.
 type ResolveFunc func(ctx context.Context, host string) (string, error)
 
@@ -186,10 +244,13 @@ type SlotResult struct {
 }
 
 // Apply programs network state without concurrent calls. Local slot failures return in SlotResult.
-func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (results []SlotResult, err error) {
-	wgConfPaths, nftRuleset, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, log)
+// previous is the forward set the last successful Apply programmed, nil on the first call; applied
+// is the forward set this call programmed. After the shared nft step, Apply flushes conntrack for
+// every tuple previous carries that applied no longer does.
+func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, previous, localForwards []ResolvedForward, log *zap.SugaredLogger) (results []SlotResult, applied []ResolvedForward, err error) {
+	wgConfPaths, nftRuleset, resolved, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, log)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() {
 		if cleanupErr := cleanup(err != nil); cleanupErr != nil {
@@ -201,14 +262,14 @@ func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, re
 	if !rc.isLocal() {
 		ok, err := ifaceExists(ctx, run, clusterInterface)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		exists[0] = ok
 	} else {
 		for _, p := range rc.WireGuard.Peers {
 			ok, err := ifaceExists(ctx, run, NewSlotIdentity(rc.Identity.ID, p.Slot).Interface)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			exists[p.Slot] = ok
 		}
@@ -219,13 +280,16 @@ func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, re
 	if !rc.isLocal() {
 		for _, c := range plans[0].Cmds {
 			if err := runStep(ctx, run, c, log); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if err := runStep(ctx, run, final, log); err != nil {
-			return nil, fmt.Errorf("apply nftables ruleset: %w", err)
+			return nil, nil, fmt.Errorf("apply nftables ruleset: %w", err)
 		}
-		return nil, nil
+		if err := flushConntrack(ctx, run, previous, resolved, log); err != nil {
+			return nil, nil, err
+		}
+		return nil, resolved, nil
 	}
 
 	results = make([]SlotResult, 0, len(plans))
@@ -240,9 +304,23 @@ func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, re
 	}
 	if err := runStep(ctx, run, final, log); err != nil {
 		err = fmt.Errorf("apply nftables ruleset: %w", err)
-		return unapplied(results, err), err
+		return unapplied(results, err), nil, err
 	}
-	return results, nil
+	if err := flushConntrack(ctx, run, previous, resolved, log); err != nil {
+		return results, nil, err
+	}
+	return results, resolved, nil
+}
+
+// flushConntrack runs conntrackFlushCommands(previous, applied) after the shared nft step has
+// succeeded, so the new ruleset is already forwarding before a stale flow is torn down.
+func flushConntrack(ctx context.Context, run runner, previous, applied []ResolvedForward, log *zap.SugaredLogger) error {
+	for _, c := range conntrackFlushCommands(previous, applied) {
+		if err := runStep(ctx, run, c, log); err != nil {
+			return fmt.Errorf("flush conntrack for forward %s: %w", strings.Join(c.args, " "), err)
+		}
+	}
+	return nil
 }
 
 // unapplied marks a pass whose final ruleset failed: no slot is admitted, though each created
@@ -257,20 +335,29 @@ func unapplied(results []SlotResult, err error) []SlotResult {
 	return results
 }
 
-// runStep executes one plan step. A tolerateExists step failing with EEXIST found its object
-// already installed, the expected re-apply outcome; that is logged at Debug rather than failed.
+// runStep executes one plan step. A tolerateExists or tolerateNoFlows step whose failure matches
+// its marker found the expected idempotent outcome, logged at Debug rather than failed.
 func runStep(ctx context.Context, run runner, c command, log *zap.SugaredLogger) error {
 	err := run(ctx, c)
-	if err != nil && c.tolerateExists && strings.Contains(err.Error(), existsMarker) {
+	if err == nil {
+		return nil
+	}
+	if c.tolerateExists && strings.Contains(err.Error(), existsMarker) {
 		log.Debugw("step's object already exists, leaving it in place",
+			"command", strings.Join(append([]string{c.name}, c.args...), " "), "error", err)
+		return nil
+	}
+	if c.tolerateNoFlows && strings.Contains(err.Error(), noFlowsMarker) {
+		log.Debugw("conntrack flush matched no flows, already gone",
 			"command", strings.Join(append([]string{c.name}, c.args...), " "), "error", err)
 		return nil
 	}
 	return err
 }
 
-// renderConfig writes 0600 per-slot configs and renders the shared ruleset.
-func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (wgConfPaths map[int]string, nftRuleset string, cleanup func(logFailures bool) error, err error) {
+// renderConfig writes 0600 per-slot configs and renders the shared ruleset. resolved is the
+// forward set actually used to render it: Cluster's freshly resolved set, or Local's localForwards.
+func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (wgConfPaths map[int]string, nftRuleset string, resolved []ResolvedForward, cleanup func(logFailures bool) error, err error) {
 	wgConfPaths = map[int]string{}
 	var paths []string
 	cleanup = func(logFailures bool) error {
@@ -325,24 +412,24 @@ func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve
 				if cleanupErr := cleanup(true); cleanupErr != nil {
 					log.Warnw("remove wg conf temp files", "error", cleanupErr)
 				}
-				return nil, "", nil, err
+				return nil, "", nil, nil, err
 			}
 		}
 	} else if err := writeWGConf(0, rc); err != nil {
 		if cleanupErr := cleanup(true); cleanupErr != nil {
 			log.Warnw("remove wg conf temp files", "error", cleanupErr)
 		}
-		return nil, "", nil, err
+		return nil, "", nil, nil, err
 	}
 
-	resolved := localForwards
+	resolved = localForwards
 	if !rc.isLocal() {
 		resolved, err = resolveForwards(ctx, rc.Forwards, resolve)
 		if err != nil {
 			if cleanupErr := cleanup(true); cleanupErr != nil {
 				log.Warnw("remove wg conf temp files", "error", cleanupErr)
 			}
-			return nil, "", nil, fmt.Errorf("resolve forwards: %w", err)
+			return nil, "", nil, nil, fmt.Errorf("resolve forwards: %w", err)
 		}
 	}
 	nftRuleset, err = RenderNftables(rc, resolved)
@@ -350,9 +437,9 @@ func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve
 		if cleanupErr := cleanup(true); cleanupErr != nil {
 			log.Warnw("remove wg conf temp files", "error", cleanupErr)
 		}
-		return nil, "", nil, fmt.Errorf("render nftables ruleset: %w", err)
+		return nil, "", nil, nil, fmt.Errorf("render nftables ruleset: %w", err)
 	}
-	return wgConfPaths, nftRuleset, cleanup, nil
+	return wgConfPaths, nftRuleset, resolved, cleanup, nil
 }
 
 // ifaceExists reports whether iface is present. Only ip(8)'s "does not exist" answer means absent;

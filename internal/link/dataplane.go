@@ -18,6 +18,9 @@ type dataPlane struct {
 	// on a successful apply and leaves once its teardown has completed.
 	slots       map[int]bool
 	otherHolder bool
+	// forwards is the forward set the last successful apply programmed, read by the next apply so
+	// it can flush the conntrack entries of whatever tuple no longer appears.
+	forwards []ResolvedForward
 }
 
 func newDataPlane(rc RuntimeConfig) *dataPlane {
@@ -45,18 +48,27 @@ func (d *dataPlane) clearOtherHolder() {
 	d.otherHolder = false
 }
 
-// applyPass records outcomes and re-renders the Local fence under the node lock.
+// applyPass records outcomes and re-renders the Local fence under the node lock, threading the
+// last successfully applied forward set into apply and storing its returned set only on success.
 func (d *dataPlane) applyPass(ctx context.Context, run runner, current RuntimeConfig,
-	apply func(context.Context) ([]SlotResult, error), log *zap.SugaredLogger) ([]SlotResult, error) {
+	apply func(context.Context, []ResolvedForward) ([]SlotResult, []ResolvedForward, error), log *zap.SugaredLogger) ([]SlotResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	previous := d.forwards
 	if !current.isLocal() {
-		return apply(ctx)
+		results, applied, err := apply(ctx, previous)
+		if err == nil {
+			d.forwards = applied
+		}
+		return results, err
 	}
 
 	d.rc = current
 	departed := d.teardownSlots(ctx, run, configuredSlots(current), log)
-	results, err := apply(ctx)
+	results, applied, err := apply(ctx, previous)
+	if err == nil {
+		d.forwards = applied
+	}
 	d.record(results)
 	if fenceErr := d.renderFence(ctx, run); fenceErr != nil {
 		err = errors.Join(err, fenceErr)

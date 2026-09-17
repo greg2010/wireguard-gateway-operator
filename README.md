@@ -524,7 +524,9 @@ A forward targets a Service in the Gateway's own namespace by default. To forwar
 into a different namespace, set `forwards[].namespace`, and the target namespace
 must opt in by carrying the label `wgnet.dev/allow-gateway-ingress: "true"`. This
 consent gate prevents a Gateway owner from exposing another tenant's Service to
-the public internet.
+the public internet. Changing a forward's target, target port or protocol, or
+removing a forward, drops the established connections of the old target at once;
+clients reconnect and land on the new target.
 
 ```sh
 kubectl label namespace other-ns wgnet.dev/allow-gateway-ingress=true

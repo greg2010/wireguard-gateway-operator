@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -86,8 +87,8 @@ func resultsFor(slots []int, failed ...int) []SlotResult {
 // outcome without a real apply.
 func applyPassWith(t *testing.T, d *dataPlane, run runner, rc RuntimeConfig, results []SlotResult) []SlotResult {
 	t.Helper()
-	got, err := d.applyPass(context.Background(), run, rc, func(context.Context) ([]SlotResult, error) {
-		return results, nil
+	got, err := d.applyPass(context.Background(), run, rc, func(context.Context, []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+		return results, nil, nil
 	}, testLogger(t))
 	if err != nil {
 		t.Fatalf("applyPass: %v", err)
@@ -512,8 +513,8 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 				}
 			}
 
-			results, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context) ([]SlotResult, error) {
-				return Apply(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, nil, testLogger(t))
+			results, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+				return Apply(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, previous, nil, testLogger(t))
 			}, testLogger(t))
 			if err != nil {
 				t.Fatalf("applyPass: %v", err)
@@ -529,6 +530,82 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 			want := wantFenceRuleset(slot0.Interface)
 			if got := lastFence(t, rec.snapshot()); got != want {
 				t.Errorf("fence after the apply = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestApplyPassThreadsForwards pins how applyPass threads the forward set: a success's returned
+// set becomes the next call's previous, a failure's does not, and a no-op standbyPass leaves it.
+func TestApplyPassThreadsForwards(t *testing.T) {
+	forwardA := []ResolvedForward{{Name: "a", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.10", TargetPort: 8443}}
+	forwardB := []ResolvedForward{{Name: "a", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}}
+	failErr := errors.New("injected apply failure")
+
+	tcs := []struct {
+		name string
+		// standbyAfterFirst runs a no-op standbyPass between the first and second applyPass calls.
+		standbyAfterFirst bool
+		// secondFails makes the second call fail and return forwardB, which must not replace the
+		// stored set; a third call then checks the set the first call stored survived.
+		secondFails bool
+	}{
+		{name: "two_successful_calls"},
+		{name: "a_standby_pass_between_two_successful_calls", standbyAfterFirst: true},
+		{name: "a_failing_call_does_not_replace_the_stored_set", secondFails: true},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := RuntimeConfig{WireGuard: WireGuard{Address: "10.99.0.2/32"}}
+			d := newDataPlane(rc)
+			rec := &runRecorder{}
+
+			var previous [][]ResolvedForward
+			apply := func(_ context.Context, prev []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+				previous = append(previous, prev)
+				if len(previous) == 2 && tc.secondFails {
+					return nil, forwardB, failErr
+				}
+				if len(previous) == 1 {
+					return nil, forwardA, nil
+				}
+				return nil, forwardB, nil
+			}
+
+			if _, err := d.applyPass(context.Background(), rec.run, rc, apply, testLogger(t)); err != nil {
+				t.Fatalf("call 1: %v", err)
+			}
+			if tc.standbyAfterFirst {
+				if err := d.standbyPass(context.Background(), rec.run, rc, func() bool { return true }, testLogger(t)); err != nil {
+					t.Fatalf("standbyPass: %v", err)
+				}
+			}
+			_, err := d.applyPass(context.Background(), rec.run, rc, apply, testLogger(t))
+			switch {
+			case tc.secondFails && !errors.Is(err, failErr):
+				t.Fatalf("call 2 error = %v, want one wrapping %v", err, failErr)
+			case !tc.secondFails && err != nil:
+				t.Fatalf("call 2: %v", err)
+			}
+			if tc.secondFails {
+				if _, err := d.applyPass(context.Background(), rec.run, rc, apply, testLogger(t)); err != nil {
+					t.Fatalf("call 3: %v", err)
+				}
+			}
+
+			wantLen := 2
+			if tc.secondFails {
+				wantLen = 3
+			}
+			if len(previous) != wantLen {
+				t.Fatalf("apply callback ran %d times, want %d", len(previous), wantLen)
+			}
+			if !reflect.DeepEqual(previous[0], []ResolvedForward(nil)) {
+				t.Errorf("call 1's previous = %+v, want nil", previous[0])
+			}
+			if !reflect.DeepEqual(previous[wantLen-1], forwardA) {
+				t.Errorf("last call's previous = %+v, want %+v", previous[wantLen-1], forwardA)
 			}
 		})
 	}
@@ -681,8 +758,8 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
 	pass := func(rec *runRecorder, d *dataPlane, rc RuntimeConfig) error {
-		_, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context) ([]SlotResult, error) {
-			return Apply(ctx, rec.run, rc, "priv", resolve, nil, testLogger(t))
+		_, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+			return Apply(ctx, rec.run, rc, "priv", resolve, previous, nil, testLogger(t))
 		}, testLogger(t))
 		return err
 	}

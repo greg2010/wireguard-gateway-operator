@@ -107,8 +107,8 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	resolve := newResolver(net.DefaultResolver.LookupIP)
 
 	apply := func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward) ([]SlotResult, error) {
-		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context) ([]SlotResult, error) {
-			return Apply(ctx, execCommand, rc, privKey, resolve, localForwards, log)
+		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+			return Apply(ctx, execCommand, rc, privKey, resolve, previous, localForwards, log)
 		}, log)
 	}
 	reconcile := newLeaderReconcile(cs, cfg, rd, preCheck, apply, log)
