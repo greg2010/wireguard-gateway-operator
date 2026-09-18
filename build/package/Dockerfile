@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -o /out/ ./cmd/...
 
 # Link runtime stage: alpine plus the CLIs gateway-link shells out to (ip, wg, nft).
-FROM alpine:3.21 AS link
+FROM alpine:3.22 AS link
 
 RUN apk add --no-cache iproute2 wireguard-tools nftables conntrack-tools
 
@@ -33,7 +33,7 @@ USER 10001:10001
 
 # Operator runtime stage: the manager only talks to the API server, so it needs
 # no extra CLIs beyond TLS roots. Build with --target operator.
-FROM alpine:3.21 AS operator
+FROM alpine:3.22 AS operator
 
 RUN apk add --no-cache ca-certificates
 
