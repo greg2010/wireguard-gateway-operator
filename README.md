@@ -259,12 +259,18 @@ secrets cluster-wide. The operator's credential reading is configured via Helm
 `GATEWAY_GCP_CREDENTIALS_SECRET` and `GATEWAY_GCP_CREDENTIALS_KEY`, but the
 defaults match the standard provider setup.
 
+For a load-balanced Gateway the operator re-lists the MIG's members every
+`gcp.discoveryInterval` (default `30s`) and re-reads each member's details every
+`gcp.addressRefreshInterval` (default `10m`) to catch an address change the
+listing missed. The env vars are `GATEWAY_GCP_DISCOVERY_INTERVAL` and
+`GATEWAY_GCP_ADDRESS_REFRESH_INTERVAL`.
+
 **4. The operator.**
 
 ```sh
 helm install wireguard-gateway-operator \
   oci://ghcr.io/greg2010/wireguard-gateway-operator/charts/wireguard-gateway-operator \
-  --version 0.8.0 \
+  --version 0.8.1 \
   -n wireguard-gateway-operator --create-namespace
 ```
 
@@ -365,14 +371,23 @@ server:
 
 - Each forward's `(port, protocol)` combination must be unique.
 - A UDP forward must not use `spec.wireguard.listenPort`.
+- Under `trafficPolicy: Cluster`, a TCP forward must not use port `8080`, the
+  link's health port.
 - At most 64 forwards per Gateway.
 
-The `ADDRESS` column is the gateway VM's public IP, mirrored onto
-`status.address` once provisioning completes; for `type: External` this is the
-address reserved outside the operator. `READY` reflects the `Ready`
-condition and `POLICY` the traffic policy. `kubectl get gateway -o wide` adds
-`NODE`, the node holding the link Lease. With `dnsHostnames` set and external-dns
-running, the listed names resolve to that IP.
+Under `Local` the health port is `27000` plus `status.link.id`. The id is
+assigned by the operator after apply, so a TCP forward on that port fails at
+reconcile with `ReservedHealthPort`.
+
+The `ADDRESS` column is the gateway's public IP, mirrored onto `status.address`
+once provisioning completes. For `type: External` it is the address reserved
+outside the operator. For a load-balanced Gateway it is the forwarding rule's
+address; each member's own IP is in `status.gcp.members[].externalAddress`.
+
+`READY` reflects the `Ready` condition and `POLICY` the traffic policy.
+`kubectl get gateway -o wide` adds `NODE`, the node holding the link Lease. With
+`dnsHostnames` set and external-dns running, the listed names resolve to
+`ADDRESS`.
 
 `spec.gcp.address` selects where the gateway VM's public ingress address comes
 from, `Reserved` by default:
@@ -415,11 +430,40 @@ it) and no `spec.gcp.loadBalancer` field. On a single-instance Gateway,
 `diskSizeGB` is set at creation and immutable; a load-balanced Gateway rolls a
 disk-size change out as a template revision.
 
+The load-balanced path, down to the tunnel:
+
+```
+            client
+               │
+               │  public internet
+               ▼
+┌─────────────────────────────┐
+│  forwarding rule            │
+│  status.address, all ports  │
+│  healthy VMs only           │
+└──────┬───────┬───────┬──────┘
+       │       │       │  one VM per replica,
+       ▼       ▼       ▼  spread over the zones
+    ┌─────┐ ┌─────┐ ┌─────┐
+    │ VM  │ │ VM  │ │ VM  │
+    └──┬──┘ └──┬──┘ └──┬──┘
+       │       │       │  a WireGuard tunnel per VM
+       └───────┼───────┘  (cluster dials each VM's own IP)
+               ▼
+┌─────────────────────────────┐
+│  gateway-link, one peer     │
+│  per member slot            │
+└──────────────┬──────────────┘
+               │
+               ▼
+     Cluster or Local path above
+```
+
 To opt into load balancing, set `spec.gcp.loadBalancer` (at creation; it is
 immutable). A load-balanced Gateway's `metadata.name` is at most 37 characters:
 the instance template name prefix appends a 17-character revision suffix and GCP
-caps the prefix at 54. The MIG spreads across zones specified in `spec.gcp.zones`;
-if omitted, a single zone is implied:
+caps the prefix at 54. The MIG spreads across the zones in `spec.gcp.zones`,
+which must all be in `spec.gcp.region`; if omitted, a single zone is implied:
 
 ```yaml
 spec:
@@ -434,9 +478,13 @@ spec:
 
 The effective zone set (computed from `zones` if present, otherwise the single
 `zone`) is immutable: once created, the MIG cannot gain or lose zones, though
-`replicas` can scale within them. `replicas` is capped by the tunnel address capacity. A `/29` has five member slots: slot 0 takes `gatewayAddress`, and only the link address is excluded.
+`replicas` can scale within them. `spec.wireguard.subnet`, `gatewayAddress` and
+`linkAddress` are immutable on a load-balanced Gateway too: each member's key
+bundle is written once and carries its tunnel address and the link address.
 
-The load balancer distributes traffic across live instances; `status.gcp.members`
+`replicas` is capped by the tunnel address capacity. A `/29` has five member
+slots: slot 0 takes `gatewayAddress`, and only the link address is excluded. The
+load balancer distributes traffic across live instances; `status.gcp.members`
 tracks each member's observed state:
 
 ```yaml
@@ -452,6 +500,48 @@ status:
       revision: "1"                 # template revision the member runs: the last path segment of the instance template named by the MIG version
       state: Active                 # Pending, Active, Recreating, Departing, or Departed
 ```
+
+`state` is one of:
+
+| State | Meaning |
+| --- | --- |
+| `Pending` | In the MIG's list but without a slot yet, because GCP has not assigned it an instance id or because every slot is taken. |
+| `Active` | Listed, with a slot, a tunnel address and its own keypair. |
+| `Recreating` | Being recreated by the MIG. Keeps its slot, key, address and peer. |
+| `Departing` | Missing from the last one or two listings. Keeps its slot, key, address and peer. |
+| `Departed` | Missing from three listings in a row, or listed as `DELETING` or `ABANDONING`. The peer is removed; the slot is freed once its cloud resources are gone. If it shows up again it goes back to `Active` on the same slot. |
+
+GCP health-checks every member at `/forwarded-healthz` on the link's health
+port, over the same path client traffic is forwarded on. The load balancer's
+check runs every 5s and stops sending traffic to a member after 2 failures. The
+MIG's autohealing check runs every 30s and recreates a VM that fails 10 checks
+in a row (five minutes).
+
+A recreated VM keeps its name, slot, key and address. Autohealing ignores a new
+VM for `initialDelaySec`, 900 seconds, while it boots and fetches its key
+bundle.
+
+Member addresses are stateful: GCP promotes each to a static address
+(`statefulExternalIp` on `nic0`), keeps it through autohealing and rollouts, and
+releases it only when the VM is permanently deleted from the group
+(`ON_PERMANENT_INSTANCE_DELETION`). A load-balanced Gateway holds one external
+address per member plus one for the forwarding rule, all counted against the
+region's quota.
+
+Changing `spec.gcp.image`, `machineType`, `diskSizeGB`, `spot`,
+`spec.wireguard.listenPort`, `mtu` or the chart's `operator.enableOsLogin`
+creates a new instance template revision. Nothing else does: the revision is a
+hash of those inputs only, so a value GCP assigns, such as the service-account
+email, never rolls the fleet.
+
+The MIG then recreates its VMs on the new template, one per zone at a time
+(`replacementMethod: RECREATE`, no surge, `maxUnavailable` equal to the zone
+count, spread over the zones). Each VM keeps its name and address. The old
+template goes once the MIG reports every VM on the new one.
+
+With `replicas` at least twice the zone count, every zone keeps a serving VM
+during a rollout. With `replicas` equal to the zone count, all VMs are recreated
+at once and every forward is down until they boot.
 
 ## Traffic policy
 
@@ -487,7 +577,15 @@ EndpointSlice reads the link needs to find backend pods on its node. Kubernetes
 escalation prevention limits what it may grant to permissions it holds itself; the
 chart satisfies that with a `bind` grant on that one ClusterRole by name.
 
-A Gateway is `Ready=True` once its address is provisioned and the link pod that holds the Lease reports an established WireGuard tunnel. The pod's readiness probe succeeds only after a fresh handshake with a peer (in `Local` mode, on any one of its applied slots). The holder publishes the same tunnel state onto its Lease, in the `wgnet.dev/tunnel-ready` annotation, in the same write that renews `holderIdentity`; the operator requires both the holder pod's readiness and that annotation before it sets `Ready=True`, so a probe that latches ready before the holder has acquired the Lease cannot make the Gateway Ready on its own. Until then the condition is `Ready=False`; this table is in precedence order.
+A Gateway is `Ready=True` once its address is provisioned and the link pod that
+holds the Lease reports an established WireGuard tunnel. The pod's readiness
+probe succeeds only after a fresh handshake with a peer (in `Local` mode, on any
+one of its applied slots). The holder publishes the same tunnel state onto its
+Lease, in the `wgnet.dev/tunnel-ready` annotation, in the same write that renews
+`holderIdentity`; the operator requires both the holder pod's readiness and that
+annotation before it sets `Ready=True`, so a probe that latches ready before the
+holder has acquired the Lease cannot make the Gateway Ready on its own. Until
+then the condition is `Ready=False`; this table is in precedence order.
 
 | Reason | Policy | Meaning |
 | --- | --- | --- |
@@ -573,6 +671,11 @@ same address. With `address.type: Ephemeral` it takes a new one, so even this
 instance-only rebuild lands on a new public IP and every `dnsHostnames` name has
 to re-propagate.
 
+A load-balanced Gateway has no `Instance` to delete; template changes roll out
+on their own (see [Load balancing](#load-balancing)). Deleting a member VM by
+hand is a permanent deletion: its address is released, it goes `Departing` then
+`Departed`, and the MIG creates a replacement.
+
 Do not widen the deletion to force a rebuild. Deleting the `XGatewayGCP`
 composite destroys the Address (`address.type: Reserved` only), Firewall,
 service account, Secrets, and Instance; an operator-created `Reserved` address is
@@ -606,11 +709,19 @@ firewall rule, leaving no login path at all.
 ## Development
 
 Run `make test` for the full suite (unit, integration, e2e) or the per-suite
-targets `make test-unit` / `make test-integration` / `make test-e2e`. Composition integration tests dry-run server-side apply for every rendered composed resource against vendored provider CRDs; `make provider-crds` refreshes them from the packages pinned in `k8s/infra/crossplane/crossplane-providers/values.yaml`, and `make test-integration` fetches the envtest binaries it needs. The e2e
-suite self-provisions a kind cluster, the full Crossplane stack, and a real GCP
-gateway, so it requires the GCP configuration above. `E2E_MAX_ADDRESSES` defaults to 8; a fleet counts its members plus one, and a single-instance Gateway counts one. It must not exceed the region external address quota. Local development needs
-[Go](https://go.dev/doc/install), [kind](https://kind.sigs.k8s.io/docs/user/quick-start/),
-and a container runtime — [Docker](https://docs.docker.com/engine/install/) or
+targets `make test-unit` / `make test-integration` / `make test-e2e`.
+Composition integration tests dry-run server-side apply for every rendered
+composed resource against vendored provider CRDs; `make provider-crds` refreshes
+them from the packages pinned in
+`k8s/infra/crossplane/crossplane-providers/values.yaml`, and
+`make test-integration` fetches the envtest binaries it needs. The e2e suite
+self-provisions a kind cluster, the full Crossplane stack, and a real GCP
+gateway, so it requires the GCP configuration above. `E2E_MAX_ADDRESSES`
+defaults to 8; a fleet counts its members plus one, and a single-instance
+Gateway counts one. It must not exceed the region external address quota. Local
+development needs [Go](https://go.dev/doc/install),
+[kind](https://kind.sigs.k8s.io/docs/user/quick-start/), and a container runtime
+— [Docker](https://docs.docker.com/engine/install/) or
 [Podman](https://podman.io/docs/installation).
 
 ## License
