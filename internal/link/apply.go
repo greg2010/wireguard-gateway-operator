@@ -236,6 +236,37 @@ func conntrackFlushCommands(previous, current []ResolvedForward) []command {
 // ResolveFunc resolves a Cluster-mode forward's backend Service to a concrete address.
 type ResolveFunc func(ctx context.Context, host string) (string, error)
 
+// responderProbeLatch remembers whether the last pass already warned about an unanswered health
+// probe, so a pass finding the same absence again stays silent.
+type responderProbeLatch struct {
+	warned bool
+}
+
+// warn logs msg once, with fields, on the transition to missing true, then stays silent until a
+// pass reports missing false, which clears the latch for the next transition.
+func (l *responderProbeLatch) warn(log *zap.SugaredLogger, missing bool, msg string, fields ...any) {
+	if !missing {
+		l.warned = false
+		return
+	}
+	if l.warned {
+		return
+	}
+	l.warned = true
+	log.Warnw(msg, fields...)
+}
+
+// warnUnansweredProbes warns, through latch, when the rendered config would leave the LB health
+// probe unanswered: no responder pod for Local on nodeName, or no responder target for Cluster.
+func warnUnansweredProbes(latch *responderProbeLatch, rc RuntimeConfig, nodeName string, log *zap.SugaredLogger) {
+	if rc.isLocal() {
+		_, ok := rc.Responders[nodeName]
+		latch.warn(log, !ok, "no responder pod on this node; health probes for this Gateway will fail", "node", nodeName)
+		return
+	}
+	latch.warn(log, rc.HealthPort > 0 && rc.ResponderTarget == "", "no responder target; health probes for this Gateway will fail")
+}
+
 // SlotResult is one slot's apply outcome.
 type SlotResult struct {
 	Slot    int
@@ -243,12 +274,11 @@ type SlotResult struct {
 	Err     error // nil when Applied
 }
 
-// Apply programs network state without concurrent calls. Local slot failures return in SlotResult.
-// previous is the forward set the last successful Apply programmed, nil on the first call; applied
-// is the forward set this call programmed. After the shared nft step, Apply flushes conntrack for
-// every tuple previous carries that applied no longer does.
-func Apply(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, previous, localForwards []ResolvedForward, log *zap.SugaredLogger) (results []SlotResult, applied []ResolvedForward, err error) {
-	wgConfPaths, nftRuleset, resolved, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, log)
+// applyConfig programs network state without concurrent calls; slot failures land in SlotResult.
+// previous is the last-applied forward set (nil on first call); it flushes stale conntrack.
+func applyConfig(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, previous, localForwards []ResolvedForward, nodeName string, latch *responderProbeLatch, log *zap.SugaredLogger) (results []SlotResult, applied []ResolvedForward, err error) {
+	warnUnansweredProbes(latch, rc, nodeName, log)
+	wgConfPaths, nftRuleset, resolved, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, nodeName, log)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -357,7 +387,7 @@ func runStep(ctx context.Context, run runner, c command, log *zap.SugaredLogger)
 
 // renderConfig writes 0600 per-slot configs and renders the shared ruleset. resolved is the
 // forward set actually used to render it: Cluster's freshly resolved set, or Local's localForwards.
-func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, log *zap.SugaredLogger) (wgConfPaths map[int]string, nftRuleset string, resolved []ResolvedForward, cleanup func(logFailures bool) error, err error) {
+func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve ResolveFunc, localForwards []ResolvedForward, nodeName string, log *zap.SugaredLogger) (wgConfPaths map[int]string, nftRuleset string, resolved []ResolvedForward, cleanup func(logFailures bool) error, err error) {
 	wgConfPaths = map[int]string{}
 	var paths []string
 	cleanup = func(logFailures bool) error {
@@ -432,7 +462,7 @@ func renderConfig(ctx context.Context, rc RuntimeConfig, privKey string, resolve
 			return nil, "", nil, nil, fmt.Errorf("resolve forwards: %w", err)
 		}
 	}
-	nftRuleset, err = RenderNftables(rc, resolved)
+	nftRuleset, err = RenderNftables(rc, resolved, nodeName)
 	if err != nil {
 		if cleanupErr := cleanup(true); cleanupErr != nil {
 			log.Warnw("remove wg conf temp files", "error", cleanupErr)

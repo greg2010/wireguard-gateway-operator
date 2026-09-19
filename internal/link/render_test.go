@@ -83,7 +83,7 @@ func TestRenderNftables(t *testing.T) {
 		{Name: "tcp-svc", PublicPort: 8443, Protocol: "tcp", Target: "10.96.1.1", TargetPort: 443},
 	}
 
-	out, err := RenderNftables(clusterRC(), forwards)
+	out, err := RenderNftables(clusterRC(), forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -112,40 +112,135 @@ func TestRenderNftables(t *testing.T) {
 	}
 }
 
-// TestRenderNftablesClusterInputAdmission verifies the admission rule: a
-// configured health port is accepted ahead of the drop that ends the input chain.
-func TestRenderNftablesClusterInputAdmission(t *testing.T) {
-	rc := clusterRC()
-	rc.HealthPort = 8080
-
-	out, err := RenderNftables(rc, nil)
-	if err != nil {
-		t.Fatalf("RenderNftables: %v", err)
+// TestRenderNftablesClusterResponderDNAT pins the rendered Cluster ruleset: the health-port DNAT
+// and its forward-chain accept only render when both HealthPort and ResponderTarget are set.
+func TestRenderNftablesClusterResponderDNAT(t *testing.T) {
+	forwards := []ResolvedForward{
+		{Name: "web", PublicPort: 8443, Protocol: "tcp", Target: "10.96.1.1", TargetPort: 443},
+		{Name: "game", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.2", TargetPort: 9000},
 	}
 
-	admitIdx := strings.Index(out, `iif "wg0" tcp dport 8080 accept`)
-	dropIdx := strings.Index(out, `iif "wg0" drop`)
-	if admitIdx < 0 {
-		t.Fatalf("missing health port admission rule:\n%s", out)
+	tcs := []struct {
+		name     string
+		rc       RuntimeConfig
+		forwards []ResolvedForward
+		want     string
+	}{
+		{
+			name: "health_port_and_responder_target_set_with_forwards",
+			rc: RuntimeConfig{
+				WireGuard:       WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort:      8080,
+				ResponderTarget: "10.96.5.5",
+				ResponderPort:   9090,
+			},
+			forwards: forwards,
+			want: `add table inet gateway
+flush table inet gateway
+table inet gateway {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iif "wg0" tcp dport 8443 dnat ip to 10.96.1.1 : 443
+		iif "wg0" udp dport 30000 dnat ip to 10.96.2.2 : 9000
+		iif "wg0" tcp dport 8080 dnat ip to 10.96.5.5 : 9090
 	}
-	if dropIdx < 0 {
-		t.Fatalf("missing input drop rule:\n%s", out)
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname != "wg0" masquerade
 	}
-	if admitIdx >= dropIdx {
-		t.Errorf("admission rule must precede drop: admit=%d drop=%d\n%s", admitIdx, dropIdx, out)
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		oifname "wg0" tcp flags syn tcp option maxseg size set rt mtu
+		ct state established,related accept
+		iif "wg0" ip daddr 10.96.1.1 tcp dport 443 accept
+		iif "wg0" ip daddr 10.96.2.2 udp dport 9000 accept
+		iif "wg0" ip daddr 10.96.5.5 tcp dport 9090 accept
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iif "wg0" drop
 	}
 }
-
-// TestRenderNftablesClusterNoHealthPortOmitsAdmission pins that an unset health port renders no
-// admission rule, keeping a config from an older operator or a test fixture unchanged.
-func TestRenderNftablesClusterNoHealthPortOmitsAdmission(t *testing.T) {
-	out, err := RenderNftables(clusterRC(), nil)
-	if err != nil {
-		t.Fatalf("RenderNftables: %v", err)
+`,
+		},
+		{
+			name: "health_port_set_no_responder_target",
+			rc: RuntimeConfig{
+				WireGuard:  WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort: 8080,
+			},
+			want: `add table inet gateway
+flush table inet gateway
+table inet gateway {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
 	}
-	want := []string{"type filter hook input priority filter; policy accept;", `iif "wg0" drop`}
-	if got := chainRules(t, out, "input"); !slices.Equal(got, want) {
-		t.Errorf("input chain rules = %v, want %v", got, want)
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname != "wg0" masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		oifname "wg0" tcp flags syn tcp option maxseg size set rt mtu
+		ct state established,related accept
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iif "wg0" drop
+	}
+}
+`,
+		},
+		{
+			name: "no_health_port_ignores_a_set_responder_target",
+			rc: RuntimeConfig{
+				WireGuard:       WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				ResponderTarget: "10.96.5.5",
+				ResponderPort:   9090,
+			},
+			want: `add table inet gateway
+flush table inet gateway
+table inet gateway {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname != "wg0" masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+		oifname "wg0" tcp flags syn tcp option maxseg size set rt mtu
+		ct state established,related accept
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iif "wg0" drop
+	}
+}
+`,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := RenderNftables(tc.rc, tc.forwards, "")
+			if err != nil {
+				t.Fatalf("RenderNftables: %v", err)
+			}
+			if out != tc.want {
+				t.Errorf("rendered ruleset =\n%s\nwant\n%s", out, tc.want)
+			}
+		})
 	}
 }
 
@@ -156,11 +251,11 @@ func TestRenderNftablesDeterministicAndSorted(t *testing.T) {
 		{Name: "b", PublicPort: 80, Protocol: "tcp", Target: "10.0.0.2", TargetPort: 80},
 	}
 
-	first, err := RenderNftables(clusterRC(), forwards)
+	first, err := RenderNftables(clusterRC(), forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (first): %v", err)
 	}
-	second, err := RenderNftables(clusterRC(), forwards)
+	second, err := RenderNftables(clusterRC(), forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (second): %v", err)
 	}
@@ -196,7 +291,7 @@ func TestRenderNftablesRetargetReferencesOnlyNewClusterIP(t *testing.T) {
 
 	before, err := RenderNftables(clusterRC(), []ResolvedForward{
 		{Name: svcName, PublicPort: port, Protocol: proto, Target: oldIP, TargetPort: target},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (before): %v", err)
 	}
@@ -206,7 +301,7 @@ func TestRenderNftablesRetargetReferencesOnlyNewClusterIP(t *testing.T) {
 
 	after, err := RenderNftables(clusterRC(), []ResolvedForward{
 		{Name: svcName, PublicPort: port, Protocol: proto, Target: newIP, TargetPort: target},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (after): %v", err)
 	}
@@ -230,7 +325,7 @@ func TestRenderNftablesRetargetReferencesOnlyNewClusterIP(t *testing.T) {
 }
 
 func TestRenderNftablesEmpty(t *testing.T) {
-	out, err := RenderNftables(clusterRC(), nil)
+	out, err := RenderNftables(clusterRC(), nil, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -260,7 +355,7 @@ func TestRenderNftablesClusterClampFirst(t *testing.T) {
 		{Name: "game", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.2", TargetPort: 9000},
 	}
 
-	out, err := RenderNftables(clusterRC(), forwards)
+	out, err := RenderNftables(clusterRC(), forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -303,7 +398,7 @@ func localRC(id int, slots ...int) RuntimeConfig {
 }
 
 // TestRenderNftablesLocal pins the exact fragment set of the Local ruleset: no masquerade, the
-// premark rules, both DNATs, the clamp, the forward and input rules, clamp before every accept.
+// premark, DNAT, clamp, forward and input rules. This node carries no Responders entry.
 func TestRenderNftablesLocal(t *testing.T) {
 	rc := localRC(3, 0)
 	forwards := []ResolvedForward{
@@ -311,7 +406,7 @@ func TestRenderNftablesLocal(t *testing.T) {
 		{Name: "game", PublicPort: 8081, Protocol: "udp", Target: "10.244.1.8", TargetPort: 8081},
 	}
 
-	out, err := RenderNftables(rc, forwards)
+	out, err := RenderNftables(rc, forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -321,10 +416,6 @@ func TestRenderNftablesLocal(t *testing.T) {
 		"flush table inet gw3",
 		`iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000`,
 		`ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000`,
-		"chain output {",
-		"type route hook output priority mangle; policy accept;",
-		`tcp sport 27003 ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000`,
-		`iifname "wg-gw3" tcp dport 27003 counter accept`,
 		`iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9080`,
 		`iifname "wg-gw3" udp dport 8081 counter dnat ip to 10.244.1.8 : 8081`,
 		`oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu`,
@@ -340,7 +431,7 @@ func TestRenderNftablesLocal(t *testing.T) {
 			t.Errorf("rendered local nftables missing %q\n---\n%s", frag, out)
 		}
 	}
-	wantChains := []string{"premark", "output", "prerouting", "forward", "input"}
+	wantChains := []string{"premark", "prerouting", "forward", "input"}
 	if got := renderedChains(out); !slices.Equal(got, wantChains) {
 		t.Errorf("local ruleset chains = %v, want %v", got, wantChains)
 	}
@@ -359,10 +450,74 @@ func TestRenderNftablesLocal(t *testing.T) {
 	}
 }
 
+// TestRenderNftablesLocalResponderDNAT pins the prerouting and forward chains as complete
+// literals, with and without a Responders entry for the rendering node.
+func TestRenderNftablesLocalResponderDNAT(t *testing.T) {
+	rc := localRC(3, 0)
+	rc.ResponderPort = 9090
+	forward := []ResolvedForward{{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080}}
+
+	t.Run("responder_entry_present_renders_the_health_dnat", func(t *testing.T) {
+		rc.Responders = map[string]string{"node-a": "10.244.2.9"}
+		out, err := RenderNftables(rc, forward, "node-a")
+		if err != nil {
+			t.Fatalf("RenderNftables: %v", err)
+		}
+		wantPrerouting := []string{
+			"type nat hook prerouting priority dstnat; policy accept;",
+			`iifname "wg-gw3" tcp dport 27003 counter dnat ip to 10.244.2.9 : 9090`,
+			`iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9080`,
+		}
+		if got := chainRules(t, out, "prerouting"); !slices.Equal(got, wantPrerouting) {
+			t.Errorf("prerouting chain = %v, want %v", got, wantPrerouting)
+		}
+		wantForward := []string{
+			"type filter hook forward priority filter; policy accept;",
+			`oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu`,
+			`iifname "wg-gw3" ct state established,related counter accept`,
+			`iifname "wg-gw3" ip daddr 10.244.2.9 tcp dport 9090 ct state new counter accept`,
+			`iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9080 ct state new counter accept`,
+			`iifname "wg-gw3" counter drop`,
+			`oifname "wg-gw3" ct state established,related counter accept`,
+			`oifname "wg-gw3" counter drop`,
+		}
+		if got := chainRules(t, out, "forward"); !slices.Equal(got, wantForward) {
+			t.Errorf("forward chain = %v, want %v", got, wantForward)
+		}
+	})
+
+	t.Run("no_responder_entry_renders_only_the_forwards_dnat", func(t *testing.T) {
+		rc.Responders = map[string]string{"node-b": "10.244.2.9"}
+		out, err := RenderNftables(rc, forward, "node-a")
+		if err != nil {
+			t.Fatalf("RenderNftables: %v", err)
+		}
+		wantPrerouting := []string{
+			"type nat hook prerouting priority dstnat; policy accept;",
+			`iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9080`,
+		}
+		if got := chainRules(t, out, "prerouting"); !slices.Equal(got, wantPrerouting) {
+			t.Errorf("prerouting chain = %v, want %v", got, wantPrerouting)
+		}
+		wantForward := []string{
+			"type filter hook forward priority filter; policy accept;",
+			`oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu`,
+			`iifname "wg-gw3" ct state established,related counter accept`,
+			`iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9080 ct state new counter accept`,
+			`iifname "wg-gw3" counter drop`,
+			`oifname "wg-gw3" ct state established,related counter accept`,
+			`oifname "wg-gw3" counter drop`,
+		}
+		if got := chainRules(t, out, "forward"); !slices.Equal(got, wantForward) {
+			t.Errorf("forward chain = %v, want %v", got, wantForward)
+		}
+	})
+}
+
 // TestRenderNftablesLocalMultiSlot covers the Local-mode multi-slot render invariants.
 func TestRenderNftablesLocalMultiSlot(t *testing.T) {
 	t.Run("local_peer_list_gap_keeps_remaining_identity", func(t *testing.T) {
-		out, err := RenderNftables(localRC(7, 0, 2), nil)
+		out, err := RenderNftables(localRC(7, 0, 2), nil, "")
 		if err != nil {
 			t.Fatalf("RenderNftables: %v", err)
 		}
@@ -375,7 +530,7 @@ func TestRenderNftablesLocalMultiSlot(t *testing.T) {
 	// local_two_slots_disjoint_marks_tables: slot 0 and slot 2's marks/tables/interfaces are
 	// pairwise distinct, and slot 0 matches identity_test.go's pinned single-slot values exactly.
 	t.Run("local_two_slots_disjoint_marks_tables", func(t *testing.T) {
-		out, err := RenderNftables(localRC(3, 0, 2), nil)
+		out, err := RenderNftables(localRC(3, 0, 2), nil, "")
 		if err != nil {
 			t.Fatalf("RenderNftables: %v", err)
 		}
@@ -389,9 +544,9 @@ func TestRenderNftablesLocalMultiSlot(t *testing.T) {
 			t.Errorf("slot 0 = %+v, want %+v (identity_test.go's pinned single-slot values)", slot0, want)
 		}
 		for _, slot := range []SlotIdentity{slot0, slot2} {
-			want := `tcp sport 27003 ct direction reply ct mark and ` + slot.MarkMask + ` == ` + slot.Mark + ` counter meta mark set meta mark and 0x0000ffff or ` + slot.Mark
+			want := `ct direction reply ct mark and ` + slot.MarkMask + ` == ` + slot.Mark + ` counter meta mark set meta mark and 0x0000ffff or ` + slot.Mark
 			if strings.Count(out, want) != 1 {
-				t.Errorf("rendered local nftables output chain has %d rules matching %q, want exactly 1\n---\n%s", strings.Count(out, want), want, out)
+				t.Errorf("rendered local nftables premark chain has %d rules matching %q, want exactly 1\n---\n%s", strings.Count(out, want), want, out)
 			}
 		}
 		for _, frag := range []string{
@@ -421,10 +576,6 @@ flush table inet gw5
 table inet gw5 {
 	chain premark {
 		type filter hook prerouting priority mangle; policy accept;
-	}
-
-	chain output {
-		type route hook output priority mangle; policy accept;
 	}
 
 	chain prerouting {
@@ -473,7 +624,7 @@ table inet gateway {
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := RenderNftables(tc.rc, nil)
+			out, err := RenderNftables(tc.rc, nil, "")
 			if err != nil {
 				t.Fatalf("RenderNftables: %v", err)
 			}
@@ -490,7 +641,7 @@ func TestRenderNftablesKeepMaskComplementsMarkMask(t *testing.T) {
 	if want := "0xffff0000"; markMask != want {
 		t.Fatalf("markMask = %q, want %q (this test pins keepMask against the identity-derived mask)", markMask, want)
 	}
-	out, err := RenderNftables(localRC(3, 0), nil)
+	out, err := RenderNftables(localRC(3, 0), nil, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -513,11 +664,11 @@ func TestRenderNftablesLocalDeterministic(t *testing.T) {
 		{Name: "b", PublicPort: 80, Protocol: "tcp", Target: "10.244.1.2", TargetPort: 80},
 	}
 
-	first, err := RenderNftables(rc, forwards)
+	first, err := RenderNftables(rc, forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (first): %v", err)
 	}
-	second, err := RenderNftables(rc, forwards)
+	second, err := RenderNftables(rc, forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables (second): %v", err)
 	}

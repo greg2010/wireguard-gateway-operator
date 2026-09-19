@@ -28,36 +28,6 @@ func dpRuntimeConfig(slots ...int) RuntimeConfig {
 	}
 }
 
-// wantFenceRuleset is the document a replica admitting exactly ifaces installs. Its literal form
-// is pinned by TestFencingRuleset.
-func wantFenceRuleset(ifaces ...string) string {
-	ident := NewGatewayIdentity(dpLinkID)
-	var b strings.Builder
-	for _, stmt := range []string{"add table inet fence-%[1]s\n", "flush table inet fence-%[1]s\n", "table inet fence-%[1]s {\n"} {
-		fmt.Fprintf(&b, stmt, ident.NftTable)
-	}
-	b.WriteString("\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n")
-	fmt.Fprintf(&b, "\t\ttcp dport %d iifname \"lo\" accept\n", ident.HealthPort)
-	for _, iface := range ifaces {
-		fmt.Fprintf(&b, "\t\ttcp dport %d iifname %q accept\n", ident.HealthPort, iface)
-	}
-	fmt.Fprintf(&b, "\t\ttcp dport %d drop\n\t}\n}\n", ident.HealthPort)
-	return b.String()
-}
-
-// lastFence returns the document the last `nft -f -` step loaded, which is the fence a pass
-// re-renders at its end.
-func lastFence(t *testing.T, cmds []command) string {
-	t.Helper()
-	for _, cmd := range slices.Backward(cmds) {
-		if cmd.name == "nft" && slices.Equal(cmd.args, []string{"-f", "-"}) {
-			return cmd.stdin
-		}
-	}
-	t.Fatalf("no fence render among %d commands: %v", len(cmds), cmds)
-	return ""
-}
-
 // ipSteps returns the argv of every ip(8) command run, in order.
 func ipSteps(cmds []command) [][]string {
 	steps := [][]string{}
@@ -94,62 +64,6 @@ func applyPassWith(t *testing.T, d *dataPlane, run runner, rc RuntimeConfig, res
 		t.Fatalf("applyPass: %v", err)
 	}
 	return got
-}
-
-// TestFenceAdmitsExactlyTheAppliedSlots admits only slots whose pass applied.
-func TestFenceAdmitsExactlyTheAppliedSlots(t *testing.T) {
-	tcs := []struct {
-		name    string
-		slots   []int
-		passes  [][]SlotResult
-		wantIfa []string
-	}{
-		{
-			name:    "every_slot_applied_admits_every_interface",
-			slots:   []int{0, 2},
-			passes:  [][]SlotResult{resultsFor([]int{0, 2})},
-			wantIfa: []string{"wg-gw3", "wg-gw3-2"},
-		},
-		{
-			name:    "slot_down_after_an_applied_pass_loses_admission",
-			slots:   []int{0, 2},
-			passes:  [][]SlotResult{resultsFor([]int{0, 2}), resultsFor([]int{0, 2}, 2)},
-			wantIfa: []string{"wg-gw3"},
-		},
-		{
-			name:    "slot_never_applied_is_not_admitted",
-			slots:   []int{0, 2},
-			passes:  [][]SlotResult{resultsFor([]int{0, 2}, 2)},
-			wantIfa: []string{"wg-gw3"},
-		},
-		{
-			name:    "failed_slot_is_readmitted_by_its_next_successful_pass",
-			slots:   []int{0, 2},
-			passes:  [][]SlotResult{resultsFor([]int{0, 2}, 2), resultsFor([]int{0, 2})},
-			wantIfa: []string{"wg-gw3", "wg-gw3-2"},
-		},
-		{
-			name:    "no_applied_slot_admits_no_interface",
-			slots:   []int{0, 2},
-			passes:  [][]SlotResult{resultsFor([]int{0, 2}, 0, 2)},
-			wantIfa: nil,
-		},
-	}
-
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			rc := dpRuntimeConfig(tc.slots...)
-			d := newDataPlane(rc)
-			rec := &runRecorder{}
-			for _, results := range tc.passes {
-				applyPassWith(t, d, rec.run, rc, results)
-			}
-			want := wantFenceRuleset(tc.wantIfa...)
-			if got := lastFence(t, rec.snapshot()); got != want {
-				t.Errorf("fence after the pass = %q, want %q", got, want)
-			}
-		})
-	}
 }
 
 // TestDepartedSlotTeardown retains failed departures for the next pass.
@@ -218,10 +132,6 @@ func TestDepartedSlotTeardown(t *testing.T) {
 			if held := d.heldSlots(); !slices.Equal(held, tc.wantHeld) {
 				t.Errorf("held slots = %v, want %v", held, tc.wantHeld)
 			}
-			want := wantFenceRuleset("wg-gw3")
-			if fence := lastFence(t, rec.snapshot()); fence != want {
-				t.Errorf("fence after the departure = %q, want %q", fence, want)
-			}
 		})
 	}
 }
@@ -281,39 +191,32 @@ func TestStandbyPass(t *testing.T) {
 		otherHolder bool
 		leader      bool
 		wantSteps   [][]string
-		wantFence   bool
-		wantIfaces  []string
 		wantHeld    []int
 	}{
 		{
-			name:        "standby_holding_nothing_admits_no_interface",
+			name:        "standby_holding_nothing_runs_no_command",
 			configSlots: []int{0},
 			wantSteps:   [][]string{},
-			wantFence:   true,
 			wantHeld:    []int{},
 		},
 		{
-			name:        "standby_keeps_an_inherited_slot_and_admits_no_interface",
+			name:        "standby_keeps_an_inherited_slot_with_no_observed_holder",
 			configSlots: []int{0},
 			inherited:   []int{0},
 			wantSteps:   [][]string{},
-			wantFence:   true,
 			wantHeld:    []int{0},
 		},
 		{
 			name:      "standby_keeps_an_inherited_slot_the_config_no_longer_lists",
 			inherited: []int{0},
 			wantSteps: [][]string{},
-			wantFence: true,
 			wantHeld:  []int{0},
 		},
 		{
-			name:        "standby_keeps_a_slot_its_own_pass_applied_and_admits_it",
+			name:        "standby_keeps_a_slot_its_own_pass_applied_with_no_observed_holder",
 			configSlots: []int{0},
 			applied:     []int{0},
 			wantSteps:   [][]string{},
-			wantFence:   true,
-			wantIfaces:  []string{slot0.Interface},
 			wantHeld:    []int{0},
 		},
 		{
@@ -322,7 +225,6 @@ func TestStandbyPass(t *testing.T) {
 			inherited:   []int{0},
 			otherHolder: true,
 			wantSteps:   slotSteps,
-			wantFence:   true,
 			wantHeld:    []int{},
 		},
 		{
@@ -331,7 +233,6 @@ func TestStandbyPass(t *testing.T) {
 			applied:     []int{0},
 			otherHolder: true,
 			wantSteps:   slotSteps,
-			wantFence:   true,
 			wantHeld:    []int{},
 		},
 		{
@@ -364,22 +265,15 @@ func TestStandbyPass(t *testing.T) {
 				t.Fatalf("standbyPass: %v", err)
 			}
 
-			if steps := ipSteps(rec.snapshot()); !slices.EqualFunc(steps, tc.wantSteps, slices.Equal) {
+			cmds := rec.snapshot()
+			if steps := ipSteps(cmds); !slices.EqualFunc(steps, tc.wantSteps, slices.Equal) {
 				t.Errorf("standby steps = %v, want %v", steps, tc.wantSteps)
 			}
 			if held := d.heldSlots(); !slices.Equal(held, tc.wantHeld) {
 				t.Errorf("held slots = %v, want %v", held, tc.wantHeld)
 			}
-			cmds := rec.snapshot()
-			if !tc.wantFence {
-				if len(cmds) != 0 {
-					t.Fatalf("a holder's standby pass ran %d commands, want none: %v", len(cmds), cmds)
-				}
-				return
-			}
-			want := wantFenceRuleset(tc.wantIfaces...)
-			if got := lastFence(t, cmds); got != want {
-				t.Errorf("standby fence = %q, want %q", got, want)
+			if len(cmds) != len(tc.wantSteps) {
+				t.Errorf("standby pass ran %d commands, want exactly its %d ip steps: %v", len(cmds), len(tc.wantSteps), cmds)
 			}
 		})
 	}
@@ -441,15 +335,15 @@ func TestStandbyPassAfterAFailedTeardown(t *testing.T) {
 				t.Fatalf("standbyPass: %v", err)
 			}
 
-			if steps := ipSteps(rec.snapshot()); !slices.EqualFunc(steps, tc.wantSteps, slices.Equal) {
+			cmds := rec.snapshot()
+			if steps := ipSteps(cmds); !slices.EqualFunc(steps, tc.wantSteps, slices.Equal) {
 				t.Errorf("standby steps = %v, want %v", steps, tc.wantSteps)
 			}
 			if held := d.heldSlots(); !slices.Equal(held, tc.wantHeld) {
 				t.Errorf("held slots after the standby pass = %v, want %v", held, tc.wantHeld)
 			}
-			want := wantFenceRuleset()
-			if got := lastFence(t, rec.snapshot()); got != want {
-				t.Errorf("fence after the standby pass = %q, want %q", got, want)
+			if len(cmds) != len(tc.wantSteps) {
+				t.Errorf("standby pass ran %d commands, want exactly its %d ip steps: %v", len(cmds), len(tc.wantSteps), cmds)
 			}
 		})
 	}
@@ -476,20 +370,19 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 		"ip route flush table " + table + " type throw",
 		"ip rule add fwmark " + slot0.Mark + "/" + slot0.MarkMask + " lookup " + table + " priority " + rulePriority,
 		"nft -f -",
-		"nft -f -",
 	}
 
 	tcs := []struct {
 		name string
-		// standbyFirst runs the watcher's initial callback before leadership, the race the
-		// restarted holder loses.
+		// standbyFirst runs the watcher's initial callback before leadership; it runs no
+		// command, since standbyPass leaves a held slot untouched absent an observed holder.
 		standbyFirst bool
 		wantSteps    []string
 	}{
 		{
 			name:         "the_standby_pass_that_precedes_leadership_keeps_the_interface",
 			standbyFirst: true,
-			wantSteps:    append([]string{"nft -f -"}, applySteps...),
+			wantSteps:    applySteps,
 		},
 		{
 			name:      "leadership_without_an_earlier_standby_pass",
@@ -514,7 +407,7 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 			}
 
 			results, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-				return Apply(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, previous, nil, testLogger(t))
+				return applyConfig(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, previous, nil, "", &responderProbeLatch{}, testLogger(t))
 			}, testLogger(t))
 			if err != nil {
 				t.Fatalf("applyPass: %v", err)
@@ -526,10 +419,6 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 			}
 			if held := d.heldSlots(); !slices.Equal(held, []int{0}) {
 				t.Errorf("held slots after the apply = %v, want %v", held, []int{0})
-			}
-			want := wantFenceRuleset(slot0.Interface)
-			if got := lastFence(t, rec.snapshot()); got != want {
-				t.Errorf("fence after the apply = %q, want %q", got, want)
 			}
 		})
 	}
@@ -611,8 +500,8 @@ func TestApplyPassThreadsForwards(t *testing.T) {
 	}
 }
 
-// TestStepDown pins the step-down fence in both modes: the data-plane table goes first, then
-// every slot this replica holds, and Local ends by re-rendering its fence from what remains.
+// TestStepDown pins step-down's teardown plan in both modes: the data-plane table goes first,
+// then every slot this replica holds.
 func TestStepDown(t *testing.T) {
 	slot0, slot2 := NewSlotIdentity(dpLinkID, 0), NewSlotIdentity(dpLinkID, 2)
 
@@ -636,15 +525,10 @@ func TestStepDown(t *testing.T) {
 			{"ip", "rule", "del", "fwmark", slot2.Mark + "/" + slot2.MarkMask, "lookup", "100515", "priority", rulePriority},
 			{"ip", "route", "flush", "table", "100515"},
 			{"ip", "link", "del", slot2.Interface},
-			{"nft", "-f", "-"},
 		}
 		assertRanPlan(t, cmds, wantPlan)
 		if held := d.heldSlots(); !slices.Equal(held, []int{}) {
 			t.Errorf("held slots after the step-down = %v, want none", held)
-		}
-		want := wantFenceRuleset()
-		if got := lastFence(t, cmds); got != want {
-			t.Errorf("fence after the step-down = %q, want %q", got, want)
 		}
 	})
 
@@ -681,7 +565,6 @@ func TestStepDown(t *testing.T) {
 			{"ip", "rule", "del", "fwmark", slot0.Mark + "/" + slot0.MarkMask, "lookup", "100003", "priority", rulePriority},
 			{"ip", "route", "flush", "table", "100003"},
 			{"ip", "link", "del", slot0.Interface},
-			{"nft", "-f", "-"},
 		})
 	})
 }
@@ -711,7 +594,6 @@ func TestFirstAttemptedSlotIsHeld(t *testing.T) {
 		{"ip", "rule", "del", "fwmark", slot2.Mark + "/" + slot2.MarkMask, "lookup", "100515", "priority", rulePriority},
 		{"ip", "route", "flush", "table", "100515"},
 		{"ip", "link", "del", slot2.Interface},
-		{"nft", "-f", "-"},
 	}
 
 	tcs := []struct {
@@ -759,7 +641,7 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 
 	pass := func(rec *runRecorder, d *dataPlane, rc RuntimeConfig) error {
 		_, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-			return Apply(ctx, rec.run, rc, "priv", resolve, previous, nil, testLogger(t))
+			return applyConfig(ctx, rec.run, rc, "priv", resolve, previous, nil, "", &responderProbeLatch{}, testLogger(t))
 		}, testLogger(t))
 		return err
 	}
@@ -767,8 +649,7 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 	first := dpApplyConfig(0, 2)
 	d := newDataPlane(first)
 	failing := &runRecorder{hook: func(c command) error {
-		// The fence render is an nft -f - too; only the data-plane ruleset fails here.
-		if c.name == "nft" && !strings.Contains(c.stdin, "fence-") {
+		if c.name == "nft" {
 			return nftErr
 		}
 		return nil
@@ -802,7 +683,6 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 		"ip route flush table 100003 type throw",
 		"ip rule add fwmark " + slot0.Mark + "/" + slot0.MarkMask + " lookup 100003 priority " + rulePriority,
 		"nft -f -",
-		"nft -f -",
 	}
 	cmds := rec.snapshot()
 	if steps := stepLines(t, cmds); !slices.Equal(steps, wantPlan) {
@@ -810,9 +690,6 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 	}
 	if held := d.heldSlots(); !slices.Equal(held, []int{0}) {
 		t.Errorf("held slots after the departure = %v, want %v", held, []int{0})
-	}
-	if fence, want := lastFence(t, cmds), wantFenceRuleset(slot0.Interface); fence != want {
-		t.Errorf("fence after the second pass = %q, want %q", fence, want)
 	}
 }
 
@@ -842,13 +719,13 @@ func TestStandbyPassOtherHolderEvidenceIsPerTerm(t *testing.T) {
 	}{
 		{
 			name:      "acquisition_clears_prior_holder_evidence_and_keeps_held_slot",
-			wantSteps: []string{"nft -f -"},
+			wantSteps: []string{},
 			wantHeld:  []int{0},
 		},
 		{
 			name:       "new_holder_observation_after_acquisition_tears_down_held_slot",
 			observeNew: true,
-			wantSteps:  []string{strings.Join(teardown[0], " "), strings.Join(teardown[1], " "), strings.Join(teardown[2], " "), "nft -f -"},
+			wantSteps:  []string{strings.Join(teardown[0], " "), strings.Join(teardown[1], " "), strings.Join(teardown[2], " ")},
 			wantHeld:   []int{},
 		},
 	}

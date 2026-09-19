@@ -9,18 +9,12 @@ table inet {{ .Table }} {
 {{- end }}
 	}
 
-	chain output {
-		type route hook output priority mangle; policy accept;
-{{- range $s := .Slots }}
-{{- if gt $.HealthPort 0 }}
-		tcp sport {{ $.HealthPort }} ct direction reply ct mark and {{ $s.MarkMask }} == {{ $s.Mark }} counter meta mark set meta mark and {{ $s.KeepMask }} or {{ $s.Mark }}
-{{- end }}
-{{- end }}
-	}
-
 	chain prerouting {
 		type nat hook prerouting priority dstnat; policy accept;
 {{- range $s := .Slots }}
+{{- if $.ResponderIP }}
+		iifname "{{ $s.Interface }}" tcp dport {{ $.HealthPort }} counter dnat ip to {{ $.ResponderIP }} : {{ $.ResponderPort }}
+{{- end }}
 {{- range $f := $.Forwards }}
 		iifname "{{ $s.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
 {{- end }}
@@ -32,6 +26,9 @@ table inet {{ .Table }} {
 {{- range $s := .Slots }}
 		oifname "{{ $s.Interface }}" tcp flags syn counter tcp option maxseg size set rt mtu
 		iifname "{{ $s.Interface }}" ct state established,related counter accept
+{{- if $.ResponderIP }}
+		iifname "{{ $s.Interface }}" ip daddr {{ $.ResponderIP }} tcp dport {{ $.ResponderPort }} ct state new counter accept
+{{- end }}
 {{- range $f := $.Forwards }}
 		iifname "{{ $s.Interface }}" ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} ct state new counter accept
 {{- end }}
@@ -44,9 +41,6 @@ table inet {{ .Table }} {
 	chain input {
 		type filter hook input priority filter; policy accept;
 {{- range $s := .Slots }}
-{{- if gt $.HealthPort 0 }}
-		iifname "{{ $s.Interface }}" tcp dport {{ $.HealthPort }} counter accept
-{{- end }}
 		iifname "{{ $s.Interface }}" counter drop
 {{- end }}
 	}

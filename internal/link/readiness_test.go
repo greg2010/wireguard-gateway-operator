@@ -385,103 +385,6 @@ func TestReadinessFaultSlotsStepDown(t *testing.T) {
 	}
 }
 
-// TestReadyForwarded verifies: /forwarded-healthz answers 200 only for the active
-// holder with an applied dataplane, ignoring the handshake kubeletStatus checks.
-func TestReadyForwarded(t *testing.T) {
-	tcs := []struct {
-		name   string
-		local  bool
-		leader bool
-		fault  string
-		slots  []SlotResult
-		want   bool
-	}{
-		{
-			name:   "forwarded_route_200_only_on_active_holder_with_applied_dataplane",
-			local:  true,
-			leader: true,
-			slots:  []SlotResult{{Slot: 0, Applied: true}},
-			want:   true,
-		},
-		{
-			name:   "standby_never_answers_forwarded_even_with_applied_dataplane",
-			local:  true,
-			leader: false,
-			slots:  []SlotResult{{Slot: 0, Applied: true}},
-			want:   false,
-		},
-		{
-			name:   "holder_with_no_applied_slot_fails_forwarded",
-			local:  true,
-			leader: true,
-			slots:  []SlotResult{{Slot: 0, Applied: false}},
-			want:   false,
-		},
-		{
-			name:   "holder_with_gateway_fault_fails_forwarded",
-			local:  true,
-			leader: true,
-			fault:  FaultApplyFailed,
-			slots:  []SlotResult{{Slot: 0, Applied: true}},
-			want:   false,
-		},
-		{
-			name:   "local_pending_fleet_applies_no_slot_and_fails_forwarded",
-			local:  true,
-			leader: true,
-			slots:  []SlotResult{},
-			want:   false,
-		},
-		{
-			name:   "cluster_mode_ruleset_alone_gates_forwarded",
-			leader: true,
-			slots:  nil,
-			want:   true,
-		},
-	}
-
-	for _, tc := range tcs {
-		t.Run(tc.name, func(t *testing.T) {
-			rd := newReadiness(tc.local, 3, time.Now, nil, testLogger(t))
-			rd.setLeader(tc.leader)
-			rd.setFault(tc.fault)
-			rd.setPass(tc.slots, len(tc.slots), 25, true)
-			if got := rd.readyForwarded(); got != tc.want {
-				t.Errorf("readyForwarded = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestForwardedHandler covers /forwarded-healthz, which ignores Host and User-Agent entirely.
-func TestForwardedHandler(t *testing.T) {
-	rd := newReadiness(true, 3, time.Now, nil, testLogger(t))
-	rd.setLeader(true)
-	rd.setPass([]SlotResult{{Slot: 0, Applied: true}}, 1, 25, true)
-
-	for _, headers := range []struct{ host, userAgent string }{
-		{},
-		{host: "attacker.example", userAgent: "curl/8.0"},
-		{host: "kubelet-probe", userAgent: "kube-probe/1.30"},
-	} {
-		req := httptest.NewRequest(http.MethodGet, "/forwarded-healthz", nil)
-		if headers.host != "" {
-			req.Host = headers.host
-		}
-		if headers.userAgent != "" {
-			req.Header.Set("User-Agent", headers.userAgent)
-		}
-		rec := httptest.NewRecorder()
-		rd.forwardedHandler(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Errorf("status = %d, want %d (host=%q, user-agent=%q)", rec.Code, http.StatusOK, headers.host, headers.userAgent)
-		}
-		if got := rec.Body.String(); got != "ok" {
-			t.Errorf("body = %q, want %q", got, "ok")
-		}
-	}
-}
-
 // TestHealthzFaultfreeStandby accepts a fault-free standby.
 func TestHealthzFaultfreeStandby(t *testing.T) {
 	rd := newReadiness(true, 3, time.Now, nil, testLogger(t))
@@ -692,34 +595,29 @@ func TestHealthzAcrossALeadershipTransition(t *testing.T) {
 	rd := newReadiness(true, 3, time.Now, nil, testLogger(t))
 
 	steps := []struct {
-		name          string
-		act           func()
-		wantHealthz   int
-		wantForwarded int
+		name        string
+		act         func()
+		wantHealthz int
 	}{
 		{
-			name:          "first_cycle_applied_an_empty_fleet",
-			act:           func() { rd.setLeader(true); rd.setPass([]SlotResult{}, 0, 0, true) },
-			wantHealthz:   http.StatusOK,
-			wantForwarded: http.StatusServiceUnavailable,
+			name:        "first_cycle_applied_an_empty_fleet",
+			act:         func() { rd.setLeader(true); rd.setPass([]SlotResult{}, 0, 0, true) },
+			wantHealthz: http.StatusOK,
 		},
 		{
-			name:          "stepped_down",
-			act:           func() { rd.setLeader(false); rd.setFault("") },
-			wantHealthz:   http.StatusOK,
-			wantForwarded: http.StatusServiceUnavailable,
+			name:        "stepped_down",
+			act:         func() { rd.setLeader(false); rd.setFault("") },
+			wantHealthz: http.StatusOK,
 		},
 		{
-			name:          "reacquired_before_its_first_pass",
-			act:           func() { rd.setLeader(true) },
-			wantHealthz:   http.StatusServiceUnavailable,
-			wantForwarded: http.StatusServiceUnavailable,
+			name:        "reacquired_before_its_first_pass",
+			act:         func() { rd.setLeader(true) },
+			wantHealthz: http.StatusServiceUnavailable,
 		},
 		{
-			name:          "first_pass_of_the_new_cycle_applied",
-			act:           func() { rd.setPass([]SlotResult{}, 0, 0, true) },
-			wantHealthz:   http.StatusOK,
-			wantForwarded: http.StatusServiceUnavailable,
+			name:        "first_pass_of_the_new_cycle_applied",
+			act:         func() { rd.setPass([]SlotResult{}, 0, 0, true) },
+			wantHealthz: http.StatusOK,
 		},
 	}
 
@@ -728,9 +626,6 @@ func TestHealthzAcrossALeadershipTransition(t *testing.T) {
 			step.act()
 			if got := probeCode(rd.handler, "/healthz"); got != step.wantHealthz {
 				t.Errorf("/healthz status = %d, want %d", got, step.wantHealthz)
-			}
-			if got := probeCode(rd.forwardedHandler, "/forwarded-healthz"); got != step.wantForwarded {
-				t.Errorf("/forwarded-healthz status = %d, want %d", got, step.wantForwarded)
 			}
 		})
 	}

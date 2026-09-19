@@ -181,8 +181,8 @@ func TestServeHealthHandler(t *testing.T) {
 	}
 }
 
-// TestServeHealthServesAndDrains confirms /healthz and /forwarded-healthz both answer over the
-// wire, then cancels and asserts a graceful nil return.
+// TestServeHealthServesAndDrains confirms /healthz answers over the wire, then cancels and
+// asserts a graceful nil return.
 func TestServeHealthServesAndDrains(t *testing.T) {
 	now := time.Unix(1700001000, 0)
 	rd := newReadiness(true, 3, func() time.Time { return now }, func(_ context.Context, _ string) (string, error) {
@@ -199,10 +199,6 @@ func TestServeHealthServesAndDrains(t *testing.T) {
 	body := getBody(t, addr, "/healthz")
 	if body != "ok" {
 		t.Errorf("healthz body = %q, want ok", body)
-	}
-	forwardedBody := getBody(t, addr, "/forwarded-healthz")
-	if forwardedBody != "ok" {
-		t.Errorf("forwarded-healthz body = %q, want ok", forwardedBody)
 	}
 
 	cancel()
@@ -414,28 +410,4 @@ func actionResources(actions []k8stesting.Action) []string {
 		resources = append(resources, action.GetResource().Resource)
 	}
 	return resources
-}
-
-// TestFencingInstalledBeforeListenerBinds installs the Local fence before listener startup.
-func TestFencingInstalledBeforeListenerBinds(t *testing.T) {
-	dir := t.TempDir()
-	body := `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"nftTable":"gw3","healthPort":27003},"podSelector":{"app":"gateway-link"},` +
-		`"wireguard":{"address":"10.244.1.7/32","peers":[{"slot":0,"publicKey":"PUB=","endpoint":"203.0.113.5:51820","allowedIPs":["0.0.0.0/0"]}]},` +
-		`"forwards":[{"name":"web","publicPort":443,"protocol":"tcp","namespace":"default","serviceName":"web"}]}`
-
-	cfg := Config{
-		ConfigPath: filepath.Join(dir, "config.json"),
-		WGKeyPath:  filepath.Join(dir, "priv"),
-		NodeName:   "node-a",
-	}
-	writeConfig(t, cfg.ConfigPath, body)
-	writeConfig(t, cfg.WGKeyPath, "priv-key-material=")
-
-	err := Run(context.Background(), cfg, testLogger(t))
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "install fencing table") {
-		t.Errorf("error = %q, want it to name the fencing install step, proving Run reached it before the in-cluster client or the health listener", err.Error())
-	}
 }

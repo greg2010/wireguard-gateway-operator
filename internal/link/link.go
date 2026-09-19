@@ -43,20 +43,6 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	}
 
 	dp := newDataPlane(rc)
-	if rc.isLocal() {
-		// No slot is admitted yet: this replica has applied none, and the fence admits the
-		// health port on exactly the interfaces of the slots its own passes applied.
-		if err := InstallFencing(ctx, execCommand, rc, nil); err != nil {
-			return fmt.Errorf("install fencing table: %w", err)
-		}
-		// Deferred first so Go's LIFO order runs it last, after every other cleanup this
-		// function defers below and after g.Wait() has returned serveHealth.
-		defer func() {
-			if err := RemoveFencing(context.Background(), execCommand, rc); err != nil {
-				log.Warnw("remove fencing table", "error", err)
-			}
-		}()
-	}
 
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -108,7 +94,7 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 
 	apply := func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward) ([]SlotResult, error) {
 		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-			return Apply(ctx, execCommand, rc, privKey, resolve, previous, localForwards, log)
+			return applyConfig(ctx, execCommand, rc, privKey, resolve, previous, localForwards, cfg.NodeName, &dp.probeLatch, log)
 		}, log)
 	}
 	reconcile := newLeaderReconcile(cs, cfg, rd, preCheck, apply, log)
@@ -118,7 +104,7 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 		g.Go(func() error {
 			return watchLocalForwards(gctx, cfg, ew, rc.Identity, func(ctx context.Context, accepted RuntimeConfig) {
 				if err := dp.standbyPass(ctx, execCommand, accepted, rd.isLeader, log); err != nil {
-					log.Warnw("maintain the standby's fence", "error", err)
+					log.Warnw("maintain the standby's data plane", "error", err)
 				}
 			}, log)
 		})
@@ -236,7 +222,6 @@ func readKeyFile(path string) (string, error) {
 func serveHealth(ctx context.Context, rd *readiness, cs kubernetes.Interface, cfg Config, log *zap.SugaredLogger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", rd.handler)
-	mux.HandleFunc("/forwarded-healthz", rd.forwardedHandler)
 	srv := &http.Server{Addr: cfg.HealthAddr, Handler: mux}
 
 	errCh := make(chan error, 1)

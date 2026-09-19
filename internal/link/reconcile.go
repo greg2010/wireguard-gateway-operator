@@ -73,7 +73,7 @@ func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identi
 		changed := cfgDigest != lastConfigDigest
 		var rulesetDig string
 		if ew != nil {
-			ruleset, err := RenderNftables(rc, forwards)
+			ruleset, err := RenderNftables(rc, forwards, cfg.NodeName)
 			if err != nil {
 				log.Warnw("render nftables ruleset for digest", "error", err)
 				return
@@ -137,7 +137,7 @@ func watchLocalForwards(ctx context.Context, cfg Config, ew *endpointWatcher, id
 }
 
 // loadRuntimeConfigMatching loads the RuntimeConfig at path and rejects one whose mode or identity
-// differs from startup's: the watcher, RBAC, netns and fence names are fixed at process start.
+// differs from startup's: the watcher, RBAC and data-plane table names are fixed at process start.
 func loadRuntimeConfigMatching(path string, startup *GatewayIdentity) (RuntimeConfig, error) {
 	rc, err := LoadRuntimeConfig(path)
 	if err != nil {

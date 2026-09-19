@@ -203,20 +203,6 @@ func (r *readiness) anyFreshSlot(ctx context.Context) bool {
 	return false
 }
 
-// readyForwarded accepts only the applied holder with an applied Local slot.
-func (r *readiness) readyForwarded() bool {
-	if !r.isLeader() || !r.applied.Load() {
-		return false
-	}
-	if r.gatingFault() != "" {
-		return false
-	}
-	if !r.local {
-		return true
-	}
-	return slices.ContainsFunc(r.snapshotSlots(), func(s SlotResult) bool { return s.Applied })
-}
-
 func (r *readiness) handler(w http.ResponseWriter, req *http.Request) {
 	ready, body := r.kubeletStatus(req.Context())
 	if ready {
@@ -226,16 +212,6 @@ func (r *readiness) handler(w http.ResponseWriter, req *http.Request) {
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
 	r.writeReadinessBody(w, body)
-}
-
-func (r *readiness) forwardedHandler(w http.ResponseWriter, _ *http.Request) {
-	if r.readyForwarded() {
-		w.WriteHeader(http.StatusOK)
-		r.writeReadinessBody(w, "ok")
-		return
-	}
-	w.WriteHeader(http.StatusServiceUnavailable)
-	r.writeReadinessBody(w, "not the active holder, or the dataplane is not applied")
 }
 
 func (r *readiness) writeReadinessBody(w http.ResponseWriter, body string) {

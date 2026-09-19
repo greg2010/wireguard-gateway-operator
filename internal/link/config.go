@@ -18,7 +18,7 @@ type Config struct {
 	// Peer public keys are inline in RuntimeConfig.WireGuard.Peers.
 	WGKeyPath string `envconfig:"GATEWAY_WG_KEY_PATH" default:"/etc/gateway/wg/private"`
 	// HealthAddr is the listen address for the readiness HTTP server.
-	HealthAddr string `envconfig:"GATEWAY_HEALTH_ADDR" default:":8080"`
+	HealthAddr string `envconfig:"GATEWAY_HEALTH_ADDR" default:":27000"`
 	// ReconcileInterval backstops the fsnotify-driven reload loop in case a
 	// filesystem event is missed.
 	ReconcileInterval time.Duration `envconfig:"GATEWAY_RECONCILE_INTERVAL" default:"10s"`
@@ -54,13 +54,20 @@ type RuntimeConfig struct {
 	// replica, and makes Forward.Service and Forward.TargetPort required instead of the Local set.
 	Identity *GatewayIdentity `json:"identity,omitempty"`
 
-	// HealthPort is required in Local mode and must equal Identity.HealthPort.
-	// The fence renders the identity's value.
+	// HealthPort is required in Local mode and must equal Identity.HealthPort: the port the
+	// health DNAT and the kubelet probe both target.
 	HealthPort int `json:"healthPort,omitempty"`
 
 	// PodSelector matches this Gateway's link pods, and is what the election's liveness table
 	// watches by. Local mode only, and required there.
 	PodSelector map[string]string `json:"podSelector,omitempty"`
+
+	// Responders maps node name to responder pod IP; a Local replica reads its own node's entry.
+	Responders map[string]string `json:"responders,omitempty"`
+	// ResponderPort is the responder pods' listen port, the health DNAT target port in both shapes.
+	ResponderPort int `json:"responderPort,omitempty"`
+	// ResponderTarget is the Cluster-shape health DNAT target, the responder Service ClusterIP.
+	ResponderTarget string `json:"responderTarget,omitempty"`
 
 	WireGuard WireGuard `json:"wireguard"`
 	Forwards  []Forward `json:"forwards"`
@@ -162,11 +169,18 @@ func (rc *RuntimeConfig) validate() error {
 	if rc.Identity != nil && len(rc.PodSelector) == 0 {
 		return fmt.Errorf("traffic policy %s requires a non-empty podSelector", rc.TrafficPolicy)
 	}
-	// The data plane renders its INPUT admission and its reply-mark restoration from this value
-	// while the fence renders them from the identity's, so the two disagreeing drops the probe.
+	// The data plane renders the health DNAT from this value; a mismatch against the identity's
+	// own, which the kubelet probe also trusts, would forward the wrong port.
 	if rc.Identity != nil && rc.HealthPort != rc.Identity.HealthPort {
 		return fmt.Errorf("healthPort %d must equal this gateway identity's health port %d (identity %+v)",
 			rc.HealthPort, rc.Identity.HealthPort, *rc.Identity)
+	}
+	// A zero port renders the health DNAT as ":0" and drops every probe with no error anywhere.
+	if rc.ResponderPort == 0 && len(rc.Responders) > 0 {
+		return fmt.Errorf("responderPort must be nonzero when responders is set (responders %+v)", rc.Responders)
+	}
+	if rc.ResponderPort == 0 && rc.ResponderTarget != "" {
+		return fmt.Errorf("responderPort must be nonzero when responderTarget is set (responderTarget %q)", rc.ResponderTarget)
 	}
 	seenSlots := make(map[int]bool, len(rc.WireGuard.Peers))
 	for i := range rc.WireGuard.Peers {

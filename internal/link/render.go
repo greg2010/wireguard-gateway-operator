@@ -85,13 +85,15 @@ func keepMask(markMask string) (string, error) {
 	return fmt.Sprintf("0x%08x", ^uint32(v)), nil
 }
 
-// nftablesData is the render input for Cluster's single-interface ruleset. HealthPort is 0 when
-// no health port is configured, which omits the INPUT admission rule entirely.
+// nftablesData is the render input for Cluster's single-interface ruleset. An empty
+// ResponderTarget omits the health DNAT and its forward-chain accept.
 type nftablesData struct {
-	Interface  string
-	Table      string
-	HealthPort int
-	Forwards   []ResolvedForward
+	Interface       string
+	Table           string
+	HealthPort      int
+	ResponderTarget string
+	ResponderPort   int
+	Forwards        []ResolvedForward
 }
 
 // localSlotData is one Local slot's connmark identity, feeding its own premark/prerouting/forward
@@ -103,16 +105,20 @@ type localSlotData struct {
 	KeepMask  string
 }
 
-// nftablesLocalData is the render input for Local's per-Gateway table, holding one block per slot.
+// nftablesLocalData is the render input for Local's per-Gateway table. An empty ResponderIP
+// omits the health DNAT and its forward-chain accept.
 type nftablesLocalData struct {
-	Table      string
-	HealthPort int
-	Slots      []localSlotData
-	Forwards   []ResolvedForward
+	Table         string
+	HealthPort    int
+	ResponderIP   string
+	ResponderPort int
+	Slots         []localSlotData
+	Forwards      []ResolvedForward
 }
 
-// RenderNftables renders the nftables document for the runtime configuration.
-func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward) (string, error) {
+// RenderNftables renders the nftables document for the runtime configuration. nodeName selects
+// this replica's entry from rc.Responders in Local mode; Cluster mode ignores it.
+func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward, nodeName string) (string, error) {
 	sorted := slices.Clone(forwards)
 	slices.SortFunc(sorted, func(a, b ResolvedForward) int {
 		if a.PublicPort != b.PublicPort {
@@ -137,10 +143,12 @@ func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward) (string, error
 			})
 		}
 		data := nftablesLocalData{
-			Table:      rc.Identity.NftTable,
-			HealthPort: rc.HealthPort,
-			Slots:      slots,
-			Forwards:   sorted,
+			Table:         rc.Identity.NftTable,
+			HealthPort:    rc.HealthPort,
+			ResponderIP:   rc.Responders[nodeName],
+			ResponderPort: rc.ResponderPort,
+			Slots:         slots,
+			Forwards:      sorted,
 		}
 		var b strings.Builder
 		if err := nftablesLocalTemplate.Execute(&b, data); err != nil {
@@ -149,11 +157,17 @@ func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward) (string, error
 		return b.String(), nil
 	}
 
+	responderTarget := ""
+	if rc.HealthPort > 0 {
+		responderTarget = rc.ResponderTarget
+	}
 	data := nftablesData{
-		Interface:  clusterInterface,
-		Table:      clusterNftTable,
-		HealthPort: rc.HealthPort,
-		Forwards:   sorted,
+		Interface:       clusterInterface,
+		Table:           clusterNftTable,
+		HealthPort:      rc.HealthPort,
+		ResponderTarget: responderTarget,
+		ResponderPort:   rc.ResponderPort,
+		Forwards:        sorted,
 	}
 	var b strings.Builder
 	if err := nftablesTemplate.Execute(&b, data); err != nil {

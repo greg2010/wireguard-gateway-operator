@@ -6,6 +6,9 @@ table inet {{ .Table }} {
 {{- range $f := .Forwards }}
 		iif "{{ $.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
 {{- end }}
+{{- if .ResponderTarget }}
+		iif "{{ .Interface }}" tcp dport {{ .HealthPort }} dnat ip to {{ .ResponderTarget }} : {{ .ResponderPort }}
+{{- end }}
 	}
 
 	chain postrouting {
@@ -20,13 +23,13 @@ table inet {{ .Table }} {
 {{- range $f := .Forwards }}
 		iif "{{ $.Interface }}" ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} accept
 {{- end }}
+{{- if .ResponderTarget }}
+		iif "{{ .Interface }}" ip daddr {{ .ResponderTarget }} tcp dport {{ .ResponderPort }} accept
+{{- end }}
 	}
 
 	chain input {
 		type filter hook input priority filter; policy accept;
-{{- if gt .HealthPort 0 }}
-		iif "{{ .Interface }}" tcp dport {{ .HealthPort }} accept
-{{- end }}
 		iif "{{ .Interface }}" drop
 	}
 }

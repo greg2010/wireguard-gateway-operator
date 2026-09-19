@@ -20,7 +20,8 @@ type dataPlane struct {
 	otherHolder bool
 	// forwards is the forward set the last successful apply programmed, read by the next apply so
 	// it can flush the conntrack entries of whatever tuple no longer appears.
-	forwards []ResolvedForward
+	forwards   []ResolvedForward
+	probeLatch responderProbeLatch
 }
 
 func newDataPlane(rc RuntimeConfig) *dataPlane {
@@ -48,8 +49,8 @@ func (d *dataPlane) clearOtherHolder() {
 	d.otherHolder = false
 }
 
-// applyPass records outcomes and re-renders the Local fence under the node lock, threading the
-// last successfully applied forward set into apply and storing its returned set only on success.
+// applyPass records outcomes under the node lock, threading the last successfully applied forward
+// set into apply and storing its returned set only on success.
 func (d *dataPlane) applyPass(ctx context.Context, run runner, current RuntimeConfig,
 	apply func(context.Context, []ResolvedForward) ([]SlotResult, []ResolvedForward, error), log *zap.SugaredLogger) ([]SlotResult, error) {
 	d.mu.Lock()
@@ -70,14 +71,11 @@ func (d *dataPlane) applyPass(ctx context.Context, run runner, current RuntimeCo
 		d.forwards = applied
 	}
 	d.record(results)
-	if fenceErr := d.renderFence(ctx, run); fenceErr != nil {
-		err = errors.Join(err, fenceErr)
-	}
 	return append(slices.Clone(results), departed...), err
 }
 
-// standbyPass re-renders this replica's fence unless it holds. It tears held slots down only after
-// another holder is observed, preserving inherited data until leadership starts.
+// standbyPass tears held slots down once another replica is observed holding the Lease,
+// preserving inherited or self-applied data until a late leadership acquisition can claim it.
 func (d *dataPlane) standbyPass(ctx context.Context, run runner, current RuntimeConfig, leader func() bool, log *zap.SugaredLogger) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -86,10 +84,9 @@ func (d *dataPlane) standbyPass(ctx context.Context, run runner, current Runtime
 	}
 	d.rc = current
 	if !d.otherHolder {
-		return d.renderFence(ctx, run)
+		return nil
 	}
-	errs := slotErrors(d.teardownSlots(ctx, run, nil, log))
-	return errors.Join(append(errs, d.renderFence(ctx, run))...)
+	return errors.Join(slotErrors(d.teardownSlots(ctx, run, nil, log))...)
 }
 
 // stepDown removes the data plane before tearing down held slots.
@@ -101,12 +98,12 @@ func (d *dataPlane) stepDown(ctx context.Context, run runner, log *zap.SugaredLo
 	}
 
 	var errs []error
-	table := TeardownStep{Name: "nft", Args: []string{"delete", "table", "inet", nftTableName(d.rc)}}
-	if err := runTeardownStep(ctx, run, table, log); err != nil {
+	table := deleteTableCommand(nftTableName(d.rc))
+	if err := runTeardownStep(ctx, run, TeardownStep{Name: table.name, Args: table.args}, log); err != nil {
 		errs = append(errs, err)
 	}
 	errs = append(errs, slotErrors(d.teardownSlots(ctx, run, nil, log))...)
-	return errors.Join(append(errs, d.renderFence(ctx, run))...)
+	return errors.Join(errs...)
 }
 
 // teardownSlots retains failed teardowns for a later retry.
@@ -137,17 +134,6 @@ func (d *dataPlane) record(results []SlotResult) {
 	for _, r := range results {
 		d.slots[r.Slot] = r.Applied
 	}
-}
-
-// renderFence re-installs the fencing table from the current applied set. The caller must hold mu.
-func (d *dataPlane) renderFence(ctx context.Context, run runner) error {
-	admitted := []int{}
-	for slot, applied := range d.slots {
-		if applied {
-			admitted = append(admitted, slot)
-		}
-	}
-	return InstallFencing(ctx, run, d.rc, admitted)
 }
 
 // heldSlots is every slot this replica still holds, applied or not, sorted.

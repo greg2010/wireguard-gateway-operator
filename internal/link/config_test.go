@@ -220,6 +220,25 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 			body:    `{"wireguard":{"address":"10.0.0.2/32","peers":[{"slot":0,"publicKey":"A=","endpoint":"h:1"},{"slot":2,"publicKey":"B=","endpoint":"h:2"}]}}`,
 			wantErr: "",
 		},
+		{
+			name: "local_responders_set_zero_port_invalid",
+			body: `{"trafficPolicy":"Local","healthPort":27003,"identity":{"id":3,"healthPort":27003,"nftTable":"gw3"},"podSelector":{"app":"gateway-link"},
+			        "responders":{"node-a":"10.244.2.9"},"responderPort":0,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "responderPort must be nonzero when responders is set",
+		},
+		{
+			name: "cluster_responder_target_zero_port_invalid",
+			body: `{"responderTarget":"10.96.5.5","responderPort":0,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "responderPort must be nonzero when responderTarget is set",
+		},
+		{
+			name: "cluster_responder_target_nonzero_port_valid",
+			body: `{"responderTarget":"10.96.5.5","responderPort":8000,
+			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "",
+		},
 	}
 
 	for _, tc := range tcs {

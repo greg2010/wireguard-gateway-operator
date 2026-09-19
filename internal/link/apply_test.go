@@ -299,10 +299,10 @@ func TestApplyIsIdempotent(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	if _, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t)); err != nil {
+	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if _, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t)); err != nil {
+	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
 
@@ -391,7 +391,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 	forwardB := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}
 
 	first := &runRecorder{}
-	_, applied1, err := Apply(context.Background(), first.run, rc, "priv", resolve, nil, nil, testLogger(t))
+	_, applied1, err := applyConfig(context.Background(), first.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 		t.Fatalf("first applied = %+v, want [%+v]", applied1, forwardA)
 	}
 	cmds1 := first.snapshot()
-	nftA, err := RenderNftables(rc, []ResolvedForward{forwardA})
+	nftA, err := RenderNftables(rc, []ResolvedForward{forwardA}, "")
 	if err != nil {
 		t.Fatalf("RenderNftables A: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 	})
 
 	second := &runRecorder{}
-	_, applied2, err := Apply(context.Background(), second.run, rc, "priv", resolve, applied1, nil, testLogger(t))
+	_, applied2, err := applyConfig(context.Background(), second.run, rc, "priv", resolve, applied1, nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 		t.Fatalf("second applied = %+v, want [%+v]", applied2, forwardB)
 	}
 	cmds2 := second.snapshot()
-	nftB, err := RenderNftables(rc, []ResolvedForward{forwardB})
+	nftB, err := RenderNftables(rc, []ResolvedForward{forwardB}, "")
 	if err != nil {
 		t.Fatalf("RenderNftables B: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestApplyToleratesEmptyFlush(t *testing.T) {
 				}
 				return nil
 			}}
-			_, applied, err := Apply(context.Background(), rec.run, rc, "priv", resolveB, []ResolvedForward{forwardA}, nil, testLogger(t))
+			_, applied, err := applyConfig(context.Background(), rec.run, rc, "priv", resolveB, []ResolvedForward{forwardA}, nil, "", &responderProbeLatch{}, testLogger(t))
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
 					t.Fatalf("Apply error = %v, want one containing %q", err, tc.wantErrSub)
@@ -562,7 +562,7 @@ func TestApplyFailsOnProbeError(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	_, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
+	_, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("Apply = %v, want one wrapping %v", err, probeErr)
 	}
@@ -590,7 +590,7 @@ func TestApplyOneFailingSlotOthersContinue(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-	results, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
+	results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -714,7 +714,7 @@ func TestApplyRulesetFailureHoldsEveryAttemptedSlot(t *testing.T) {
 			}
 			resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-			results, _, err := Apply(context.Background(), rec.run, rc, "priv", resolve, nil, nil, testLogger(t))
+			results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
 			if err == nil || !errors.Is(err, nftErr) {
 				t.Fatalf("Apply error = %v, want one wrapping %v", err, nftErr)
 			}
@@ -1254,7 +1254,7 @@ func TestRenderConfigModeBranch(t *testing.T) {
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls []string
-			_, ruleset, _, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", tc.resolve(t, &calls), tc.localForwards, testLogger(t))
+			_, ruleset, _, cleanup, err := renderConfig(context.Background(), tc.rc, "priv", tc.resolve(t, &calls), tc.localForwards, "", testLogger(t))
 			if err != nil {
 				t.Fatalf("renderConfig: %v", err)
 			}
@@ -1269,6 +1269,164 @@ func TestRenderConfigModeBranch(t *testing.T) {
 			}
 			if !slices.Equal(calls, tc.wantCalls) {
 				t.Errorf("resolver calls = %v, want %v", calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// TestWarnUnansweredProbes pins warnUnansweredProbes logging WARN once when the config cannot
+// answer the LB health probe, in both shapes, and nothing when it can.
+func TestWarnUnansweredProbes(t *testing.T) {
+	tcs := []struct {
+		name        string
+		rc          RuntimeConfig
+		wantMessage string
+		wantNode    string
+	}{
+		{
+			name: "local_no_responder_entry_for_this_node_warns",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+			},
+			wantMessage: "no responder pod on this node; health probes for this Gateway will fail",
+			wantNode:    "node-a",
+		},
+		{
+			name: "local_responder_entry_present_no_warning",
+			rc: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				Responders:    map[string]string{"node-a": "10.244.2.9"},
+			},
+		},
+		{
+			name: "cluster_health_port_no_responder_target_warns",
+			rc: RuntimeConfig{
+				WireGuard:  WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort: 8080,
+			},
+			wantMessage: "no responder target; health probes for this Gateway will fail",
+		},
+		{
+			name: "cluster_health_port_with_responder_target_no_warning",
+			rc: RuntimeConfig{
+				WireGuard:       WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort:      8080,
+				ResponderTarget: "10.96.5.5",
+			},
+		},
+		{
+			name: "cluster_no_health_port_no_warning",
+			rc: RuntimeConfig{
+				WireGuard: WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			log, logs := observedLogger(t)
+			warnUnansweredProbes(&responderProbeLatch{}, tc.rc, "node-a", log)
+
+			entries := logs.All()
+			if tc.wantMessage == "" {
+				if len(entries) != 0 {
+					t.Fatalf("log entries = %+v, want none", entries)
+				}
+				return
+			}
+			if len(entries) != 1 {
+				t.Fatalf("log entries = %d, want 1: %+v", len(entries), entries)
+			}
+			if entries[0].Message != tc.wantMessage {
+				t.Errorf("log message = %q, want %q", entries[0].Message, tc.wantMessage)
+			}
+			if tc.wantNode != "" {
+				if got := entries[0].ContextMap()["node"]; got != tc.wantNode {
+					t.Errorf("node field = %v, want %q", got, tc.wantNode)
+				}
+			}
+		})
+	}
+}
+
+// TestWarnUnansweredProbesOncePerState pins the once-per-state latch: repeated unanswered probes
+// warn only the first time, and an answered call clears it so the next absence warns again.
+func TestWarnUnansweredProbesOncePerState(t *testing.T) {
+	tcs := []struct {
+		name        string
+		missing     RuntimeConfig
+		present     RuntimeConfig
+		wantMessage string
+		wantNode    string
+	}{
+		{
+			name: "local",
+			missing: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+			},
+			present: RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				WireGuard:     WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				Responders:    map[string]string{"node-a": "10.244.2.9"},
+			},
+			wantMessage: "no responder pod on this node; health probes for this Gateway will fail",
+			wantNode:    "node-a",
+		},
+		{
+			name: "cluster",
+			missing: RuntimeConfig{
+				WireGuard:  WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort: 8080,
+			},
+			present: RuntimeConfig{
+				WireGuard:       WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}},
+				HealthPort:      8080,
+				ResponderTarget: "10.96.5.5",
+			},
+			wantMessage: "no responder target; health probes for this Gateway will fail",
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			log, logs := observedLogger(t)
+			latch := &responderProbeLatch{}
+
+			steps := []struct {
+				name               string
+				rc                 RuntimeConfig
+				wantCumulativeLogs int
+			}{
+				{"missing_first_pass_warns", tc.missing, 1},
+				{"missing_second_pass_stays_silent", tc.missing, 1},
+				{"present_pass_clears_latch", tc.present, 1},
+				{"missing_again_warns_second_time", tc.missing, 2},
+			}
+			for _, step := range steps {
+				t.Run(step.name, func(t *testing.T) {
+					warnUnansweredProbes(latch, step.rc, "node-a", log)
+					if got := len(logs.All()); got != step.wantCumulativeLogs {
+						t.Fatalf("cumulative log entries = %d, want %d", got, step.wantCumulativeLogs)
+					}
+				})
+			}
+
+			for i, entry := range logs.All() {
+				if entry.Message != tc.wantMessage {
+					t.Errorf("entry %d message = %q, want %q", i, entry.Message, tc.wantMessage)
+				}
+				if tc.wantNode != "" {
+					if got := entry.ContextMap()["node"]; got != tc.wantNode {
+						t.Errorf("entry %d node field = %v, want %q", i, got, tc.wantNode)
+					}
+				}
 			}
 		})
 	}

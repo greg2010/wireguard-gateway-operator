@@ -335,7 +335,7 @@ func TestRulesetDigestStableAndSensitive(t *testing.T) {
 		{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080},
 	}
 
-	first, err := RenderNftables(rc, forwards)
+	first, err := RenderNftables(rc, forwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
@@ -348,7 +348,7 @@ func TestRulesetDigestStableAndSensitive(t *testing.T) {
 	changedForwards := []ResolvedForward{
 		{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.9", TargetPort: 9080},
 	}
-	second, err := RenderNftables(rc, changedForwards)
+	second, err := RenderNftables(rc, changedForwards, "")
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}
