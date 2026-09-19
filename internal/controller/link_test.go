@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,9 +23,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
@@ -2175,4 +2179,524 @@ func publicKeyOf(t *testing.T, privateKey string) string {
 		t.Fatalf("parse private key %q: %v", privateKey, err)
 	}
 	return key.PublicKey().String()
+}
+
+// TestLinkObjectHash table-tests the link gate hash: builder output hashes stably, every input
+// that changes an object changes it, and a stale gate annotation on the input is ignored.
+func TestLinkObjectHash(t *testing.T) {
+	cfg := testConfig()
+	gwWith := func(mutate func(gw *wgnetv1alpha1.Gateway)) *wgnetv1alpha1.Gateway {
+		gw := newGateway("edge", "wg-system", nil, nil)
+		if mutate != nil {
+			mutate(gw)
+		}
+		return gw
+	}
+	configMap := func(gw *wgnetv1alpha1.Gateway, address string) client.Object {
+		cm, err := buildLinkConfigMap(gw, address, nil, nil, "gateway-public-key", nil, clusterHealthPort, nil, "10.96.0.9")
+		if err != nil {
+			t.Fatalf("build link configmap: %v", err)
+		}
+		return cm
+	}
+	staleDeployment := func() client.Object {
+		dep := buildLinkDeployment(gwWith(nil), cfg)
+		dep.Annotations = map[string]string{linkHashAnnotation: "stale"}
+		return dep
+	}
+
+	tests := []struct {
+		name      string
+		a, b      client.Object
+		wantEqual bool
+	}{
+		{
+			name:      "same deployment built twice",
+			a:         buildLinkDeployment(gwWith(nil), cfg),
+			b:         buildLinkDeployment(gwWith(nil), cfg),
+			wantEqual: true,
+		},
+		{
+			name:      "stale gate annotation is excluded",
+			a:         staleDeployment(),
+			b:         buildLinkDeployment(gwWith(nil), cfg),
+			wantEqual: true,
+		},
+		{
+			name: "replicas change",
+			a:    buildLinkDeployment(gwWith(nil), cfg),
+			b:    buildLinkDeployment(gwWith(func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Link.Replicas = 3 }), cfg),
+		},
+		{
+			name: "node selector change",
+			a:    buildLinkDeployment(gwWith(nil), cfg),
+			b: buildLinkDeployment(gwWith(func(gw *wgnetv1alpha1.Gateway) {
+				gw.Spec.Link.NodeSelector = map[string]string{"role": "edge"}
+			}), cfg),
+		},
+		{
+			name: "configmap address change",
+			a:    configMap(gwWith(nil), "203.0.113.10"),
+			b:    configMap(gwWith(nil), "203.0.113.11"),
+		},
+		{
+			name: "role rules change with the traffic policy",
+			a:    buildLinkRole(gwWith(nil)),
+			b: buildLinkRole(gwWith(func(gw *wgnetv1alpha1.Gateway) {
+				gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+			})),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantAnnotations := maps.Clone(tt.a.GetAnnotations())
+
+			hashA, err := objectHash(tt.a, linkHashAnnotation)
+			if err != nil {
+				t.Fatalf("hash a: %v", err)
+			}
+			hashB, err := objectHash(tt.b, linkHashAnnotation)
+			if err != nil {
+				t.Fatalf("hash b: %v", err)
+			}
+
+			if (hashA == hashB) != tt.wantEqual {
+				t.Errorf("hashes %q and %q equal = %v, want %v", hashA, hashB, hashA == hashB, tt.wantEqual)
+			}
+			if !maps.Equal(tt.a.GetAnnotations(), wantAnnotations) {
+				t.Errorf("input annotations = %v, want %v unchanged by hashing", tt.a.GetAnnotations(), wantAnnotations)
+			}
+		})
+	}
+}
+
+// TestLinkDirty table-tests the per-Gateway link dirty flag: an unseen key forces one apply, a
+// mark forces the next pass only, and forgetting a key returns it to unseen.
+func TestLinkDirty(t *testing.T) {
+	key := types.NamespacedName{Namespace: "wg-system", Name: "edge"}
+	tests := []struct {
+		name  string
+		setup func(r *GatewayReconciler)
+		want  []bool
+	}{
+		{
+			name: "unseen key",
+			want: []bool{true, false},
+		},
+		{
+			name:  "seen and clean",
+			setup: func(r *GatewayReconciler) { r.linkDirty.take(key) },
+			want:  []bool{false, false},
+		},
+		{
+			name: "marked after a take",
+			setup: func(r *GatewayReconciler) {
+				r.linkDirty.take(key)
+				r.linkDirty.mark(key)
+			},
+			want: []bool{true, false},
+		},
+		{
+			name: "forgotten after a take",
+			setup: func(r *GatewayReconciler) {
+				r.linkDirty.take(key)
+				r.linkDirty.forget(key)
+			},
+			want: []bool{true, false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &GatewayReconciler{}
+			if tt.setup != nil {
+				tt.setup(r)
+			}
+			got := []bool{r.linkDirty.take(key), r.linkDirty.take(key)}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("successive takes = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatewaysForLinkObject table-tests the link-object mapper: a namespaced child resolves
+// through its Gateway controller reference, the cluster-scoped binding through its owner labels.
+func TestGatewaysForLinkObject(t *testing.T) {
+	cfg := testConfig()
+	gw := newGateway("edge", "wg-system", nil, nil)
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	gatewayRef := metav1.OwnerReference{
+		APIVersion: wgnetv1alpha1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: new(true),
+	}
+	daemonSetRef := metav1.OwnerReference{
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Kind:       "DaemonSet",
+		Name:       "edge-link",
+		UID:        "22223333-4444-5555-6666-777788889999",
+		Controller: new(true),
+	}
+	foreignGatewayRef := metav1.OwnerReference{
+		APIVersion: "gateway.networking.k8s.io/v1",
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        "33334444-5555-6666-7777-888899990000",
+		Controller: new(true),
+	}
+	deploymentWith := func(refs []metav1.OwnerReference) client.Object {
+		dep := buildLinkDeployment(gw, cfg)
+		dep.OwnerReferences = refs
+		return dep
+	}
+
+	tests := []struct {
+		name         string
+		build        func() client.Object
+		wantRequests []reconcile.Request
+		wantDirty    bool
+	}{
+		{
+			name:         "gateway controller reference",
+			build:        func() client.Object { return deploymentWith([]metav1.OwnerReference{gatewayRef}) },
+			wantRequests: []reconcile.Request{{NamespacedName: key}},
+			wantDirty:    true,
+		},
+		{
+			name:         "cluster-scoped binding carrying owner labels",
+			build:        func() client.Object { return buildLinkClusterRoleBinding(gw) },
+			wantRequests: []reconcile.Request{{NamespacedName: key}},
+			wantDirty:    true,
+		},
+		{
+			name:  "no owner reference",
+			build: func() client.Object { return deploymentWith(nil) },
+		},
+		{
+			name:  "controller reference of another kind",
+			build: func() client.Object { return deploymentWith([]metav1.OwnerReference{daemonSetRef}) },
+		},
+		{
+			name:  "gateway controller reference of another api group",
+			build: func() client.Object { return deploymentWith([]metav1.OwnerReference{foreignGatewayRef}) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &GatewayReconciler{}
+			// Take once so the key is seen and clean: a mark by the mapper is then observable.
+			r.linkDirty.take(key)
+
+			got := r.gatewaysForLinkObject(context.Background(), tt.build())
+			if !slices.Equal(got, tt.wantRequests) {
+				t.Errorf("requests = %v, want exactly %v", got, tt.wantRequests)
+			}
+			if dirty := r.linkDirty.take(key); dirty != tt.wantDirty {
+				t.Errorf("gateway %s dirty = %v, want %v", key, dirty, tt.wantDirty)
+			}
+		})
+	}
+}
+
+// TestIsLinkObject table-tests the link-object predicate, including the drifted-label case:
+// an edit that overwrites the component label must still reach the reconciler.
+func TestIsLinkObject(t *testing.T) {
+	cfg := testConfig()
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gatewayRef := metav1.OwnerReference{
+		APIVersion: wgnetv1alpha1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: new(true),
+	}
+
+	tests := []struct {
+		name  string
+		build func() client.Object
+		want  bool
+	}{
+		{
+			name:  "link component label",
+			build: func() client.Object { return buildLinkDeployment(gw, cfg) },
+			want:  true,
+		},
+		{
+			name:  "cluster-scoped binding",
+			build: func() client.Object { return buildLinkClusterRoleBinding(gw) },
+			want:  true,
+		},
+		{
+			name: "label dropped from an owned link object",
+			build: func() client.Object {
+				dep := buildLinkDeployment(gw, cfg)
+				dep.Labels = nil
+				dep.OwnerReferences = []metav1.OwnerReference{gatewayRef}
+				return dep
+			},
+			want: true,
+		},
+		{
+			name:  "responder object of the same gateway",
+			build: func() client.Object { return buildResponderDeployment(cfg, gw) },
+		},
+		{
+			name: "unrelated object owned by the gateway under another name",
+			build: func() client.Object {
+				return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
+					Namespace: gw.Namespace, Name: "other", OwnerReferences: []metav1.OwnerReference{gatewayRef},
+				}}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isLinkObject(tt.build()); got != tt.want {
+				t.Errorf("isLinkObject = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// linkWriteLog counts the link-object writes a reconcile issues, keyed "<verb>/<kind>", so a
+// test pins the exact set of calls instead of asserting one kind's absence.
+type linkWriteLog struct {
+	mu    sync.Mutex
+	names map[string]bool
+	calls map[string]int
+}
+
+// countedLinkKind names the kind obj is counted under, or "" for a kind the link write-gate
+// tests do not count (the Gateway itself, its key Secrets, the GCP composites).
+func countedLinkKind(obj client.Object) string {
+	switch obj.(type) {
+	case *corev1.ServiceAccount:
+		return "ServiceAccount"
+	case *rbacv1.Role:
+		return "Role"
+	case *rbacv1.RoleBinding:
+		return "RoleBinding"
+	case *rbacv1.ClusterRoleBinding:
+		return "ClusterRoleBinding"
+	case *corev1.ConfigMap:
+		return "ConfigMap"
+	case *appsv1.Deployment:
+		return "Deployment"
+	case *appsv1.DaemonSet:
+		return "DaemonSet"
+	case *networkingv1.NetworkPolicy:
+		return "NetworkPolicy"
+	case *policyv1.PodDisruptionBudget:
+		return "PodDisruptionBudget"
+	default:
+		return ""
+	}
+}
+
+func (l *linkWriteLog) record(verb string, obj client.Object) {
+	kind := countedLinkKind(obj)
+	if kind == "" || !l.names[obj.GetName()] {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls[verb+"/"+kind]++
+}
+
+func (l *linkWriteLog) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = map[string]int{}
+}
+
+// entries renders the recorded calls as sorted "<verb>/<kind>=<count>" strings.
+func (l *linkWriteLog) entries() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.calls))
+	for call, n := range l.calls {
+		out = append(out, fmt.Sprintf("%s=%d", call, n))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// countingLinkClient rewires r's client to the operator identity through an interceptor
+// recording every Patch and Delete of a link object named in names.
+func countingLinkClient(t *testing.T, te *testEnv, r *GatewayReconciler, names []string) *linkWriteLog {
+	t.Helper()
+	wc, err := client.NewWithWatch(te.operatorCfg, client.Options{Scheme: te.scheme})
+	if err != nil {
+		t.Fatalf("build watch client: %v", err)
+	}
+	writes := &linkWriteLog{names: map[string]bool{}, calls: map[string]int{}}
+	for _, name := range names {
+		writes.names[name] = true
+	}
+	r.Client = interceptor.NewClient(wc, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			writes.record("Patch", obj)
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			writes.record("Delete", obj)
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	return writes
+}
+
+// linkObjectsPresent reports whether gw's common link objects, its mode-specific workload and,
+// in the Local shape, its ClusterRoleBinding are all readable through cl.
+func linkObjectsPresent(ctx context.Context, cl client.Client, ns, name, crbName string, local bool) bool {
+	key := client.ObjectKey{Namespace: ns, Name: name}
+	objs := []client.Object{
+		&corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &corev1.ConfigMap{},
+	}
+	if local {
+		objs = append(objs, &appsv1.DaemonSet{})
+	} else {
+		objs = append(objs, &appsv1.Deployment{}, &networkingv1.NetworkPolicy{})
+	}
+	for _, obj := range objs {
+		if err := cl.Get(ctx, key, obj); err != nil {
+			return false
+		}
+	}
+	if !local {
+		return true
+	}
+	return cl.Get(ctx, client.ObjectKey{Name: crbName}, &rbacv1.ClusterRoleBinding{}) == nil
+}
+
+// linkWriteStep is one Gateway spec edit in the steady-write table together with the exact set
+// of link writes the reconcile following it must issue.
+type linkWriteStep struct {
+	name        string
+	mutate      func(gw *wgnetv1alpha1.Gateway)
+	wantEntries []string
+}
+
+// linkSteadyTimeout bounds the wait for a fresh Gateway's link objects to exist.
+const linkSteadyTimeout = 30 * time.Second
+
+// TestEnsureLinkSteadyWrites pins the link write gate: an unchanged reconcile applies nothing,
+// the dirty flag forces every write, and a spec edit patches only what changed.
+func TestEnsureLinkSteadyWrites(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     wgnetv1alpha1.TrafficPolicy
+		wantSteady []string
+		wantDirty  []string
+		steps      []linkWriteStep
+	}{
+		{
+			name:   "cluster",
+			policy: wgnetv1alpha1.TrafficPolicyCluster,
+			wantDirty: []string{
+				"Patch/ConfigMap=1", "Patch/Deployment=1",
+				"Patch/NetworkPolicy=1", "Patch/Role=1", "Patch/RoleBinding=1", "Patch/ServiceAccount=1",
+			},
+			steps: []linkWriteStep{
+				{
+					name:        "replicas",
+					mutate:      func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Link.Replicas = 3 },
+					wantEntries: []string{"Patch/Deployment=1", "Patch/PodDisruptionBudget=1"},
+				},
+				{
+					name: "node selector",
+					mutate: func(gw *wgnetv1alpha1.Gateway) {
+						gw.Spec.Link.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+					},
+					wantEntries: []string{"Patch/Deployment=1"},
+				},
+			},
+		},
+		{
+			name:   "local",
+			policy: wgnetv1alpha1.TrafficPolicyLocal,
+			wantDirty: []string{
+				"Patch/ClusterRoleBinding=1", "Patch/ConfigMap=1", "Patch/DaemonSet=1",
+				"Patch/Role=1", "Patch/RoleBinding=1", "Patch/ServiceAccount=1",
+			},
+			steps: []linkWriteStep{
+				{
+					name: "node selector",
+					mutate: func(gw *wgnetv1alpha1.Gateway) {
+						gw.Spec.Link.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+					},
+					wantEntries: []string{"Patch/DaemonSet=1"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			te := setupEnvtestRBAC(t)
+
+			r, key := linkGatewayFixture(ctx, t, te, "link-steady-"+tt.name, tt.policy)
+			var gw wgnetv1alpha1.Gateway
+			mustGet(ctx, t, te.client, key, &gw)
+			name, crbName := linkComponentName(&gw), linkClusterRoleBindingName(&gw)
+			local := tt.policy == wgnetv1alpha1.TrafficPolicyLocal
+			writes := countingLinkClient(t, te, r, []string{name, crbName})
+			req := ctrl.Request{NamespacedName: key}
+
+			pollUntil(ctx, t, linkSteadyTimeout, "gw's link objects to exist", func() bool {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("reconcile: %v", err)
+				}
+				return linkObjectsPresent(ctx, r.Client, key.Namespace, name, crbName, local)
+			})
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("steady reconcile: %v", err)
+			}
+			if got := writes.entries(); !slices.Equal(got, tt.wantSteady) {
+				t.Errorf("steady reconcile link writes = %v, want exactly %v", got, tt.wantSteady)
+			}
+
+			r.linkDirty.mark(key)
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("dirty reconcile: %v", err)
+			}
+			if got := writes.entries(); !slices.Equal(got, tt.wantDirty) {
+				t.Errorf("dirty reconcile link writes = %v, want exactly %v", got, tt.wantDirty)
+			}
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("reconcile after the dirty pass: %v", err)
+			}
+			if got := writes.entries(); !slices.Equal(got, tt.wantSteady) {
+				t.Errorf("link writes after the dirty pass = %v, want exactly %v", got, tt.wantSteady)
+			}
+
+			for _, step := range tt.steps {
+				mustGet(ctx, t, te.client, key, &gw)
+				step.mutate(&gw)
+				if err := te.client.Update(ctx, &gw); err != nil {
+					t.Fatalf("%s: update gateway: %v", step.name, err)
+				}
+
+				writes.reset()
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("%s: reconcile: %v", step.name, err)
+				}
+				if got := writes.entries(); !slices.Equal(got, step.wantEntries) {
+					t.Errorf("%s: link writes = %v, want exactly %v", step.name, got, step.wantEntries)
+				}
+			}
+		})
+	}
 }

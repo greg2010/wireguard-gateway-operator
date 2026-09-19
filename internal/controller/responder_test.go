@@ -945,11 +945,11 @@ func TestResponderObjectHash(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wantAnnotations := maps.Clone(tt.a.GetAnnotations())
 
-			hashA, err := responderObjectHash(tt.a)
+			hashA, err := objectHash(tt.a, responderHashAnnotation)
 			if err != nil {
 				t.Fatalf("hash a: %v", err)
 			}
-			hashB, err := responderObjectHash(tt.b)
+			hashB, err := objectHash(tt.b, responderHashAnnotation)
 			if err != nil {
 				t.Fatalf("hash b: %v", err)
 			}
@@ -1159,7 +1159,7 @@ func TestEnsureGatewayResponderSteadyWrites(t *testing.T) {
 				t.Errorf("steady reconcile responder writes = %v, want exactly []", got)
 			}
 
-			r.markResponderDirty(key)
+			r.responderDirty.mark(key)
 			writes.reset()
 			if _, err := r.Reconcile(ctx, req); err != nil {
 				t.Fatalf("dirty reconcile: %v", err)
@@ -1211,22 +1211,22 @@ func TestResponderDirty(t *testing.T) {
 		},
 		{
 			name:  "seen and clean",
-			setup: func(r *GatewayReconciler) { r.takeResponderDirty(key) },
+			setup: func(r *GatewayReconciler) { r.responderDirty.take(key) },
 			want:  []bool{false, false},
 		},
 		{
 			name: "marked after a take",
 			setup: func(r *GatewayReconciler) {
-				r.takeResponderDirty(key)
-				r.markResponderDirty(key)
+				r.responderDirty.take(key)
+				r.responderDirty.mark(key)
 			},
 			want: []bool{true, false},
 		},
 		{
 			name: "forgotten after a take",
 			setup: func(r *GatewayReconciler) {
-				r.takeResponderDirty(key)
-				r.forgetResponderDirty(key)
+				r.responderDirty.take(key)
+				r.responderDirty.forget(key)
 			},
 			want: []bool{true, false},
 		},
@@ -1238,7 +1238,7 @@ func TestResponderDirty(t *testing.T) {
 			if tt.setup != nil {
 				tt.setup(r)
 			}
-			got := []bool{r.takeResponderDirty(key), r.takeResponderDirty(key)}
+			got := []bool{r.responderDirty.take(key), r.responderDirty.take(key)}
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("successive takes = %v, want %v", got, tt.want)
 			}
@@ -1303,7 +1303,7 @@ func TestGatewaysForResponderObject(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &GatewayReconciler{}
 			// Take once so the key is seen and clean: a mark by the mapper is then observable.
-			r.takeResponderDirty(key)
+			r.responderDirty.take(key)
 
 			obj := buildResponderService(gw)
 			obj.OwnerReferences = tt.refs
@@ -1312,7 +1312,7 @@ func TestGatewaysForResponderObject(t *testing.T) {
 			if !slices.Equal(got, tt.wantRequests) {
 				t.Errorf("requests = %v, want exactly %v", got, tt.wantRequests)
 			}
-			if dirty := r.takeResponderDirty(key); dirty != tt.wantDirty {
+			if dirty := r.responderDirty.take(key); dirty != tt.wantDirty {
 				t.Errorf("gateway %s dirty = %v, want %v", key, dirty, tt.wantDirty)
 			}
 		})
@@ -1554,15 +1554,15 @@ func TestEnsureGatewayResponderDirtyKeptOnError(t *testing.T) {
 				t.Errorf("steady reconcile responder writes = %v, want exactly []", got)
 			}
 
-			r.markResponderDirty(key)
+			r.responderDirty.mark(key)
 			failService.Store(true)
 			if _, err := r.Reconcile(ctx, req); err == nil {
 				t.Fatal("reconcile with a failing responder service apply = nil, want an error")
 			}
-			if dirty := r.takeResponderDirty(key); !dirty {
+			if dirty := r.responderDirty.take(key); !dirty {
 				t.Errorf("gateway %s dirty after the failed pass = false, want true", key)
 			}
-			r.markResponderDirty(key)
+			r.responderDirty.mark(key)
 
 			failService.Store(false)
 			writes.reset()

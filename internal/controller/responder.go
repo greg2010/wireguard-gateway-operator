@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -273,55 +271,6 @@ func buildResponderPodDisruptionBudget(gw *wgnetv1alpha1.Gateway) *policyv1.PodD
 // applied, so a reconcile that changes nothing issues no write.
 const responderHashAnnotation = "wgnet.dev/responder-hash"
 
-// responderObjectHash returns the lowercase hex SHA-256 of obj's JSON encoding with the gate
-// annotation excluded, so the gate value never feeds itself. obj is not mutated.
-func responderObjectHash(obj client.Object) (string, error) {
-	clone, ok := obj.DeepCopyObject().(client.Object)
-	if !ok {
-		return "", fmt.Errorf("deep copy of %T is not a client.Object", obj)
-	}
-	annotations := clone.GetAnnotations()
-	delete(annotations, responderHashAnnotation)
-	if len(annotations) == 0 {
-		annotations = nil
-	}
-	clone.SetAnnotations(annotations)
-	data, err := json.Marshal(clone)
-	if err != nil {
-		return "", fmt.Errorf("marshal %T: %w", obj, err)
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:]), nil
-}
-
-// applyIfChanged stamps desired with its hash and skips apply when live carries the same hash.
-// force applies regardless; NotFound means absent, and desired gets the server response.
-func (r *GatewayReconciler) applyIfChanged(ctx context.Context, gw *wgnetv1alpha1.Gateway, desired, live client.Object, force bool) (bool, error) {
-	hash, err := responderObjectHash(desired)
-	if err != nil {
-		return false, err
-	}
-	annotations := desired.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string, 1)
-	}
-	annotations[responderHashAnnotation] = hash
-	desired.SetAnnotations(annotations)
-
-	key := client.ObjectKeyFromObject(desired)
-	switch err := r.Get(ctx, key, live); {
-	case apierrors.IsNotFound(err):
-	case err != nil:
-		return false, fmt.Errorf("get %T %s: %w", live, key, err)
-	case !force && live.GetAnnotations()[responderHashAnnotation] == hash:
-		return false, nil
-	}
-	if err := r.apply(ctx, gw, desired); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
 // deleteResponderLeftover deletes gw's responder object of probe's kind once it is no longer
 // wanted, and only while the cached client still sees it live and not already deleting.
 func (r *GatewayReconciler) deleteResponderLeftover(ctx context.Context, gw *wgnetv1alpha1.Gateway, probe client.Object) error {
@@ -333,36 +282,6 @@ func (r *GatewayReconciler) deleteResponderLeftover(ctx context.Context, gw *wgn
 		return nil
 	}
 	return r.deleteIfPresent(ctx, probe, client.PropagationPolicy(metav1.DeletePropagationBackground))
-}
-
-// markResponderDirty forces the next reconcile of key to re-apply every responder object.
-func (r *GatewayReconciler) markResponderDirty(key types.NamespacedName) {
-	r.responderDirtyMu.Lock()
-	defer r.responderDirtyMu.Unlock()
-	if r.responderDirty == nil {
-		r.responderDirty = make(map[types.NamespacedName]bool)
-	}
-	r.responderDirty[key] = true
-}
-
-// takeResponderDirty reports whether key is dirty or unseen, and clears the flag. Unseen counts
-// as dirty so the first pass after an operator restart re-applies once.
-func (r *GatewayReconciler) takeResponderDirty(key types.NamespacedName) bool {
-	r.responderDirtyMu.Lock()
-	defer r.responderDirtyMu.Unlock()
-	if r.responderDirty == nil {
-		r.responderDirty = make(map[types.NamespacedName]bool)
-	}
-	dirty, seen := r.responderDirty[key]
-	r.responderDirty[key] = false
-	return dirty || !seen
-}
-
-// forgetResponderDirty drops key's entry, returning it to unseen.
-func (r *GatewayReconciler) forgetResponderDirty(key types.NamespacedName) {
-	r.responderDirtyMu.Lock()
-	defer r.responderDirtyMu.Unlock()
-	delete(r.responderDirty, key)
 }
 
 // isGatewayOwner reports whether ref is a controller reference to this operator's Gateway,
@@ -379,7 +298,7 @@ func (r *GatewayReconciler) gatewaysForResponderObject(_ context.Context, obj cl
 		return nil
 	}
 	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: owner.Name}
-	r.markResponderDirty(key)
+	r.responderDirty.mark(key)
 	return []reconcile.Request{{NamespacedName: key}}
 }
 
@@ -387,27 +306,27 @@ func (r *GatewayReconciler) gatewaysForResponderObject(_ context.Context, obj cl
 // leftovers, returning the responder Service ClusterIP for the Cluster shape and "" for Local.
 func (r *GatewayReconciler) ensureGatewayResponder(ctx context.Context, gw *wgnetv1alpha1.Gateway) (clusterIP string, retErr error) {
 	key := client.ObjectKeyFromObject(gw)
-	force := r.takeResponderDirty(key)
+	force := r.responderDirty.take(key)
 	// A forced pass that fails leaves objects unapplied under a matching hash; keep the flag.
 	defer func() {
 		if force && retErr != nil {
-			r.markResponderDirty(key)
+			r.responderDirty.mark(key)
 		}
 	}()
 
-	if _, err := r.applyIfChanged(ctx, gw, buildResponderConfigMap(gw), &corev1.ConfigMap{}, force); err != nil {
+	if _, err := r.applyObjectIfChanged(ctx, gw, responderHashAnnotation, buildResponderConfigMap(gw), &corev1.ConfigMap{}, force); err != nil {
 		return "", fmt.Errorf("apply responder configmap: %w", err)
 	}
 
 	svc := buildResponderService(gw)
 	var liveSvc corev1.Service
-	applied, err := r.applyIfChanged(ctx, gw, svc, &liveSvc, force)
+	applied, err := r.applyObjectIfChanged(ctx, gw, responderHashAnnotation, svc, &liveSvc, force)
 	if err != nil {
 		return "", fmt.Errorf("apply responder service: %w", err)
 	}
 
 	if isLocal(gw) {
-		if _, err := r.applyIfChanged(ctx, gw, buildResponderDaemonSet(r.Config, gw), &appsv1.DaemonSet{}, force); err != nil {
+		if _, err := r.applyObjectIfChanged(ctx, gw, responderHashAnnotation, buildResponderDaemonSet(r.Config, gw), &appsv1.DaemonSet{}, force); err != nil {
 			return "", fmt.Errorf("apply responder daemonset: %w", err)
 		}
 		if err := r.deleteResponderLeftover(ctx, gw, &appsv1.Deployment{}); err != nil {
@@ -419,14 +338,14 @@ func (r *GatewayReconciler) ensureGatewayResponder(ctx context.Context, gw *wgne
 		return "", nil
 	}
 
-	if _, err := r.applyIfChanged(ctx, gw, buildResponderDeployment(r.Config, gw), &appsv1.Deployment{}, force); err != nil {
+	if _, err := r.applyObjectIfChanged(ctx, gw, responderHashAnnotation, buildResponderDeployment(r.Config, gw), &appsv1.Deployment{}, force); err != nil {
 		return "", fmt.Errorf("apply responder deployment: %w", err)
 	}
 	if err := r.deleteResponderLeftover(ctx, gw, &appsv1.DaemonSet{}); err != nil {
 		return "", err
 	}
 	if effectiveResponderReplicas(gw) > 1 {
-		if _, err := r.applyIfChanged(ctx, gw, buildResponderPodDisruptionBudget(gw), &policyv1.PodDisruptionBudget{}, force); err != nil {
+		if _, err := r.applyObjectIfChanged(ctx, gw, responderHashAnnotation, buildResponderPodDisruptionBudget(gw), &policyv1.PodDisruptionBudget{}, force); err != nil {
 			return "", fmt.Errorf("apply responder poddisruptionbudget: %w", err)
 		}
 	} else if err := r.deleteResponderLeftover(ctx, gw, &policyv1.PodDisruptionBudget{}); err != nil {

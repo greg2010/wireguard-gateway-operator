@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,10 +103,47 @@ type GatewayReconciler struct {
 	gcpAddressRefreshed sync.Map
 	now                 func() time.Time
 
-	// responderDirty holds, per Gateway, whether the next pass must re-apply every responder
-	// object; a missing key is unseen, which forces one apply. responderDirtyMu guards it.
-	responderDirtyMu sync.Mutex
-	responderDirty   map[types.NamespacedName]bool
+	// responderDirty and linkDirty carry the per-Gateway re-apply flag for their component's
+	// objects, so drift that leaves the hash unchanged is still corrected.
+	responderDirty dirtyTracker
+	linkDirty      dirtyTracker
+}
+
+// dirtyTracker records, per Gateway, whether the next pass must re-apply every object of one
+// component. It is in-memory: a key it has never seen counts as dirty.
+type dirtyTracker struct {
+	mu   sync.Mutex
+	keys map[types.NamespacedName]bool
+}
+
+// mark forces the next reconcile of key to re-apply.
+func (d *dirtyTracker) mark(key types.NamespacedName) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.keys == nil {
+		d.keys = make(map[types.NamespacedName]bool)
+	}
+	d.keys[key] = true
+}
+
+// take reports whether key is dirty or unseen, and clears the flag. Unseen counts as dirty so
+// the first pass after an operator restart re-applies once.
+func (d *dirtyTracker) take(key types.NamespacedName) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.keys == nil {
+		d.keys = make(map[types.NamespacedName]bool)
+	}
+	dirty, seen := d.keys[key]
+	d.keys[key] = false
+	return dirty || !seen
+}
+
+// forget drops key's entry, returning it to unseen.
+func (d *dirtyTracker) forget(key types.NamespacedName) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.keys, key)
 }
 
 // +kubebuilder:rbac:groups=wgnet.dev,resources=gateways,verbs=get;list;watch;create;update;patch;delete
@@ -142,14 +180,16 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var gw wgnetv1alpha1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.forgetResponderDirty(req.NamespacedName)
+			r.responderDirty.forget(req.NamespacedName)
+			r.linkDirty.forget(req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
 	if !gw.DeletionTimestamp.IsZero() {
-		r.forgetResponderDirty(req.NamespacedName)
+		r.responderDirty.forget(req.NamespacedName)
+		r.linkDirty.forget(req.NamespacedName)
 		return r.reconcileDelete(ctx, &gw)
 	}
 
@@ -760,6 +800,55 @@ func (r *GatewayReconciler) objectExists(ctx context.Context, namespace, name st
 	return true, nil
 }
 
+// objectHash returns the lowercase hex SHA-256 of obj's JSON encoding with gateAnnotation
+// excluded, so the gate value never feeds itself. obj is not mutated.
+func objectHash(obj client.Object, gateAnnotation string) (string, error) {
+	clone, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return "", fmt.Errorf("deep copy of %T is not a client.Object", obj)
+	}
+	annotations := clone.GetAnnotations()
+	delete(annotations, gateAnnotation)
+	if len(annotations) == 0 {
+		annotations = nil
+	}
+	clone.SetAnnotations(annotations)
+	data, err := json.Marshal(clone)
+	if err != nil {
+		return "", fmt.Errorf("marshal %T: %w", obj, err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// applyObjectIfChanged stamps desired's hash under gateAnnotation and applies only when live
+// differs, reporting whether it applied; force applies always, owner is nil if cluster-scoped.
+func (r *GatewayReconciler) applyObjectIfChanged(ctx context.Context, owner *wgnetv1alpha1.Gateway, gateAnnotation string, desired, live client.Object, force bool) (bool, error) {
+	hash, err := objectHash(desired, gateAnnotation)
+	if err != nil {
+		return false, err
+	}
+	annotations := desired.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string, 1)
+	}
+	annotations[gateAnnotation] = hash
+	desired.SetAnnotations(annotations)
+
+	key := client.ObjectKeyFromObject(desired)
+	switch err := r.Get(ctx, key, live); {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return false, fmt.Errorf("get %T %s: %w", live, key, err)
+	case !force && live.GetAnnotations()[gateAnnotation] == hash:
+		return false, nil
+	}
+	if err := r.apply(ctx, owner, desired); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // apply server-side-applies desired, filling the GVK from the scheme because typed builders omit
 // the TypeMeta SSA requires. A nil gw stamps no ownerReference, as cluster-scoped children need.
 func (r *GatewayReconciler) apply(ctx context.Context, gw *wgnetv1alpha1.Gateway, desired client.Object) error {
@@ -798,6 +887,10 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	responderWorkloadDrift := builder.WithPredicates(responderWorkloadPredicate())
 	responderObjectEvents := handler.EnqueueRequestsFromMapFunc(r.gatewaysForResponderObject)
 
+	linkObjectPredicate := builder.WithPredicates(predicate.NewPredicateFuncs(isLinkObject))
+	linkWorkloadDrift := builder.WithPredicates(linkWorkloadPredicate())
+	linkObjectEvents := handler.EnqueueRequestsFromMapFunc(r.gatewaysForLinkObject)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&wgnetv1alpha1.Gateway{}).
 		// No predicate: the workload status event is the only push signal for pod readiness,
@@ -821,6 +914,17 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&appsv1.Deployment{}, responderObjectEvents, responderWorkloadDrift).
 		Watches(&appsv1.DaemonSet{}, responderObjectEvents, responderWorkloadDrift).
 		Watches(&policyv1.PodDisruptionBudget{}, responderObjectEvents, responderWorkloadDrift).
+		// The same drift signal for the link objects, including the three RBAC kinds and the
+		// cluster-scoped binding, which no Owns covers.
+		Watches(&corev1.ServiceAccount{}, linkObjectEvents, linkObjectPredicate).
+		Watches(&rbacv1.Role{}, linkObjectEvents, linkObjectPredicate).
+		Watches(&rbacv1.RoleBinding{}, linkObjectEvents, linkObjectPredicate).
+		Watches(&rbacv1.ClusterRoleBinding{}, linkObjectEvents, linkObjectPredicate).
+		Watches(&corev1.ConfigMap{}, linkObjectEvents, linkObjectPredicate).
+		Watches(&appsv1.Deployment{}, linkObjectEvents, linkWorkloadDrift).
+		Watches(&appsv1.DaemonSet{}, linkObjectEvents, linkWorkloadDrift).
+		Watches(&networkingv1.NetworkPolicy{}, linkObjectEvents, linkWorkloadDrift).
+		Watches(&policyv1.PodDisruptionBudget{}, linkObjectEvents, linkWorkloadDrift).
 		Complete(r)
 }
 

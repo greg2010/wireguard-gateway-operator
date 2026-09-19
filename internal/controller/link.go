@@ -20,10 +20,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
@@ -37,6 +41,8 @@ const (
 	linkConfigKey = "config.json"
 	// componentLink labels and names the in-cluster link objects.
 	componentLink = "link"
+	// linkNameSuffix trails the Gateway name in every namespaced link object's name.
+	linkNameSuffix = "-link"
 	// linkEndpointSliceClusterRole is the chart-shipped ClusterRole granting EndpointSlice
 	// reads; a fixed cluster-scoped name, the resourceName of the operator's bind grant.
 	linkEndpointSliceClusterRole = "gateway-link-endpointslice-reader"
@@ -113,7 +119,7 @@ func linkSecretName(gw *wgnetv1alpha1.Gateway) string   { return gw.Name + "-lin
 
 // linkComponentName names every namespaced link object of a Gateway: the workload,
 // ConfigMap, NetworkPolicy, PDB, ServiceAccount, Role, RoleBinding and Lease.
-func linkComponentName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + "-link" }
+func linkComponentName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + linkNameSuffix }
 
 // linkClusterRoleBindingName hashes namespace and name into the cluster-scoped binding
 // name; "<namespace>-<name>" is ambiguous when either contains a dash.
@@ -868,16 +874,85 @@ func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1
 	return nil
 }
 
+// linkHashAnnotation carries the hash of the desired link object the operator last applied,
+// so a reconcile that changes nothing issues no write.
+const linkHashAnnotation = "wgnet.dev/link-hash"
+
+// linkWorkloadPredicate filters the link Deployment, DaemonSet, NetworkPolicy and
+// PodDisruptionBudget watches to spec, label and annotation changes: others write their status.
+func linkWorkloadPredicate() predicate.Predicate {
+	return predicate.And(
+		predicate.NewPredicateFuncs(isLinkObject),
+		predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.LabelChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		),
+	)
+}
+
+// isLinkObject reports whether obj is a Gateway's link child: it carries the link component
+// label, or an edit dropped that label from an object a Gateway owns under its link name.
+func isLinkObject(obj client.Object) bool {
+	if obj.GetLabels()["app.kubernetes.io/component"] == componentLink {
+		return true
+	}
+	owner := metav1.GetControllerOf(obj)
+	return isGatewayOwner(owner) && obj.GetName() == owner.Name+linkNameSuffix
+}
+
+// LinkCacheSelector matches every link object the operator applies. It scopes the manager cache
+// for the kinds the reconciler reads back only as link children, so the informers do not hold
+// every such object in the cluster. A link object whose label drifted falls out of the cache and
+// reads NotFound, which makes the next pass re-apply it and restore the label.
+func LinkCacheSelector() labels.Selector {
+	return labels.SelectorFromSet(labels.Set{"app.kubernetes.io/component": componentLink})
+}
+
+// gatewaysForLinkObject marks the Gateway owning obj dirty and enqueues it, so an out-of-band
+// edit to a link object is re-applied even though its hash still matches.
+func (r *GatewayReconciler) gatewaysForLinkObject(_ context.Context, obj client.Object) []reconcile.Request {
+	key, ok := linkObjectGateway(obj)
+	if !ok {
+		return nil
+	}
+	r.linkDirty.mark(key)
+	return []reconcile.Request{{NamespacedName: key}}
+}
+
+// linkObjectGateway resolves the Gateway obj belongs to: a namespaced child through its
+// controller reference, the cluster-scoped binding through the owner labels standing in for one.
+func linkObjectGateway(obj client.Object) (types.NamespacedName, bool) {
+	if owner := metav1.GetControllerOf(obj); isGatewayOwner(owner) {
+		return types.NamespacedName{Namespace: obj.GetNamespace(), Name: owner.Name}, true
+	}
+	labels := obj.GetLabels()
+	namespace, name := labels[ownerNamespaceLabel], labels[ownerNameLabel]
+	if namespace == "" || name == "" {
+		return types.NamespacedName{}, false
+	}
+	return types.NamespacedName{Namespace: namespace, Name: name}, true
+}
+
 // ensureLink applies common link resources and the mode-specific workload. responderTarget is
 // the responder Service ClusterIP, folded into a Cluster Gateway's health DNAT target.
-func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int, responders map[string]string, responderTarget string) error {
-	if err := r.apply(ctx, gw, buildLinkServiceAccount(gw)); err != nil {
+func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int, responders map[string]string, responderTarget string) (retErr error) {
+	key := client.ObjectKeyFromObject(gw)
+	force := r.linkDirty.take(key)
+	// A forced pass that fails leaves objects unapplied under a matching hash; keep the flag.
+	defer func() {
+		if force && retErr != nil {
+			r.linkDirty.mark(key)
+		}
+	}()
+
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkServiceAccount(gw), &corev1.ServiceAccount{}, force); err != nil {
 		return err
 	}
-	if err := r.apply(ctx, gw, buildLinkRole(gw)); err != nil {
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkRole(gw), &rbacv1.Role{}, force); err != nil {
 		return err
 	}
-	if err := r.apply(ctx, gw, buildLinkRoleBinding(gw)); err != nil {
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkRoleBinding(gw), &rbacv1.RoleBinding{}, force); err != nil {
 		return err
 	}
 
@@ -885,30 +960,37 @@ func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Ga
 	if err != nil {
 		return err
 	}
-	if err := r.apply(ctx, gw, cm); err != nil {
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, cm, &corev1.ConfigMap{}, force); err != nil {
 		return err
 	}
 
 	if ident != nil {
-		if err := r.apply(ctx, nil, buildLinkClusterRoleBinding(gw)); err != nil {
+		if _, err := r.applyObjectIfChanged(ctx, nil, linkHashAnnotation, buildLinkClusterRoleBinding(gw), &rbacv1.ClusterRoleBinding{}, force); err != nil {
 			return err
 		}
-		return r.apply(ctx, gw, buildLinkDaemonSet(gw, r.Config, ident))
-	}
-
-	if err := r.apply(ctx, gw, buildLinkNetworkPolicy(gw, backends)); err != nil {
+		_, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkDaemonSet(gw, r.Config, ident), &appsv1.DaemonSet{}, force)
 		return err
 	}
-	if err := r.apply(ctx, gw, buildLinkDeployment(gw, r.Config)); err != nil {
+
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkNetworkPolicy(gw, backends), &networkingv1.NetworkPolicy{}, force); err != nil {
+		return err
+	}
+	if _, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkDeployment(gw, r.Config), &appsv1.Deployment{}, force); err != nil {
 		return err
 	}
 
 	if effectiveLinkReplicas(gw) > 1 {
-		return r.apply(ctx, gw, buildLinkPodDisruptionBudget(gw))
+		_, err := r.applyObjectIfChanged(ctx, gw, linkHashAnnotation, buildLinkPodDisruptionBudget(gw), &policyv1.PodDisruptionBudget{}, force)
+		return err
 	}
 	// A scale-down to one replica must not leave a PDB behind to block node drains.
-	pdb := &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{Name: linkComponentName(gw), Namespace: gw.Namespace},
+	pdb := &policyv1.PodDisruptionBudget{}
+	found, err := r.objectExists(ctx, gw.Namespace, linkComponentName(gw), pdb)
+	if err != nil {
+		return err
+	}
+	if !found || pdb.GetDeletionTimestamp() != nil {
+		return nil
 	}
 	return r.deleteIfPresent(ctx, pdb)
 }
