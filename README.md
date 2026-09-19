@@ -327,7 +327,13 @@ range 1–65535), `subnet`, `gatewayAddress`, `linkAddress`, `keepalive`, `mtu`,
 and `reconcileInterval`. An omitted `spec.wireguard` yields the standard tunnel.
 `spec.trafficPolicy` selects the data path, `Cluster` by default; see
 [Traffic policy](#traffic-policy). `spec.link` configures the link workload:
-`replicas` and a `nodeSelector` applied to its pod template.
+`replicas` and a `nodeSelector` applied to its pod template. `spec.responder`
+configures the per-Gateway responder: `image` (optional, defaults to the
+operator's `GATEWAY_RESPONDER_IMAGE`), `port` (optional, 1–65535, defaults to
+`27000`; the port the responder listens on and the health DNAT targets),
+`replicas` (optional, defaults to `2`, `Cluster` only — rejected under
+`Local`, which runs one pod per node instead), and `resources` (optional, a
+`corev1.ResourceRequirements` for the responder container).
 
 ```yaml
 apiVersion: wgnet.dev/v1alpha1
@@ -371,13 +377,22 @@ server:
 
 - Each forward's `(port, protocol)` combination must be unique.
 - A UDP forward must not use `spec.wireguard.listenPort`.
-- Under `trafficPolicy: Cluster`, a TCP forward must not use port `8080`, the
-  link's health port.
+- Under `trafficPolicy: Cluster`, a TCP forward must not use the link's health
+  port, `spec.link.healthPort` (`27000` when unset).
 - At most 64 forwards per Gateway.
 
-Under `Local` the health port is `27000` plus `status.link.id`. The id is
-assigned by the operator after apply, so a TCP forward on that port fails at
-reconcile with `ReservedHealthPort`.
+Every Gateway's `metadata.name` is at most 53 characters and must be a
+DNS-1035 label (lowercase alphanumerics and hyphens, starting with a letter).
+
+`spec.link.healthPort` is Cluster only and defaults to `27000`: it is the port
+the cloud health check and the MIG autohealer probe on the VM, and the port
+the link DNATs the tunnel's health traffic to the responder. It is mutable
+and reserved from TCP forwards.
+
+Under `Local`, `spec.link.healthPort` is rejected and the health port is
+`27000` plus `status.link.id` instead. The id is assigned by the operator
+after apply, so a TCP forward on that port fails at reconcile with
+`ReservedHealthPort`.
 
 The `ADDRESS` column is the gateway's public IP, mirrored onto `status.address`
 once provisioning completes. For `type: External` it is the address reserved
@@ -511,11 +526,35 @@ status:
 | `Departing` | Missing from the last one or two listings. Keeps its slot, key, address and peer. |
 | `Departed` | Missing from three listings in a row, or listed as `DELETING` or `ABANDONING`. The peer is removed; the slot is freed once its cloud resources are gone. If it shows up again it goes back to `Active` on the same slot. |
 
-GCP health-checks every member at `/forwarded-healthz` on the link's health
-port, over the same path client traffic is forwarded on. The load balancer's
-check runs every 5s and stops sending traffic to a member after 2 failures. The
-MIG's autohealing check runs every 30s and recreates a VM that fails 10 checks
-in a row (five minutes).
+GCP health-checks every member at `/forwarded-healthz` on the health port,
+over the same path client traffic takes: the VM DNATs the probe to the tunnel
+address exactly as it does a forward. The link never answers the probe
+itself. In `Local` mode the holder DNATs the health port to the responder pod
+on its own node; in `Cluster` mode the link DNATs it to the responder
+Service's ClusterIP, the same path its forwards take. The reply returns
+through the tunnel either way. A 200 there proves the VM, its DNAT, the
+tunnel, the link and the pod network all work.
+
+Each Gateway owns its responder, in the Gateway's own namespace and named
+`<gateway>-responder`: a Deployment of `spec.responder.replicas` pods under
+`trafficPolicy: Cluster`, or a DaemonSet with one pod per node under
+`trafficPolicy: Local`, plus a ClusterIP Service of the same name. Both are
+owned by the Gateway and deleted with it.
+
+A Gateway's `ResponderMissing` condition goes `True` while a responder is
+missing, and a Warning event is emitted; its data plane is still applied
+without the health DNAT. In `Local` mode it names the link-pod nodes with no
+ready responder pod (reason `NoResponderOnNode`). In `Cluster` mode it goes
+`True` with reason `NoResponderRunning` while no ready responder pod exists,
+and `False` with reason `ResponderPresent` otherwise.
+
+| Chart value | Operator env | Meaning |
+| --- | --- | --- |
+| `responder.image.repository`, `responder.image.tag` | `GATEWAY_RESPONDER_IMAGE` | Default responder container image; a Gateway's `spec.responder.image` overrides it. |
+
+The load balancer's check runs every 5s and stops sending traffic to a
+member after 2 failures. The MIG's autohealing check runs every 30s and
+recreates a VM that fails 10 checks in a row (five minutes).
 
 A recreated VM keeps its name, slot, key and address. Autohealing ignores a new
 VM for `initialDelaySec`, 900 seconds, while it boots and fetches its key
@@ -607,9 +646,9 @@ then the condition is `Ready=False`; this table is in precedence order.
 The `Local` node checks (`rp_filter`, `ip_forward`, sysctl readability) run once at link
 start, so after fixing a node restart its link pod for the fault to clear: delete the
 pod and the DaemonSet recreates it. A link pod that finds its Gateway's interface
-already on the node at start keeps it: the interface is fenced once a link pod on
-another node is observed holding the Lease, and re-applied in place if this pod
-acquires the Lease.
+already on the node at start keeps it: the standby tears its held slots down once
+a link pod on another node is observed holding the Lease, and applies them again
+if this pod acquires the Lease.
 
 `spec.wireguard.linkAddress` (default `10.99.0.2`) may be identical across
 Gateways in either mode. A `Local` link assigns it to that Gateway's own tunnel
