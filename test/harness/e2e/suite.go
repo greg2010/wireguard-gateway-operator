@@ -59,6 +59,13 @@ const (
 	orphanDrainTimeout = 4 * time.Minute
 )
 
+// responderImage pins the chart's default responder image so Setup pulls and loads it
+// once, instead of the cluster pulling it from Docker Hub, matching operatorImage/linkImage.
+var responderImage = hk8s.ImageRef{
+	Repository: "docker.io/nginxinc/nginx-unprivileged",
+	Tag:        "1.28.2-alpine",
+}
+
 // Suite holds the state created once per `go test` invocation: cluster, helm driver,
 // client, images and GCP env. Tests call Start to get a per-test Stack.
 type Suite struct {
@@ -209,12 +216,22 @@ func Setup(ctx context.Context) (*Suite, error) {
 		return suite, fmt.Errorf("build link image: %w", err)
 	}
 	suite.linkImage = linkImage
+
+	// The responder image is not built by this repo, so pull it on the host the same
+	// way a missing operator/link build would fail: naming the image on error.
+	if out, err := shared.RunCmd(ctx, nil, "docker", "pull", responderImage.Ref()); err != nil {
+		return suite, fmt.Errorf("docker pull responder image %s: %w\n%s", responderImage.Ref(), err, out)
+	}
+
 	if !useExisting() {
 		if err := cluster.LoadImage(ctx, operatorImage.Ref()); err != nil {
 			return suite, fmt.Errorf("kind load operator image: %w", err)
 		}
 		if err := cluster.LoadImage(ctx, linkImage.Ref()); err != nil {
 			return suite, fmt.Errorf("kind load link image: %w", err)
+		}
+		if err := cluster.LoadImage(ctx, responderImage.Ref()); err != nil {
+			return suite, fmt.Errorf("kind load responder image: %w", err)
 		}
 	}
 
@@ -244,9 +261,10 @@ func Setup(ctx context.Context) (*Suite, error) {
 // CRD and XRD readiness signals helm --wait does not cover.
 func (s *Suite) installOperator(ctx context.Context) error {
 	valuesPath, err := writeValues(os.TempDir(), valuesParams{
-		nameOverride:  operatorNameOverride,
-		operatorImage: s.operatorImage,
-		linkImage:     s.linkImage,
+		nameOverride:   operatorNameOverride,
+		operatorImage:  s.operatorImage,
+		linkImage:      s.linkImage,
+		responderImage: responderImage,
 	})
 	if err != nil {
 		return err

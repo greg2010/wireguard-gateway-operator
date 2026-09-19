@@ -10,13 +10,13 @@ import (
 	"github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
 
-// operatorValues is the e2e overlay layered over the chart's values.yaml: it sets
-// the run's images and pins nameOverride for a deterministic Deployment name. Every
-// per-Gateway field lives on the Gateway CR, not here.
+// operatorValues is the e2e overlay layered over the chart's values.yaml: images and
+// nameOverride only, since every per-Gateway field lives on the Gateway CR.
 type operatorValues struct {
 	NameOverride string        `yaml:"nameOverride"`
 	Operator     operatorBlock `yaml:"operator"`
 	Link         imageBlock    `yaml:"link"`
+	Responder    imageBlock    `yaml:"responder"`
 }
 
 type operatorBlock struct {
@@ -38,11 +38,12 @@ type valuesParams struct {
 	// operatorImage and linkImage are the run's freshly built, kind-loaded images.
 	operatorImage k8s.ImageRef
 	linkImage     k8s.ImageRef
+	// responderImage is the harness's pulled, kind-loaded default responder image.
+	responderImage k8s.ImageRef
 }
 
-// writeValues renders the operator chart overlay for the single install and
-// writes it to a temp file, returning the path. The caller passes the path to
-// helm via -f.
+// writeValues renders the operator chart overlay to a temp file and returns its path, for the
+// caller to pass to helm via -f.
 func writeValues(dir string, p valuesParams) (string, error) {
 	v := operatorValues{
 		NameOverride: p.nameOverride,
@@ -51,6 +52,9 @@ func writeValues(dir string, p valuesParams) (string, error) {
 		},
 		Link: imageBlock{
 			Image: imageValues{Repository: p.linkImage.Repository, Tag: p.linkImage.Tag},
+		},
+		Responder: imageBlock{
+			Image: imageValues{Repository: p.responderImage.Repository, Tag: p.responderImage.Tag},
 		},
 	}
 

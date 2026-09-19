@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"runtime"
 	"slices"
 	"time"
 
@@ -133,17 +135,42 @@ func (k *KindCluster) Nodes() ([]string, error) {
 	return out, nil
 }
 
-// LoadImage side-loads a local docker image into the cluster's nodes. The Go API does
-// not expose image loading, so this shells out and kind must be on PATH.
+// LoadImage side-loads a local docker image into the cluster's nodes by shelling out, since the
+// Go API does not expose image loading and kind must be on PATH. It writes a single-platform
+// archive to work around containerd image store multi-platform indexes, which `kind load
+// docker-image` fails on (kind issue 3795).
 func (k *KindCluster) LoadImage(ctx context.Context, imageRef string) error {
+	platform := "linux/" + runtime.GOARCH
 	k.log.Info("loading image into kind cluster",
 		zap.String("cluster", k.name),
 		zap.String("image", imageRef),
+		zap.String("platform", platform),
 	)
-	out, err := shared.RunCmd(ctx, nil, "kind", "load", "docker-image",
-		"--name", k.name, imageRef)
+
+	f, err := os.CreateTemp("", "kind-image-*.tar")
 	if err != nil {
-		return fmt.Errorf("kind load docker-image %s: %w\n%s", imageRef, err, out)
+		return fmt.Errorf("create image archive temp file: %w", err)
+	}
+	archivePath := f.Name()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close image archive temp file %s: %w", archivePath, err)
+	}
+	defer func() {
+		if err := os.Remove(archivePath); err != nil {
+			k.log.Warn("failed to remove image archive temp file",
+				zap.String("path", archivePath), zap.Error(err))
+		}
+	}()
+
+	if out, err := shared.RunCmd(ctx, nil, "docker", "image", "save",
+		"--platform", platform, "-o", archivePath, imageRef); err != nil {
+		return fmt.Errorf("docker image save %s: %w\n%s", imageRef, err, out)
+	}
+
+	out, err := shared.RunCmd(ctx, nil, "kind", "load", "image-archive",
+		archivePath, "--name", k.name)
+	if err != nil {
+		return fmt.Errorf("kind load image-archive %s: %w\n%s", imageRef, err, out)
 	}
 	return nil
 }
