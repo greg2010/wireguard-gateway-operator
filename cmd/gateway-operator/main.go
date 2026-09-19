@@ -8,10 +8,14 @@ import (
 	"os"
 
 	"github.com/go-logr/zapr"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -25,9 +29,8 @@ import (
 // Held in the operator's namespace so a single replica reconciles at a time.
 const leaderElectionID = "gateway-operator-leader"
 
-// managerConfig carries the manager-runtime knobs that are distinct from the
-// reconciler's domain Config: leader election and the metrics/health bind
-// addresses. Populated from the process environment via config.Load.
+// managerConfig holds manager-runtime knobs distinct from the reconciler's domain
+// Config: leader election and metrics/health bind addresses, populated via config.Load.
 type managerConfig struct {
 	// LeaderElection enables single-active-replica reconciliation via a Lease.
 	LeaderElection bool `envconfig:"GATEWAY_OPERATOR_LEADER_ELECTION" default:"true"`
@@ -35,6 +38,20 @@ type managerConfig struct {
 	MetricsBindAddress string `envconfig:"GATEWAY_OPERATOR_METRICS_ADDR" default:":8080"`
 	// HealthProbeBindAddress is the healthz/readyz address.
 	HealthProbeBindAddress string `envconfig:"GATEWAY_OPERATOR_HEALTH_ADDR" default:":8081"`
+}
+
+// cacheOptions limits cached kinds to link children; unscoped, the cache would hold every
+// ServiceAccount/Role/RoleBinding/ClusterRoleBinding, growing with the cluster, not the operator.
+func cacheOptions() cache.Options {
+	linkObjects := cache.ByObject{Label: controller.LinkCacheSelector()}
+	return cache.Options{
+		ByObject: map[client.Object]cache.ByObject{
+			&corev1.ServiceAccount{}:     linkObjects,
+			&rbacv1.Role{}:               linkObjects,
+			&rbacv1.RoleBinding{}:        linkObjects,
+			&rbacv1.ClusterRoleBinding{}: linkObjects,
+		},
+	}
 }
 
 func main() {
@@ -79,6 +96,7 @@ func run() error {
 		LeaderElection:          mgrCfg.LeaderElection,
 		LeaderElectionID:        leaderElectionID,
 		LeaderElectionNamespace: reconcilerCfg.PodNamespace,
+		Cache:                   cacheOptions(),
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
