@@ -17,6 +17,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -422,7 +423,7 @@ func TestBuildResponderDeployment(t *testing.T) {
 			if len(c.Ports) != 1 || c.Ports[0].ContainerPort != tt.wantPort {
 				t.Errorf("container ports = %+v, want a single port %d", c.Ports, tt.wantPort)
 			}
-			if !resourceRequirementsEqual(c.Resources, gw.Spec.Responder.Resources) {
+			if !apiequality.Semantic.DeepEqual(c.Resources, gw.Spec.Responder.Resources) {
 				t.Errorf("resources = %+v, want %+v", c.Resources, gw.Spec.Responder.Resources)
 			}
 
