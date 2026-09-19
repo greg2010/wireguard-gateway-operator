@@ -665,17 +665,8 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				})
 
 				inst := desiredResource(t, resp, "instance")
-				if got := nestedString(t, inst, "spec", "forProvider", "scheduling", "provisioningModel"); got != "SPOT" {
-					t.Errorf("instance scheduling.provisioningModel = %q, want SPOT", got)
-				}
-				if got := nestedBool(t, inst, "spec", "forProvider", "scheduling", "preemptible"); !got {
-					t.Errorf("instance scheduling.preemptible = false, want true under spot")
-				}
-				if got := nestedString(t, inst, "spec", "forProvider", "scheduling", "onHostMaintenance"); got != "TERMINATE" {
-					t.Errorf("instance scheduling.onHostMaintenance = %q, want TERMINATE", got)
-				}
-				if nestedBool(t, inst, "spec", "forProvider", "scheduling", "automaticRestart") {
-					t.Errorf("instance scheduling.automaticRestart = true, want false under spot")
+				if got, want := nestedMap(t, inst, "spec", "forProvider", "scheduling"), expectedSpotScheduling(); !reflect.DeepEqual(got, want) {
+					t.Errorf("instance scheduling = %v, want %v", got, want)
 				}
 				if got := nestedString(t, inst, "spec", "forProvider", "desiredStatus"); got != "RUNNING" {
 					t.Errorf("instance desiredStatus = %q, want RUNNING", got)
@@ -869,6 +860,20 @@ func TestXGatewayGCPComposition(t *testing.T) {
 					"address", "firewall", "firewall-iap", "instance",
 					"secret", "secret-iam", "secret-version", "service-account",
 				})
+			},
+		},
+		{
+			name: "load balanced spot template carries the spot scheduling block",
+			spec: lbSpec(map[string]any{"spot": true}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				template := desiredResource(t, resp, templateResourceName(lbTemplateRevision))
+				if got, want := nestedMap(t, template, "spec", "forProvider"), expectedTemplate(lbSpec(map[string]any{"spot": true}), lbTemplateRevision).forProvider; !reflect.DeepEqual(got, want) {
+					t.Errorf("template forProvider = %v, want %v", got, want)
+				}
 			},
 		},
 		{
@@ -2023,9 +2028,24 @@ func expectedTemplate(spec map[string]any, revision string) expectedTemplateReso
 			"scopes": []any{"https://www.googleapis.com/auth/cloud-platform"},
 		},
 	}
+	if spot, _ := spec["spot"].(bool); spot {
+		forProvider["scheduling"] = expectedSpotScheduling()
+	}
 	return expectedTemplateResource{
 		externalName: fmt.Sprintf("%s-%s", xrName, revision),
 		forProvider:  forProvider,
+	}
+}
+
+// expectedSpotScheduling is the scheduling block spot Instance and InstanceTemplate both render.
+// instanceTerminationAction is explicit: GCP's default otherwise triggers permanent provider drift.
+func expectedSpotScheduling() map[string]any {
+	return map[string]any{
+		"provisioningModel":         "SPOT",
+		"preemptible":               true,
+		"automaticRestart":          false,
+		"onHostMaintenance":         "TERMINATE",
+		"instanceTerminationAction": "STOP",
 	}
 }
 
