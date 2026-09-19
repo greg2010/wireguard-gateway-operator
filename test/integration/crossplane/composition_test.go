@@ -856,6 +856,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
 				t.Helper()
 				assertExactDesiredNames(t, resp, []string{"address", "service-account"})
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{})
 			},
 		},
 		{
@@ -1243,7 +1244,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 		},
 		{
 			name: "health checks rendered shape",
-			spec: lbSpec(map[string]any{"healthPort": 8080}),
+			spec: lbSpec(map[string]any{"healthPort": 27000}),
 			observed: map[string]*fnv1.Resource{
 				"service-account": observedServiceAccount(t),
 			},
@@ -1255,7 +1256,7 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				} {
 					hc := desiredResource(t, resp, name)
 					httpCheck := nestedMap(t, hc, "spec", "forProvider", "httpHealthCheck")
-					wantHTTP := map[string]any{"port": float64(8080), "requestPath": "/forwarded-healthz"}
+					wantHTTP := map[string]any{"port": float64(27000), "requestPath": "/forwarded-healthz"}
 					if !reflect.DeepEqual(httpCheck, wantHTTP) {
 						t.Errorf("%s httpHealthCheck = %v, want %v", name, httpCheck, wantHTTP)
 					}
@@ -1265,6 +1266,39 @@ func TestXGatewayGCPComposition(t *testing.T) {
 							t.Errorf("%s forProvider[%s] = %v, want %v", name, k, got, v)
 						}
 					}
+				}
+			},
+		},
+		{
+			name: "health checks rendered shape, non-default port",
+			spec: lbSpec(map[string]any{"healthPort": 8181}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				for name, want := range map[string]map[string]any{
+					"health-check-lb":  {"checkIntervalSec": float64(5), "timeoutSec": float64(5), "healthyThreshold": float64(2), "unhealthyThreshold": float64(2)},
+					"health-check-mig": {"checkIntervalSec": float64(30), "timeoutSec": float64(10), "healthyThreshold": float64(2), "unhealthyThreshold": float64(10)},
+				} {
+					hc := desiredResource(t, resp, name)
+					httpCheck := nestedMap(t, hc, "spec", "forProvider", "httpHealthCheck")
+					wantHTTP := map[string]any{"port": float64(8181), "requestPath": "/forwarded-healthz"}
+					if !reflect.DeepEqual(httpCheck, wantHTTP) {
+						t.Errorf("%s httpHealthCheck = %v, want %v", name, httpCheck, wantHTTP)
+					}
+					forProvider := nestedMap(t, hc, "spec", "forProvider")
+					for k, v := range want {
+						if got := forProvider[k]; got != v {
+							t.Errorf("%s forProvider[%s] = %v, want %v", name, k, got, v)
+						}
+					}
+				}
+
+				probe := desiredResource(t, resp, "firewall-probe")
+				wantAllow := []any{map[string]any{"protocol": "tcp", "ports": []any{"8181"}}}
+				if got := nestedSlice(t, probe, "spec", "forProvider", "allow"); !reflect.DeepEqual(got, wantAllow) {
+					t.Errorf("firewall-probe allow = %v, want %v", got, wantAllow)
 				}
 			},
 		},
@@ -1352,6 +1386,99 @@ func TestXGatewayGCPComposition(t *testing.T) {
 				if got, want := nestedMap(t, bs, "metadata", "labels"), map[string]any{"wgnet.dev/component": "backend-service"}; !reflect.DeepEqual(got, want) {
 					t.Errorf("backend-service metadata.labels = %v, want %v", got, want)
 				}
+			},
+		},
+		{
+			name: "load-balanced external by ip, service account observed",
+			spec: lbSpec(map[string]any{
+				"address": map[string]any{"type": "External", "external": map[string]any{"ip": "203.0.113.10"}},
+			}),
+			observed: map[string]*fnv1.Resource{
+				"service-account": observedServiceAccount(t),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"firewall", "firewall-iap", "firewall-probe",
+					"forwarding-rule", "health-check-lb", "health-check-mig", "service-account",
+					templateResourceName(lbTemplateRevision),
+				})
+				fr := desiredResource(t, resp, "forwarding-rule")
+				if got := nestedString(t, fr, "spec", "forProvider", "ipAddress"); got != "203.0.113.10" {
+					t.Errorf("forwarding-rule ipAddress = %q, want %q", got, "203.0.113.10")
+				}
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != "203.0.113.10" {
+					t.Errorf("XR status.address = %q, want %q", got, "203.0.113.10")
+				}
+			},
+		},
+		{
+			name: "load-balanced external by name, empty observed set",
+			spec: lbSpec(map[string]any{
+				"address": map[string]any{"type": "External", "external": map[string]any{"name": "edge-ip"}},
+			}),
+			observed: map[string]*fnv1.Resource{},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{"address-observed", "service-account"})
+
+				addr := desiredResource(t, resp, "address-observed")
+				policies := nestedSlice(t, addr, "spec", "managementPolicies")
+				assertSameSet(t, "address-observed managementPolicies", toStrings(t, policies), []string{"Observe"})
+				if got := nestedString(t, addr, "metadata", "annotations", "crossplane.io/external-name"); got != "edge-ip" {
+					t.Errorf("address-observed external-name = %q, want %q", got, "edge-ip")
+				}
+				assertAddressForProvider(t, addr, map[string]any{"region": testRegion})
+
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{})
+			},
+		},
+		{
+			name: "load-balanced external by name, address-observed reports",
+			spec: lbSpec(map[string]any{
+				"address": map[string]any{"type": "External", "external": map[string]any{"name": "edge-ip"}},
+			}),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", "203.0.113.11"),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall", "firewall-iap", "firewall-probe",
+					"forwarding-rule", "health-check-lb", "health-check-mig", "service-account",
+					templateResourceName(lbTemplateRevision),
+				})
+				fr := desiredResource(t, resp, "forwarding-rule")
+				if got := nestedString(t, fr, "spec", "forProvider", "ipAddress"); got != "203.0.113.11" {
+					t.Errorf("forwarding-rule ipAddress = %q, want %q", got, "203.0.113.11")
+				}
+				status := compositeStatus(t, resp)
+				assertExactStatusKeys(t, status, []string{"address", "serviceAccountEmail"})
+				if got := digString(status, "address"); got != "203.0.113.11" {
+					t.Errorf("XR status.address = %q, want %q", got, "203.0.113.11")
+				}
+			},
+		},
+		{
+			name: "load-balanced external by name, address-observed not yet reporting",
+			spec: lbSpec(map[string]any{
+				"address": map[string]any{"type": "External", "external": map[string]any{"name": "edge-ip"}},
+			}),
+			observed: map[string]*fnv1.Resource{
+				"service-account":  observedServiceAccount(t),
+				"address-observed": observedAddress(t, "address-observed", ""),
+			},
+			assert: func(t *testing.T, resp *fnv1.RunFunctionResponse) {
+				t.Helper()
+				assertExactDesiredNames(t, resp, []string{
+					"address-observed", "firewall", "firewall-iap", "firewall-probe",
+					"health-check-lb", "health-check-mig", "service-account",
+					templateResourceName(lbTemplateRevision),
+				})
+				assertExactStatusKeys(t, compositeStatus(t, resp), []string{"serviceAccountEmail"})
 			},
 		},
 		{
@@ -1846,7 +1973,7 @@ func lbSpec(overrides map[string]any) map[string]any {
 		"sessionAffinity":    "NONE",
 		"targetSize":         1,
 		"zones":              []any{testRegion + "-a"},
-		"healthPort":         8080,
+		"healthPort":         27000,
 		"templateRevision":   lbTemplateRevision,
 		"members":            []any{},
 	}
