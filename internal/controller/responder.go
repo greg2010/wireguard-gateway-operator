@@ -229,12 +229,11 @@ func buildResponderDeployment(cfg Config, gw *wgnetv1alpha1.Gateway) *appsv1.Dep
 	}
 }
 
-// buildResponderDaemonSet builds a Local Gateway's responder workload: one pod per node the
-// link DaemonSet itself can land on (the same spec.link.nodeSelector), tolerating every taint.
+// buildResponderDaemonSet builds a Local Gateway's responder workload: one pod per node the link
+// DaemonSet can land on, through the same spec.link.nodeSelector and absence of tolerations.
 func buildResponderDaemonSet(cfg Config, gw *wgnetv1alpha1.Gateway) *appsv1.DaemonSet {
 	selector := responderSelectorLabels(gw)
 	tmpl := responderPodTemplate(cfg, gw)
-	tmpl.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
 	tmpl.Spec.NodeSelector = gw.Spec.Link.NodeSelector
 
 	return &appsv1.DaemonSet{

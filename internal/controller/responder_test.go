@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -461,8 +462,18 @@ func TestBuildResponderDeployment(t *testing.T) {
 	})
 }
 
-// TestBuildResponderDaemonSet pins the Local-mode responder DaemonSet: identity, labels,
-// selector, tolerations, and a nodeSelector matching the link DaemonSet's own.
+type podScheduling struct {
+	NodeSelector map[string]string
+	Tolerations  []corev1.Toleration
+	Affinity     *corev1.Affinity
+}
+
+func schedulingOf(spec corev1.PodSpec) podScheduling {
+	return podScheduling{NodeSelector: spec.NodeSelector, Tolerations: spec.Tolerations, Affinity: spec.Affinity}
+}
+
+// TestBuildResponderDaemonSet pins the Local-mode responder DaemonSet: identity, labels, selector,
+// and scheduling constraints identical to the link DaemonSet's, so both land on the same nodes.
 func TestBuildResponderDaemonSet(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -478,6 +489,7 @@ func TestBuildResponderDaemonSet(t *testing.T) {
 			gw := newGateway("edge", "wg-system", nil, nil)
 			gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
 			gw.Spec.Link.NodeSelector = tt.wantNodeSelector
+			gw.Status.Link.ID = 3
 
 			ds := buildResponderDaemonSet(cfg, gw)
 
@@ -493,15 +505,13 @@ func TestBuildResponderDaemonSet(t *testing.T) {
 			if ds.Spec.Template.Spec.AutomountServiceAccountToken == nil || *ds.Spec.Template.Spec.AutomountServiceAccountToken {
 				t.Errorf("automountServiceAccountToken = %v, want false", ds.Spec.Template.Spec.AutomountServiceAccountToken)
 			}
-			wantTolerations := []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
-			if !slices.Equal(ds.Spec.Template.Spec.Tolerations, wantTolerations) {
-				t.Errorf("tolerations = %+v, want %+v", ds.Spec.Template.Spec.Tolerations, wantTolerations)
-			}
 			if !maps.Equal(ds.Spec.Template.Spec.NodeSelector, tt.wantNodeSelector) {
 				t.Errorf("nodeSelector = %v, want %v", ds.Spec.Template.Spec.NodeSelector, tt.wantNodeSelector)
 			}
-			if ds.Spec.Template.Spec.Affinity != nil {
-				t.Errorf("affinity = %+v, want nil on the daemonset", ds.Spec.Template.Spec.Affinity)
+			linkDS := buildLinkDaemonSet(gw, cfg, linkIdentityOf(gw))
+			got := schedulingOf(ds.Spec.Template.Spec)
+			if want := schedulingOf(linkDS.Spec.Template.Spec); !reflect.DeepEqual(got, want) {
+				t.Errorf("responder scheduling = %+v, want the link daemonset's %+v", got, want)
 			}
 			if ds.Spec.UpdateStrategy.Type != appsv1.RollingUpdateDaemonSetStrategyType {
 				t.Errorf("updateStrategy = %q, want RollingUpdate", ds.Spec.UpdateStrategy.Type)
