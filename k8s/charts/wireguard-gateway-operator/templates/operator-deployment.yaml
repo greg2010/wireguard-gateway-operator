@@ -42,6 +42,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: GATEWAY_RESPONDER_IMAGE
+              value: {{ include "wireguard-gateway-operator.responderImage" . | quote }}
             - name: GATEWAY_LINK_IMAGE
               value: {{ include "wireguard-gateway-operator.linkImage" . | quote }}
             - name: GATEWAY_LINK_IMAGE_PULL_POLICY

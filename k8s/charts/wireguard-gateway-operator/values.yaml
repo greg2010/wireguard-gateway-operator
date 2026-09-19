@@ -39,6 +39,13 @@ link:
   # imagePullPolicy for the link container. Maps GATEWAY_LINK_IMAGE_PULL_POLICY.
   pullPolicy: IfNotPresent
 
+responder:
+  # Default responder image; a Gateway's spec.responder.image overrides it.
+  # Maps GATEWAY_RESPONDER_IMAGE.
+  image:
+    repository: docker.io/nginxinc/nginx-unprivileged
+    tag: 1.28.2-alpine
+
 gcp:
   # Membership discovery reads this existing Secret.
   # Maps GATEWAY_GCP_CREDENTIALS_SECRET/GATEWAY_GCP_CREDENTIALS_KEY.

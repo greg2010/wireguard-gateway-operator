@@ -42,3 +42,8 @@ app.kubernetes.io/component: {{ .component }}
 {{- define "wireguard-gateway-operator.linkImage" -}}
 {{- printf "%s:%s" .Values.link.image.repository .Values.link.image.tag -}}
 {{- end }}
+
+{{/* The operator passes this to itself via the GATEWAY_RESPONDER_IMAGE env. */}}
+{{- define "wireguard-gateway-operator.responderImage" -}}
+{{- printf "%s:%s" .Values.responder.image.repository .Values.responder.image.tag -}}
+{{- end }}
