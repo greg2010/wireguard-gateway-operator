@@ -31,22 +31,62 @@ type FirewallAllowed struct {
 	Ports []string `json:"ports"`
 }
 
-// SharedNetworkCount returns 1 if SharedNetworkName exists, else 0.
-// It avoids the eventually consistent list API after teardown.
-func (s *Suite) SharedNetworkCount(ctx context.Context) (int, error) {
+// sharedNetwork is the subset of `gcloud compute networks describe --format=json` the
+// residual description reports.
+type sharedNetwork struct {
+	Name        string   `json:"name"`
+	Subnetworks []string `json:"subnetworks"`
+}
+
+// SharedNetworkResidual describes what is left of SharedNetworkName, empty once it is gone.
+// It describes rather than lists to avoid the eventually consistent list API after teardown.
+func (s *Suite) SharedNetworkResidual(ctx context.Context) (string, error) {
 	auth := gcpAuth{projectID: s.env.ProjectID, credsFile: s.env.CredsFile}
 	out, err := runGcloud(ctx, auth,
 		"compute", "networks", "describe", SharedNetworkName,
 		"--project", auth.projectID,
-		"--format", "value(name)",
+		"--format", "json",
 	)
 	if err != nil {
 		if isNotFound(err) {
-			return 0, nil
+			return "", nil
 		}
-		return 0, fmt.Errorf("describe shared network %s: %w\n%s", SharedNetworkName, err, out)
+		return "", fmt.Errorf("describe shared network %s: %w\n%s", SharedNetworkName, err, out)
 	}
-	return 1, nil
+	var network sharedNetwork
+	if err := json.Unmarshal([]byte(out), &network); err != nil {
+		return "", fmt.Errorf("decode shared network %s: %w", SharedNetworkName, err)
+	}
+	return fmt.Sprintf("network %s present, subnetworks=%d", SharedNetworkName, len(network.Subnetworks)), nil
+}
+
+// SharedNetworkAttachments names the firewall rules and routes still on SharedNetworkName,
+// the resources whose deletion the VPC waits on. Auto-created default-route-* entries are
+// listed too; they are informative rather than leaks.
+func (s *Suite) SharedNetworkAttachments(ctx context.Context) (string, error) {
+	auth := gcpAuth{projectID: s.env.ProjectID, credsFile: s.env.CredsFile}
+	rules, err := networkAttachmentNames(ctx, auth, "firewall-rules")
+	if err != nil {
+		return "", err
+	}
+	routes, err := networkAttachmentNames(ctx, auth, "routes")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("firewall-rules=[%s] routes=[%s]", rules, routes), nil
+}
+
+func networkAttachmentNames(ctx context.Context, auth gcpAuth, kind string) (string, error) {
+	out, err := runGcloud(ctx, auth,
+		"compute", kind, "list",
+		"--project", auth.projectID,
+		"--filter", "network~/"+SharedNetworkName+"$",
+		"--format", "value(name)",
+	)
+	if err != nil {
+		return "", fmt.Errorf("list %s on network %s: %w\n%s", kind, SharedNetworkName, err, out)
+	}
+	return strings.Join(strings.Fields(out), " "), nil
 }
 
 // isNotFound matches case-insensitive gcloud "not found" or 404 errors.

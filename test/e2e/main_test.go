@@ -10,9 +10,9 @@ import (
 	e2eharness "github.com/greg2010/wireguard-gateway-operator/test/harness/e2e"
 )
 
-// sharedNetworkDrainTimeout matches the per-gateway orphan drain budget; an auto-mode VPC's
-// 40 implicit subnets can tail past a minute after teardown.
-const sharedNetworkDrainTimeout = 4 * time.Minute
+// sharedNetworkDrainTimeout: run 35412850047 on 2026-09-19 needed longer than the previous
+// 4 minutes to delete the auto-mode VPC; the run before it drained in about 30 seconds.
+const sharedNetworkDrainTimeout = 10 * time.Minute
 
 const sharedNetworkDrainInterval = 5 * time.Second
 
@@ -39,34 +39,23 @@ func assertSharedNetworkDrained(suite *e2eharness.Suite, code int) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sharedNetworkDrainTimeout)
 	defer cancel()
-	deadline := time.Now().Add(sharedNetworkDrainTimeout)
-	var last int
-	for {
-		n, err := suite.SharedNetworkCount(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "e2e: shared network drain check failed: %v\n", err)
-			return 1
-		}
-		last = n
-		if n == 0 {
-			return code
-		}
-		if time.Now().After(deadline) {
-			fmt.Fprintf(os.Stderr,
-				"e2e: shared network %q still present (count=%d) after all gateways drained "+
-					"and %s of polling; the refcounted shared VPC leaked\n",
-				e2eharness.SharedNetworkName, last, sharedNetworkDrainTimeout)
-			return 1
-		}
-		select {
-		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr,
-				"e2e: shared network %q drain check interrupted (count=%d): %v\n",
-				e2eharness.SharedNetworkName, last, ctx.Err())
-			return 1
-		case <-time.After(sharedNetworkDrainInterval):
-		}
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "e2e: "+format+"\n", args...)
 	}
+	start := time.Now()
+	err := e2eharness.WaitDrained(ctx, sharedNetworkDrainInterval, suite.SharedNetworkResidual, logf)
+	if err != nil {
+		attachments, attachErr := suite.SharedNetworkAttachments(context.Background())
+		if attachErr != nil {
+			attachments = fmt.Sprintf("attachment lookup failed: %v", attachErr)
+		}
+		fmt.Fprintf(os.Stderr,
+			"e2e: shared network %q leaked: %v; still attached: %s\n",
+			e2eharness.SharedNetworkName, err, attachments)
+		return 1
+	}
+	logf("shared network %q drained in %.0fs", e2eharness.SharedNetworkName, time.Since(start).Seconds())
+	return code
 }
 
 // sharedSuite is built by TestMain before m.Run; parallel tests share the handle and

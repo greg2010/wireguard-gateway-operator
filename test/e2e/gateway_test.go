@@ -177,12 +177,13 @@ func TestGatewayCoexistence(t *testing.T) {
 	assertFirewallIsolation(ctx, t, suite, stackB, saB, saA, stackA.WireguardListenPort)
 
 	// The VPC is created once on the first gateway and reused, never duplicated.
-	n, err := suite.SharedNetworkCount(ctx)
+	residual, err := suite.SharedNetworkResidual(ctx)
 	if err != nil {
-		t.Fatalf("count shared networks: %v", err)
+		t.Fatalf("describe shared network: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("shared network count = %d, want exactly 1 backing both gateways", n)
+	if residual == "" {
+		t.Fatalf("shared network %s absent; want the one VPC backing both gateways",
+			e2eharness.SharedNetworkName)
 	}
 }
 
@@ -1992,6 +1993,13 @@ func TestGatewaySingleInstanceRetainedReasons(t *testing.T) {
 	}
 }
 
+const (
+	// Run 20260918-221808 hit not-ready on the shared VPC about four minutes after its
+	// re-creation; an auto-mode VPC's implicit-subnet tail runs minutes.
+	firewallRuleNotReadyTimeout  = 10 * time.Minute
+	firewallRuleNotReadyInterval = 5 * time.Second
+)
+
 func denyGatewayWireGuard(ctx context.Context, t *testing.T, suite *e2eharness.Suite, prefix, network, serviceAccount string) {
 	t.Helper()
 	env := suite.Env()
@@ -2019,9 +2027,12 @@ func denyGatewayWireGuard(ctx context.Context, t *testing.T, suite *e2eharness.S
 		},
 	}
 	for _, rule := range rules {
-		createCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		_, err := shared.RunCmdStdout(createCtx,
-			[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile}, "gcloud", rule.args...)
+		createCtx, cancel := context.WithTimeout(ctx, firewallRuleNotReadyTimeout)
+		err := e2eharness.RetryNotReady(createCtx, firewallRuleNotReadyInterval, t.Logf, func() error {
+			_, err := shared.RunCmdStdout(createCtx,
+				[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile}, "gcloud", rule.args...)
+			return err
+		})
 		cancel()
 		if err != nil {
 			t.Fatalf("create firewall rule %s: %v", rule.name, err)
@@ -2029,12 +2040,15 @@ func denyGatewayWireGuard(ctx context.Context, t *testing.T, suite *e2eharness.S
 		t.Logf("created firewall rule %s", rule.name)
 		ruleName := rule.name
 		t.Cleanup(func() {
-			deleteCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			deleteCtx, cancel := context.WithTimeout(context.Background(), firewallRuleNotReadyTimeout)
 			defer cancel()
-			_, err := shared.RunCmdStdout(deleteCtx,
-				[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile},
-				"gcloud", "compute", "firewall-rules", "delete", ruleName,
-				"--project", env.ProjectID, "--quiet")
+			err := e2eharness.RetryNotReady(deleteCtx, firewallRuleNotReadyInterval, t.Logf, func() error {
+				_, err := shared.RunCmdStdout(deleteCtx,
+					[]string{"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=" + env.CredsFile},
+					"gcloud", "compute", "firewall-rules", "delete", ruleName,
+					"--project", env.ProjectID, "--quiet")
+				return err
+			})
 			if err != nil {
 				t.Errorf("delete firewall rule %s: %v", ruleName, err)
 			}
