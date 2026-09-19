@@ -16,6 +16,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -100,6 +101,11 @@ type GatewayReconciler struct {
 
 	gcpAddressRefreshed sync.Map
 	now                 func() time.Time
+
+	// responderDirty holds, per Gateway, whether the next pass must re-apply every responder
+	// object; a missing key is unseen, which forces one apply. responderDirtyMu guards it.
+	responderDirtyMu sync.Mutex
+	responderDirty   map[types.NamespacedName]bool
 }
 
 // +kubebuilder:rbac:groups=wgnet.dev,resources=gateways,verbs=get;list;watch;create;update;patch;delete
@@ -135,10 +141,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var gw wgnetv1alpha1.Gateway
 	if err := r.Get(ctx, req.NamespacedName, &gw); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			r.forgetResponderDirty(req.NamespacedName)
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
 	}
 
 	if !gw.DeletionTimestamp.IsZero() {
+		r.forgetResponderDirty(req.NamespacedName)
 		return r.reconcileDelete(ctx, &gw)
 	}
 
@@ -783,7 +794,11 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// genChanged filters NetworkPolicy, whose spec-only changes bump metadata.generation.
 	genChanged := builder.WithPredicates(predicate.GenerationChangedPredicate{})
 
-	if err := ctrl.NewControllerManagedBy(mgr).
+	responderObjectPredicate := builder.WithPredicates(predicate.NewPredicateFuncs(isResponderObject))
+	responderWorkloadDrift := builder.WithPredicates(responderWorkloadPredicate())
+	responderObjectEvents := handler.EnqueueRequestsFromMapFunc(r.gatewaysForResponderObject)
+
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&wgnetv1alpha1.Gateway{}).
 		// No predicate: the workload status event is the only push signal for pod readiness,
 		// since pods and Leases are unwatched; ConfigMap/Secret/Service never bump metadata.generation.
@@ -792,16 +807,21 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.Service{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Owns(&networkingv1.NetworkPolicy{}, genChanged).
 		Owns(xg).
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.gatewaysForService)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.gatewaysForNamespace)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.gatewaysForResponderPod),
-			builder.WithPredicates(predicate.NewPredicateFuncs(isResponderPod))).
-		Complete(r); err != nil {
-		return err
-	}
-	return nil
+			builder.WithPredicates(predicate.NewPredicateFuncs(isResponderObject))).
+		// Drift on a responder object carries no hash change, so the owning Gateway is marked
+		// dirty here and its next pass re-applies every object.
+		Watches(&corev1.ConfigMap{}, responderObjectEvents, responderObjectPredicate).
+		Watches(&corev1.Service{}, responderObjectEvents, responderObjectPredicate).
+		Watches(&appsv1.Deployment{}, responderObjectEvents, responderWorkloadDrift).
+		Watches(&appsv1.DaemonSet{}, responderObjectEvents, responderWorkloadDrift).
+		Watches(&policyv1.PodDisruptionBudget{}, responderObjectEvents, responderWorkloadDrift).
+		Complete(r)
 }
 
 // gatewaysForService maps a changed Service to the Gateways forwarding to it, matching

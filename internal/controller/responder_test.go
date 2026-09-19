@@ -4,10 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -15,8 +19,14 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 )
@@ -108,6 +118,7 @@ func TestEnsureGatewayResponderPolicySwitch(t *testing.T) {
 		policy        wgnetv1alpha1.TrafficPolicy
 		seed          func(cfg Config, gw *wgnetv1alpha1.Gateway) client.Object
 		wantWorkloads []string
+		wantDeletes   []string
 	}{
 		{
 			name:   "cluster-to-local",
@@ -116,6 +127,7 @@ func TestEnsureGatewayResponderPolicySwitch(t *testing.T) {
 				return buildResponderDeployment(cfg, gw)
 			},
 			wantWorkloads: []string{"DaemonSet/gw-responder"},
+			wantDeletes:   []string{"Delete/Deployment=1"},
 		},
 		{
 			name:   "local-to-cluster",
@@ -124,6 +136,7 @@ func TestEnsureGatewayResponderPolicySwitch(t *testing.T) {
 				return buildResponderDaemonSet(cfg, gw)
 			},
 			wantWorkloads: []string{"Deployment/gw-responder"},
+			wantDeletes:   []string{"Delete/DaemonSet=1"},
 		},
 	}
 
@@ -143,8 +156,20 @@ func TestEnsureGatewayResponderPolicySwitch(t *testing.T) {
 			mustCreate(ctx, t, cl, gw)
 
 			r := newOperatorReconciler(te, &GatewayReconciler{Config: cfg})
+			writes := countingResponderClient(t, te, r, "gw-responder", nil)
 			if _, err := r.ensureGatewayResponder(ctx, gw); err != nil {
 				t.Fatalf("ensureGatewayResponder: %v", err)
+			}
+			if got := writes.verbEntries("Delete"); !slices.Equal(got, tt.wantDeletes) {
+				t.Errorf("deletes on the switch = %v, want exactly %v", got, tt.wantDeletes)
+			}
+
+			writes.reset()
+			if _, err := r.ensureGatewayResponder(ctx, gw); err != nil {
+				t.Fatalf("steady ensureGatewayResponder: %v", err)
+			}
+			if got := writes.verbEntries("Delete"); len(got) != 0 {
+				t.Errorf("deletes on the steady pass = %v, want exactly []", got)
 			}
 
 			if got := responderWorkloadNames(ctx, t, cl, ns); !slices.Equal(got, tt.wantWorkloads) {
@@ -166,6 +191,100 @@ func currentResponderOwnerRefs(ctx context.Context, t *testing.T, cl client.Clie
 	var ds appsv1.DaemonSet
 	mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-responder"}, &ds)
 	return ds.OwnerReferences
+}
+
+// createTerminatingResponderWorkload creates obj held by a test finalizer, then deletes it so
+// envtest sets DeletionTimestamp; t.Cleanup strips the finalizer so the object can go away.
+func createTerminatingResponderWorkload(ctx context.Context, t *testing.T, cl client.Client, obj client.Object) {
+	t.Helper()
+	const finalizer = "wgnet.dev/test-hold"
+	obj.SetFinalizers([]string{finalizer})
+	key := client.ObjectKeyFromObject(obj)
+	mustCreate(ctx, t, cl, obj)
+	if err := cl.Delete(ctx, obj); err != nil {
+		t.Fatalf("delete %T %s: %v", obj, key, err)
+	}
+	live, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		t.Fatalf("deep copy of %T is not a client.Object", obj)
+	}
+	mustGet(ctx, t, cl, key, live)
+	if live.GetDeletionTimestamp().IsZero() {
+		t.Fatalf("%T %s deletionTimestamp = zero, want it terminating", obj, key)
+	}
+	t.Cleanup(func() {
+		clean, ok := obj.DeepCopyObject().(client.Object)
+		if !ok {
+			t.Fatalf("deep copy of %T is not a client.Object", obj)
+		}
+		if err := cl.Get(ctx, key, clean); err != nil {
+			if apierrors.IsNotFound(err) {
+				return
+			}
+			t.Fatalf("get %T %s for cleanup: %v", obj, key, err)
+		}
+		clean.SetFinalizers(nil)
+		if err := cl.Update(ctx, clean); err != nil {
+			t.Fatalf("clear %T %s finalizer: %v", obj, key, err)
+		}
+	})
+}
+
+// TestEnsureGatewayResponderLeftoverTerminating pins that a leftover responder workload already
+// carrying a deletionTimestamp draws no Delete when the traffic policy switches away from it.
+func TestEnsureGatewayResponderLeftoverTerminating(t *testing.T) {
+	tests := []struct {
+		name          string
+		policy        wgnetv1alpha1.TrafficPolicy
+		leftover      func(cfg Config, gw *wgnetv1alpha1.Gateway) client.Object
+		wantWorkloads []string
+	}{
+		{
+			name:   "cluster-to-local",
+			policy: wgnetv1alpha1.TrafficPolicyLocal,
+			leftover: func(cfg Config, gw *wgnetv1alpha1.Gateway) client.Object {
+				return buildResponderDeployment(cfg, gw)
+			},
+			wantWorkloads: []string{"DaemonSet/gw-responder", "Deployment/gw-responder"},
+		},
+		{
+			name:   "local-to-cluster",
+			policy: wgnetv1alpha1.TrafficPolicyCluster,
+			leftover: func(cfg Config, gw *wgnetv1alpha1.Gateway) client.Object {
+				return buildResponderDaemonSet(cfg, gw)
+			},
+			wantWorkloads: []string{"DaemonSet/gw-responder", "Deployment/gw-responder"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			te := setupEnvtestRBAC(t)
+			cl := te.client
+
+			ns := "responder-terminating-" + tt.name
+			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+			cfg := reconcileConfig()
+
+			gw := newGateway("gw", ns, nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			createTerminatingResponderWorkload(ctx, t, cl, tt.leftover(cfg, gw))
+			mustCreate(ctx, t, cl, gw)
+
+			r := newOperatorReconciler(te, &GatewayReconciler{Config: cfg})
+			writes := countingResponderClient(t, te, r, "gw-responder", nil)
+			if _, err := r.ensureGatewayResponder(ctx, gw); err != nil {
+				t.Fatalf("ensureGatewayResponder: %v", err)
+			}
+			if got := writes.verbEntries("Delete"); !slices.Equal(got, []string{}) {
+				t.Errorf("deletes with a terminating leftover = %v, want exactly []", got)
+			}
+			if got := responderWorkloadNames(ctx, t, cl, ns); !slices.Equal(got, tt.wantWorkloads) {
+				t.Errorf("workloads = %v, want exactly %v", got, tt.wantWorkloads)
+			}
+		})
+	}
 }
 
 // TestEnsureGatewayResponderTwoGateways pins that two Gateways in one namespace each get a
@@ -749,6 +868,707 @@ func TestResponderMissingConditionCluster(t *testing.T) {
 			cond := findCondition(gw.Status.Conditions, conditionResponderMissing)
 			if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != reasonNoResponderRunning {
 				t.Fatalf("ResponderMissing condition = %+v, want True/%s", cond, reasonNoResponderRunning)
+			}
+		})
+	}
+}
+
+// TestResponderObjectHash table-tests the gate hash: builder output hashes stably, every input
+// that changes an object changes it, and a stale gate annotation on the input is ignored.
+func TestResponderObjectHash(t *testing.T) {
+	cfg := testConfig()
+	gwWith := func(mutate func(gw *wgnetv1alpha1.Gateway)) *wgnetv1alpha1.Gateway {
+		gw := newGateway("edge", "wg-system", nil, nil)
+		if mutate != nil {
+			mutate(gw)
+		}
+		return gw
+	}
+	staleDeployment := func() client.Object {
+		dep := buildResponderDeployment(cfg, gwWith(nil))
+		dep.Annotations = map[string]string{responderHashAnnotation: "stale"}
+		return dep
+	}
+
+	tests := []struct {
+		name      string
+		a, b      client.Object
+		wantEqual bool
+	}{
+		{
+			name:      "same deployment built twice",
+			a:         buildResponderDeployment(cfg, gwWith(nil)),
+			b:         buildResponderDeployment(cfg, gwWith(nil)),
+			wantEqual: true,
+		},
+		{
+			name:      "stale gate annotation is excluded",
+			a:         staleDeployment(),
+			b:         buildResponderDeployment(cfg, gwWith(nil)),
+			wantEqual: true,
+		},
+		{
+			name: "replicas change",
+			a:    buildResponderDeployment(cfg, gwWith(nil)),
+			b:    buildResponderDeployment(cfg, gwWith(func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Responder.Replicas = 3 })),
+		},
+		{
+			name: "image change",
+			a:    buildResponderDeployment(cfg, gwWith(nil)),
+			b: buildResponderDeployment(cfg, gwWith(func(gw *wgnetv1alpha1.Gateway) {
+				gw.Spec.Responder.Image = "registry.example.com/custom-responder:v2"
+			})),
+		},
+		{
+			name: "port change",
+			a:    buildResponderDeployment(cfg, gwWith(nil)),
+			b:    buildResponderDeployment(cfg, gwWith(func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Responder.Port = 9090 })),
+		},
+		{
+			name: "configmap data change",
+			a:    buildResponderConfigMap(gwWith(nil)),
+			b:    buildResponderConfigMap(gwWith(func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Responder.Port = 9090 })),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wantAnnotations := maps.Clone(tt.a.GetAnnotations())
+
+			hashA, err := responderObjectHash(tt.a)
+			if err != nil {
+				t.Fatalf("hash a: %v", err)
+			}
+			hashB, err := responderObjectHash(tt.b)
+			if err != nil {
+				t.Fatalf("hash b: %v", err)
+			}
+
+			if (hashA == hashB) != tt.wantEqual {
+				t.Errorf("hashes %q and %q equal = %v, want %v", hashA, hashB, hashA == hashB, tt.wantEqual)
+			}
+			if !maps.Equal(tt.a.GetAnnotations(), wantAnnotations) {
+				t.Errorf("input annotations = %v, want %v unchanged by hashing", tt.a.GetAnnotations(), wantAnnotations)
+			}
+		})
+	}
+}
+
+// responderWriteLog counts the responder-object writes a reconcile issues, keyed "<verb>/<kind>",
+// so a test pins the exact set of calls instead of asserting one kind's absence.
+type responderWriteLog struct {
+	mu    sync.Mutex
+	name  string
+	calls map[string]int
+}
+
+// countedResponderKind names the kind obj is counted under, or "" for a kind the write-gate
+// tests do not count (the Gateway itself, the link objects' kinds, RBAC, the GCP composites).
+func countedResponderKind(obj client.Object) string {
+	switch obj.(type) {
+	case *corev1.ConfigMap:
+		return "ConfigMap"
+	case *corev1.Service:
+		return "Service"
+	case *appsv1.Deployment:
+		return "Deployment"
+	case *appsv1.DaemonSet:
+		return "DaemonSet"
+	case *policyv1.PodDisruptionBudget:
+		return "PodDisruptionBudget"
+	default:
+		return ""
+	}
+}
+
+func (l *responderWriteLog) record(verb string, obj client.Object) {
+	kind := countedResponderKind(obj)
+	if kind == "" || obj.GetName() != l.name {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls[verb+"/"+kind]++
+}
+
+func (l *responderWriteLog) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = map[string]int{}
+}
+
+// entries renders the recorded calls as sorted "<verb>/<kind>=<count>" strings.
+func (l *responderWriteLog) entries() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.calls))
+	for call, n := range l.calls {
+		out = append(out, fmt.Sprintf("%s=%d", call, n))
+	}
+	slices.Sort(out)
+	return out
+}
+
+// verbEntries is entries narrowed to one verb, for a test that pins only deletes.
+func (l *responderWriteLog) verbEntries(verb string) []string {
+	var out []string
+	for _, e := range l.entries() {
+		if strings.HasPrefix(e, verb+"/") {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// countingResponderClient rewires r's client to the operator identity through an interceptor
+// recording every Patch and Delete of responder object componentName; patchErr may fail a Patch.
+func countingResponderClient(t *testing.T, te *testEnv, r *GatewayReconciler, componentName string, patchErr func(obj client.Object) error) *responderWriteLog {
+	t.Helper()
+	wc, err := client.NewWithWatch(te.operatorCfg, client.Options{Scheme: te.scheme})
+	if err != nil {
+		t.Fatalf("build watch client: %v", err)
+	}
+	writes := &responderWriteLog{name: componentName, calls: map[string]int{}}
+	r.Client = interceptor.NewClient(wc, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if patchErr != nil {
+				if err := patchErr(obj); err != nil {
+					return err
+				}
+			}
+			writes.record("Patch", obj)
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			writes.record("Delete", obj)
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	return writes
+}
+
+// responderObjectsPresent reports whether gw's ConfigMap, Service, workload and, in the Cluster
+// shape, its PDB are all readable through cl.
+func responderObjectsPresent(ctx context.Context, cl client.Client, ns, workloadKind string) bool {
+	key := client.ObjectKey{Namespace: ns, Name: "gw-responder"}
+	objs := []client.Object{&corev1.ConfigMap{}, &corev1.Service{}}
+	if workloadKind == "Deployment" {
+		objs = append(objs, &appsv1.Deployment{}, &policyv1.PodDisruptionBudget{})
+	} else {
+		objs = append(objs, &appsv1.DaemonSet{})
+	}
+	for _, obj := range objs {
+		if err := cl.Get(ctx, key, obj); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// responderWriteStep is one Gateway spec edit in the steady-write table together with the exact
+// set of responder writes the reconcile following it must issue.
+type responderWriteStep struct {
+	name        string
+	mutate      func(gw *wgnetv1alpha1.Gateway)
+	wantEntries []string
+}
+
+// responderSteadyTimeout bounds the wait for a fresh Gateway's responder objects to exist.
+const responderSteadyTimeout = 30 * time.Second
+
+// TestEnsureGatewayResponderSteadyWrites pins the write gate in both shapes: a reconcile that
+// changes nothing issues no responder write, and a spec edit patches only the workload.
+func TestEnsureGatewayResponderSteadyWrites(t *testing.T) {
+	tests := []struct {
+		name      string
+		policy    wgnetv1alpha1.TrafficPolicy
+		workload  string
+		wantDirty []string
+		steps     []responderWriteStep
+	}{
+		{
+			name:     "cluster",
+			policy:   wgnetv1alpha1.TrafficPolicyCluster,
+			workload: "Deployment",
+			wantDirty: []string{
+				"Patch/ConfigMap=1", "Patch/Deployment=1", "Patch/PodDisruptionBudget=1", "Patch/Service=1",
+			},
+			steps: []responderWriteStep{
+				{
+					name:        "replicas",
+					mutate:      func(gw *wgnetv1alpha1.Gateway) { gw.Spec.Responder.Replicas = 3 },
+					wantEntries: []string{"Patch/Deployment=1"},
+				},
+				{
+					name: "image",
+					mutate: func(gw *wgnetv1alpha1.Gateway) {
+						gw.Spec.Responder.Image = "registry.example.com/custom-responder:v2"
+					},
+					wantEntries: []string{"Patch/Deployment=1"},
+				},
+			},
+		},
+		{
+			name:      "local",
+			policy:    wgnetv1alpha1.TrafficPolicyLocal,
+			workload:  "DaemonSet",
+			wantDirty: []string{"Patch/ConfigMap=1", "Patch/DaemonSet=1", "Patch/Service=1"},
+			steps: []responderWriteStep{
+				{
+					name: "image",
+					mutate: func(gw *wgnetv1alpha1.Gateway) {
+						gw.Spec.Responder.Image = "registry.example.com/custom-responder:v2"
+					},
+					wantEntries: []string{"Patch/DaemonSet=1"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			te := setupEnvtestRBAC(t)
+
+			r, key := linkGatewayFixture(ctx, t, te, "responder-steady-"+tt.name, tt.policy)
+			writes := countingResponderClient(t, te, r, "gw-responder", nil)
+			req := ctrl.Request{NamespacedName: key}
+
+			pollUntil(ctx, t, responderSteadyTimeout, "gw's responder objects to exist", func() bool {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("reconcile: %v", err)
+				}
+				return responderObjectsPresent(ctx, r.Client, key.Namespace, tt.workload)
+			})
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("steady reconcile: %v", err)
+			}
+			if got := writes.entries(); len(got) != 0 {
+				t.Errorf("steady reconcile responder writes = %v, want exactly []", got)
+			}
+
+			r.markResponderDirty(key)
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("dirty reconcile: %v", err)
+			}
+			if got := writes.entries(); !slices.Equal(got, tt.wantDirty) {
+				t.Errorf("dirty reconcile responder writes = %v, want exactly %v", got, tt.wantDirty)
+			}
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("reconcile after the dirty pass: %v", err)
+			}
+			if got := writes.entries(); len(got) != 0 {
+				t.Errorf("responder writes after the dirty pass = %v, want exactly []", got)
+			}
+
+			for _, step := range tt.steps {
+				var gw wgnetv1alpha1.Gateway
+				mustGet(ctx, t, te.client, key, &gw)
+				step.mutate(&gw)
+				if err := te.client.Update(ctx, &gw); err != nil {
+					t.Fatalf("%s: update gateway: %v", step.name, err)
+				}
+
+				writes.reset()
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("%s: reconcile: %v", step.name, err)
+				}
+				if got := writes.entries(); !slices.Equal(got, step.wantEntries) {
+					t.Errorf("%s: responder writes = %v, want exactly %v", step.name, got, step.wantEntries)
+				}
+			}
+		})
+	}
+}
+
+// TestResponderDirty table-tests the per-Gateway dirty flag: an unseen key forces one apply, a
+// mark forces the next pass only, and forgetting a key returns it to unseen.
+func TestResponderDirty(t *testing.T) {
+	key := types.NamespacedName{Namespace: "wg-system", Name: "edge"}
+	tests := []struct {
+		name  string
+		setup func(r *GatewayReconciler)
+		want  []bool
+	}{
+		{
+			name: "unseen key",
+			want: []bool{true, false},
+		},
+		{
+			name:  "seen and clean",
+			setup: func(r *GatewayReconciler) { r.takeResponderDirty(key) },
+			want:  []bool{false, false},
+		},
+		{
+			name: "marked after a take",
+			setup: func(r *GatewayReconciler) {
+				r.takeResponderDirty(key)
+				r.markResponderDirty(key)
+			},
+			want: []bool{true, false},
+		},
+		{
+			name: "forgotten after a take",
+			setup: func(r *GatewayReconciler) {
+				r.takeResponderDirty(key)
+				r.forgetResponderDirty(key)
+			},
+			want: []bool{true, false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &GatewayReconciler{}
+			if tt.setup != nil {
+				tt.setup(r)
+			}
+			got := []bool{r.takeResponderDirty(key), r.takeResponderDirty(key)}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("successive takes = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatewaysForResponderObject table-tests the responder-object mapper: only a Gateway
+// controller reference yields a request, and that request's Gateway is marked dirty.
+func TestGatewaysForResponderObject(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.UID = testGatewayUID
+	key := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+	gatewayRef := metav1.OwnerReference{
+		APIVersion: wgnetv1alpha1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: new(true),
+	}
+	daemonSetRef := metav1.OwnerReference{
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Kind:       "DaemonSet",
+		Name:       "gw-responder",
+		UID:        "22223333-4444-5555-6666-777788889999",
+		Controller: new(true),
+	}
+	foreignGatewayRef := metav1.OwnerReference{
+		APIVersion: "gateway.networking.k8s.io/v1",
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        "33334444-5555-6666-7777-888899990000",
+		Controller: new(true),
+	}
+
+	tests := []struct {
+		name         string
+		refs         []metav1.OwnerReference
+		wantRequests []reconcile.Request
+		wantDirty    bool
+	}{
+		{
+			name:         "gateway controller reference",
+			refs:         []metav1.OwnerReference{gatewayRef},
+			wantRequests: []reconcile.Request{{NamespacedName: key}},
+			wantDirty:    true,
+		},
+		{
+			name: "no owner reference",
+		},
+		{
+			name: "controller reference of another kind",
+			refs: []metav1.OwnerReference{daemonSetRef},
+		},
+		{
+			name: "gateway controller reference of another api group",
+			refs: []metav1.OwnerReference{foreignGatewayRef},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &GatewayReconciler{}
+			// Take once so the key is seen and clean: a mark by the mapper is then observable.
+			r.takeResponderDirty(key)
+
+			obj := buildResponderService(gw)
+			obj.OwnerReferences = tt.refs
+
+			got := r.gatewaysForResponderObject(context.Background(), obj)
+			if !slices.Equal(got, tt.wantRequests) {
+				t.Errorf("requests = %v, want exactly %v", got, tt.wantRequests)
+			}
+			if dirty := r.takeResponderDirty(key); dirty != tt.wantDirty {
+				t.Errorf("gateway %s dirty = %v, want %v", key, dirty, tt.wantDirty)
+			}
+		})
+	}
+}
+
+// TestIsResponderObject table-tests the responder-object predicate, including the drifted-label
+// case: an edit that overwrites the component label must still reach the reconciler.
+func TestIsResponderObject(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.UID = testGatewayUID
+	gatewayRef := metav1.OwnerReference{
+		APIVersion: wgnetv1alpha1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: new(true),
+	}
+
+	tests := []struct {
+		name  string
+		build func() client.Object
+		want  bool
+	}{
+		{
+			name:  "component label",
+			build: func() client.Object { return buildResponderService(gw) },
+			want:  true,
+		},
+		{
+			name: "drifted label under the gateway's responder name",
+			build: func() client.Object {
+				svc := buildResponderService(gw)
+				svc.Labels["app.kubernetes.io/component"] = "drifted"
+				svc.OwnerReferences = []metav1.OwnerReference{gatewayRef}
+				return svc
+			},
+			want: true,
+		},
+		{
+			name: "drifted label under another name",
+			build: func() client.Object {
+				svc := buildResponderService(gw)
+				svc.Name = "edge-link"
+				svc.Labels["app.kubernetes.io/component"] = "drifted"
+				svc.OwnerReferences = []metav1.OwnerReference{gatewayRef}
+				return svc
+			},
+		},
+		{
+			name: "drifted label with no controller reference",
+			build: func() client.Object {
+				svc := buildResponderService(gw)
+				svc.Labels["app.kubernetes.io/component"] = "drifted"
+				return svc
+			},
+		},
+		{
+			name: "gateway controller reference of another api group",
+			build: func() client.Object {
+				svc := buildResponderService(gw)
+				delete(svc.Labels, "app.kubernetes.io/component")
+				svc.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: "gateway.networking.k8s.io/v1",
+					Kind:       "Gateway",
+					Name:       gw.Name,
+					UID:        "33334444-5555-6666-7777-888899990000",
+					Controller: new(true),
+				}}
+				return svc
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isResponderObject(tt.build()); got != tt.want {
+				t.Errorf("isResponderObject = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResponderWorkloadPredicate table-tests the Deployment, DaemonSet and PDB watch predicate:
+// a status-only write is dropped, while spec, label and annotation drift still reaches the queue.
+func TestResponderWorkloadPredicate(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+	gw.UID = testGatewayUID
+	gatewayRef := metav1.OwnerReference{
+		APIVersion: wgnetv1alpha1.GroupVersion.String(),
+		Kind:       "Gateway",
+		Name:       gw.Name,
+		UID:        gw.UID,
+		Controller: new(true),
+	}
+	responderDeployment := func() *appsv1.Deployment {
+		dep := buildResponderDeployment(testConfig(), gw)
+		dep.Generation = 3
+		dep.ResourceVersion = "100"
+		dep.Annotations = map[string]string{responderHashAnnotation: "cafe"}
+		dep.OwnerReferences = []metav1.OwnerReference{gatewayRef}
+		return dep
+	}
+	foreignDeployment := func() *appsv1.Deployment {
+		dep := responderDeployment()
+		dep.Labels = nil
+		dep.OwnerReferences = nil
+		return dep
+	}
+	updated := func(build func() *appsv1.Deployment, mutate func(dep *appsv1.Deployment)) event.UpdateEvent {
+		old := build()
+		next := build()
+		next.ResourceVersion = "101"
+		mutate(next)
+		return event.UpdateEvent{ObjectOld: old, ObjectNew: next}
+	}
+
+	tests := []struct {
+		name string
+		eval func(p predicate.Predicate) bool
+		want bool
+	}{
+		{
+			name: "status-only update",
+			eval: func(p predicate.Predicate) bool {
+				return p.Update(updated(responderDeployment, func(dep *appsv1.Deployment) {
+					dep.Status.ReadyReplicas = 2
+				}))
+			},
+		},
+		{
+			name: "generation bumped",
+			eval: func(p predicate.Predicate) bool {
+				return p.Update(updated(responderDeployment, func(dep *appsv1.Deployment) { dep.Generation = 4 }))
+			},
+			want: true,
+		},
+		{
+			name: "label changed",
+			eval: func(p predicate.Predicate) bool {
+				return p.Update(updated(responderDeployment, func(dep *appsv1.Deployment) {
+					dep.Labels["app.kubernetes.io/component"] = "drifted"
+				}))
+			},
+			want: true,
+		},
+		{
+			name: "annotation changed",
+			eval: func(p predicate.Predicate) bool {
+				return p.Update(updated(responderDeployment, func(dep *appsv1.Deployment) {
+					dep.Annotations[responderHashAnnotation] = "beef"
+				}))
+			},
+			want: true,
+		},
+		{
+			name: "create",
+			eval: func(p predicate.Predicate) bool {
+				return p.Create(event.CreateEvent{Object: responderDeployment()})
+			},
+			want: true,
+		},
+		{
+			name: "delete",
+			eval: func(p predicate.Predicate) bool {
+				return p.Delete(event.DeleteEvent{Object: responderDeployment()})
+			},
+			want: true,
+		},
+		{
+			name: "generation bumped on a foreign deployment",
+			eval: func(p predicate.Predicate) bool {
+				return p.Update(updated(foreignDeployment, func(dep *appsv1.Deployment) { dep.Generation = 4 }))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.eval(responderWorkloadPredicate()); got != tt.want {
+				t.Errorf("responderWorkloadPredicate = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnsureGatewayResponderDirtyKeptOnError pins that an apply failing mid-pass keeps the
+// Gateway dirty, so the retry force-applies every responder object rather than trusting the hash.
+func TestEnsureGatewayResponderDirtyKeptOnError(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     wgnetv1alpha1.TrafficPolicy
+		workload   string
+		wantForced []string
+	}{
+		{
+			name:     "cluster",
+			policy:   wgnetv1alpha1.TrafficPolicyCluster,
+			workload: "Deployment",
+			wantForced: []string{
+				"Patch/ConfigMap=1", "Patch/Deployment=1", "Patch/PodDisruptionBudget=1", "Patch/Service=1",
+			},
+		},
+		{
+			name:       "local",
+			policy:     wgnetv1alpha1.TrafficPolicyLocal,
+			workload:   "DaemonSet",
+			wantForced: []string{"Patch/ConfigMap=1", "Patch/DaemonSet=1", "Patch/Service=1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			te := setupEnvtestRBAC(t)
+
+			r, key := linkGatewayFixture(ctx, t, te, "responder-dirty-error-"+tt.name, tt.policy)
+			var failService atomic.Bool
+			writes := countingResponderClient(t, te, r, "gw-responder", func(obj client.Object) error {
+				if _, ok := obj.(*corev1.Service); ok && obj.GetName() == "gw-responder" && failService.Load() {
+					return fmt.Errorf("synthetic responder service apply failure")
+				}
+				return nil
+			})
+			req := ctrl.Request{NamespacedName: key}
+
+			pollUntil(ctx, t, responderSteadyTimeout, "gw's responder objects to exist", func() bool {
+				if _, err := r.Reconcile(ctx, req); err != nil {
+					t.Fatalf("reconcile: %v", err)
+				}
+				return responderObjectsPresent(ctx, r.Client, key.Namespace, tt.workload)
+			})
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("steady reconcile: %v", err)
+			}
+			if got := writes.entries(); len(got) != 0 {
+				t.Errorf("steady reconcile responder writes = %v, want exactly []", got)
+			}
+
+			r.markResponderDirty(key)
+			failService.Store(true)
+			if _, err := r.Reconcile(ctx, req); err == nil {
+				t.Fatal("reconcile with a failing responder service apply = nil, want an error")
+			}
+			if dirty := r.takeResponderDirty(key); !dirty {
+				t.Errorf("gateway %s dirty after the failed pass = false, want true", key)
+			}
+			r.markResponderDirty(key)
+
+			failService.Store(false)
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("reconcile after clearing the failure: %v", err)
+			}
+			if got := writes.entries(); !slices.Equal(got, tt.wantForced) {
+				t.Errorf("retry responder writes = %v, want exactly %v", got, tt.wantForced)
+			}
+
+			writes.reset()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("reconcile after the retry: %v", err)
+			}
+			if got := writes.entries(); len(got) != 0 {
+				t.Errorf("responder writes after the retry = %v, want exactly []", got)
 			}
 		})
 	}

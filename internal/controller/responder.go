@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -12,9 +13,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/responder"
@@ -24,9 +28,12 @@ import (
 // nginxConfKey is the responder ConfigMap's data key, mounted as the nginx config file.
 const nginxConfKey = "nginx.conf"
 
+// responderNameSuffix turns a Gateway's name into its responder objects' shared name.
+const responderNameSuffix = "-responder"
+
 // responderComponentName names every object of a Gateway's responder: its ConfigMap, Service
 // and workload (a Deployment or a DaemonSet, never both at once).
-func responderComponentName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + "-responder" }
+func responderComponentName(gw *wgnetv1alpha1.Gateway) string { return gw.Name + responderNameSuffix }
 
 // responderSelectorLabels are the pod-template and selector labels for a Gateway's responder
 // workload; the same scheme as linkSelectorLabels, distinguished by component value.
@@ -263,54 +270,178 @@ func buildResponderPodDisruptionBudget(gw *wgnetv1alpha1.Gateway) *policyv1.PodD
 	}
 }
 
-// ensureGatewayResponder applies gw's responder ConfigMap, Service and workload (Deployment in
-// Cluster mode, DaemonSet in Local), deletes leftovers from a switch, and returns the ClusterIP.
-func (r *GatewayReconciler) ensureGatewayResponder(ctx context.Context, gw *wgnetv1alpha1.Gateway) (string, error) {
-	if err := r.apply(ctx, gw, buildResponderConfigMap(gw)); err != nil {
+// responderHashAnnotation carries the hash of the desired responder object the operator last
+// applied, so a reconcile that changes nothing issues no write.
+const responderHashAnnotation = "wgnet.dev/responder-hash"
+
+// responderObjectHash returns the lowercase hex SHA-256 of obj's JSON encoding with the gate
+// annotation excluded, so the gate value never feeds itself. obj is not mutated.
+func responderObjectHash(obj client.Object) (string, error) {
+	clone, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return "", fmt.Errorf("deep copy of %T is not a client.Object", obj)
+	}
+	annotations := clone.GetAnnotations()
+	delete(annotations, responderHashAnnotation)
+	if len(annotations) == 0 {
+		annotations = nil
+	}
+	clone.SetAnnotations(annotations)
+	data, err := json.Marshal(clone)
+	if err != nil {
+		return "", fmt.Errorf("marshal %T: %w", obj, err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// applyIfChanged stamps desired with its hash and skips apply when live carries the same hash.
+// force applies regardless; NotFound means absent, and desired gets the server response.
+func (r *GatewayReconciler) applyIfChanged(ctx context.Context, gw *wgnetv1alpha1.Gateway, desired, live client.Object, force bool) (bool, error) {
+	hash, err := responderObjectHash(desired)
+	if err != nil {
+		return false, err
+	}
+	annotations := desired.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string, 1)
+	}
+	annotations[responderHashAnnotation] = hash
+	desired.SetAnnotations(annotations)
+
+	key := client.ObjectKeyFromObject(desired)
+	switch err := r.Get(ctx, key, live); {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return false, fmt.Errorf("get %T %s: %w", live, key, err)
+	case !force && live.GetAnnotations()[responderHashAnnotation] == hash:
+		return false, nil
+	}
+	if err := r.apply(ctx, gw, desired); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// deleteResponderLeftover deletes gw's responder object of probe's kind once it is no longer
+// wanted, and only while the cached client still sees it live and not already deleting.
+func (r *GatewayReconciler) deleteResponderLeftover(ctx context.Context, gw *wgnetv1alpha1.Gateway, probe client.Object) error {
+	found, err := r.objectExists(ctx, gw.Namespace, responderComponentName(gw), probe)
+	if err != nil {
+		return err
+	}
+	if !found || probe.GetDeletionTimestamp() != nil {
+		return nil
+	}
+	return r.deleteIfPresent(ctx, probe, client.PropagationPolicy(metav1.DeletePropagationBackground))
+}
+
+// markResponderDirty forces the next reconcile of key to re-apply every responder object.
+func (r *GatewayReconciler) markResponderDirty(key types.NamespacedName) {
+	r.responderDirtyMu.Lock()
+	defer r.responderDirtyMu.Unlock()
+	if r.responderDirty == nil {
+		r.responderDirty = make(map[types.NamespacedName]bool)
+	}
+	r.responderDirty[key] = true
+}
+
+// takeResponderDirty reports whether key is dirty or unseen, and clears the flag. Unseen counts
+// as dirty so the first pass after an operator restart re-applies once.
+func (r *GatewayReconciler) takeResponderDirty(key types.NamespacedName) bool {
+	r.responderDirtyMu.Lock()
+	defer r.responderDirtyMu.Unlock()
+	if r.responderDirty == nil {
+		r.responderDirty = make(map[types.NamespacedName]bool)
+	}
+	dirty, seen := r.responderDirty[key]
+	r.responderDirty[key] = false
+	return dirty || !seen
+}
+
+// forgetResponderDirty drops key's entry, returning it to unseen.
+func (r *GatewayReconciler) forgetResponderDirty(key types.NamespacedName) {
+	r.responderDirtyMu.Lock()
+	defer r.responderDirtyMu.Unlock()
+	delete(r.responderDirty, key)
+}
+
+// isGatewayOwner reports whether ref is a controller reference to this operator's Gateway,
+// excluding another API group's Gateway kind owning a same-named object.
+func isGatewayOwner(ref *metav1.OwnerReference) bool {
+	return ref != nil && ref.Kind == "Gateway" && ref.APIVersion == wgnetv1alpha1.GroupVersion.String()
+}
+
+// gatewaysForResponderObject marks the Gateway owning obj dirty and enqueues it, so an
+// out-of-band edit to a responder object is re-applied even though its hash still matches.
+func (r *GatewayReconciler) gatewaysForResponderObject(_ context.Context, obj client.Object) []reconcile.Request {
+	owner := metav1.GetControllerOf(obj)
+	if !isGatewayOwner(owner) {
+		return nil
+	}
+	key := types.NamespacedName{Namespace: obj.GetNamespace(), Name: owner.Name}
+	r.markResponderDirty(key)
+	return []reconcile.Request{{NamespacedName: key}}
+}
+
+// ensureGatewayResponder applies gw's responder ConfigMap, Service and workload and deletes any
+// leftovers, returning the responder Service ClusterIP for the Cluster shape and "" for Local.
+func (r *GatewayReconciler) ensureGatewayResponder(ctx context.Context, gw *wgnetv1alpha1.Gateway) (clusterIP string, retErr error) {
+	key := client.ObjectKeyFromObject(gw)
+	force := r.takeResponderDirty(key)
+	// A forced pass that fails leaves objects unapplied under a matching hash; keep the flag.
+	defer func() {
+		if force && retErr != nil {
+			r.markResponderDirty(key)
+		}
+	}()
+
+	if _, err := r.applyIfChanged(ctx, gw, buildResponderConfigMap(gw), &corev1.ConfigMap{}, force); err != nil {
 		return "", fmt.Errorf("apply responder configmap: %w", err)
 	}
-	if err := r.apply(ctx, gw, buildResponderService(gw)); err != nil {
+
+	svc := buildResponderService(gw)
+	var liveSvc corev1.Service
+	applied, err := r.applyIfChanged(ctx, gw, svc, &liveSvc, force)
+	if err != nil {
 		return "", fmt.Errorf("apply responder service: %w", err)
 	}
 
 	if isLocal(gw) {
-		if err := r.apply(ctx, gw, buildResponderDaemonSet(r.Config, gw)); err != nil {
+		if _, err := r.applyIfChanged(ctx, gw, buildResponderDaemonSet(r.Config, gw), &appsv1.DaemonSet{}, force); err != nil {
 			return "", fmt.Errorf("apply responder daemonset: %w", err)
 		}
-		if err := r.deleteIfPresent(ctx, &appsv1.Deployment{ObjectMeta: responderObjectMeta(gw)}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+		if err := r.deleteResponderLeftover(ctx, gw, &appsv1.Deployment{}); err != nil {
 			return "", err
 		}
-		if err := r.deleteIfPresent(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: responderObjectMeta(gw)}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+		if err := r.deleteResponderLeftover(ctx, gw, &policyv1.PodDisruptionBudget{}); err != nil {
 			return "", err
 		}
-	} else {
-		if err := r.apply(ctx, gw, buildResponderDeployment(r.Config, gw)); err != nil {
-			return "", fmt.Errorf("apply responder deployment: %w", err)
-		}
-		if err := r.deleteIfPresent(ctx, &appsv1.DaemonSet{ObjectMeta: responderObjectMeta(gw)}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-			return "", err
-		}
-		if effectiveResponderReplicas(gw) > 1 {
-			if err := r.apply(ctx, gw, buildResponderPodDisruptionBudget(gw)); err != nil {
-				return "", fmt.Errorf("apply responder poddisruptionbudget: %w", err)
-			}
-		} else if err := r.deleteIfPresent(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: responderObjectMeta(gw)}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
-			return "", err
-		}
+		return "", nil
 	}
 
-	var svc corev1.Service
-	key := client.ObjectKey{Namespace: gw.Namespace, Name: responderComponentName(gw)}
-	if err := r.APIReader.Get(ctx, key, &svc); err != nil {
-		return "", fmt.Errorf("get responder service: %w", err)
+	if _, err := r.applyIfChanged(ctx, gw, buildResponderDeployment(r.Config, gw), &appsv1.Deployment{}, force); err != nil {
+		return "", fmt.Errorf("apply responder deployment: %w", err)
 	}
-	return svc.Spec.ClusterIP, nil
-}
+	if err := r.deleteResponderLeftover(ctx, gw, &appsv1.DaemonSet{}); err != nil {
+		return "", err
+	}
+	if effectiveResponderReplicas(gw) > 1 {
+		if _, err := r.applyIfChanged(ctx, gw, buildResponderPodDisruptionBudget(gw), &policyv1.PodDisruptionBudget{}, force); err != nil {
+			return "", fmt.Errorf("apply responder poddisruptionbudget: %w", err)
+		}
+	} else if err := r.deleteResponderLeftover(ctx, gw, &policyv1.PodDisruptionBudget{}); err != nil {
+		return "", err
+	}
 
-// responderObjectMeta names gw's responder workload or PDB for a Delete call: the namespace and
-// name every responder child shares.
-func responderObjectMeta(gw *wgnetv1alpha1.Gateway) metav1.ObjectMeta {
-	return metav1.ObjectMeta{Namespace: gw.Namespace, Name: responderComponentName(gw)}
+	clusterIP = liveSvc.Spec.ClusterIP
+	if applied {
+		clusterIP = svc.Spec.ClusterIP
+	}
+	if clusterIP == "" {
+		return "", fmt.Errorf("get responder service: %s/%s has no clusterIP", gw.Namespace, responderComponentName(gw))
+	}
+	return clusterIP, nil
 }
 
 // gatewaysForResponderPod enqueues the pod's own Gateway (its app.kubernetes.io/instance label,
@@ -464,7 +595,25 @@ const (
 	reasonResponderPresent   = "ResponderPresent"
 )
 
-// isResponderPod reports whether obj carries a Gateway's responder component label.
-func isResponderPod(obj client.Object) bool {
-	return obj.GetLabels()["app.kubernetes.io/component"] == componentResponder
+// responderWorkloadPredicate filters the responder Deployment, DaemonSet and PodDisruptionBudget
+// watches to spec, label and annotation changes: other controllers write their status.
+func responderWorkloadPredicate() predicate.Predicate {
+	return predicate.And(
+		predicate.NewPredicateFuncs(isResponderObject),
+		predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.LabelChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+		),
+	)
+}
+
+// isResponderObject reports whether obj is a Gateway's responder child: it carries the responder
+// component label, or an edit dropped that label from an object a Gateway owns under its name.
+func isResponderObject(obj client.Object) bool {
+	if obj.GetLabels()["app.kubernetes.io/component"] == componentResponder {
+		return true
+	}
+	owner := metav1.GetControllerOf(obj)
+	return isGatewayOwner(owner) && obj.GetName() == owner.Name+responderNameSuffix
 }
