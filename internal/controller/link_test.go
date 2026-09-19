@@ -1,8 +1,8 @@
 package controller
 
 import (
-	"encoding/base32"
-	"encoding/json"
+	"context"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -13,55 +13,24 @@ import (
 	"testing"
 	"time"
 
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
 	wgnetv1alpha1 "github.com/greg2010/wireguard-gateway-operator/pkg/api/v1alpha1"
 	hk8s "github.com/greg2010/wireguard-gateway-operator/test/harness/k8s"
 )
-
-// testConfig is the operator-level config the builder tests fold into Gateways.
-func testConfig() Config {
-	return Config{
-		LinkImage:           "registry.example.com/gateway-link:test",
-		LinkImagePullPolicy: "IfNotPresent",
-		UserData:            "#ignition\n",
-		EnableOSLogin:       true,
-		RequeueInterval:     0,
-		SharedNetworkName:   "wgnet-test",
-		ProviderConfigName:  "test-provider-config",
-		PodNamespace:        "gateway-operator",
-	}
-}
-
-// testGatewayUID is a stable UID for builder assertions.
-const testGatewayUID = types.UID("11112222-3333-4444-5555-666677778888")
-
-func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostnames []string) *wgnetv1alpha1.Gateway {
-	return &wgnetv1alpha1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: testGatewayUID},
-		Spec: wgnetv1alpha1.GatewaySpec{
-			GCP: wgnetv1alpha1.GatewayGCPSpec{
-				ProjectID:   "test-project",
-				Region:      "us-central1",
-				Zone:        "us-central1-a",
-				MachineType: "e2-small",
-			},
-			Forwards:     forwards,
-			DNSHostnames: hostnames,
-		},
-	}
-}
 
 // clusterBackends is the shape classifyForwards produces for a Cluster-mode Gateway whose
 // Services publish numeric targetPorts: a resolved backend port and an unnamed Service port.
@@ -71,535 +40,6 @@ func clusterBackends(forwards []wgnetv1alpha1.Forward) []forwardBackend {
 		backends = append(backends, forwardBackend{Forward: f, BackendPort: effectiveServicePort(f)})
 	}
 	return backends
-}
-
-func assertNestedString(t *testing.T, u *unstructured.Unstructured, want string, path ...string) {
-	t.Helper()
-	got, found, err := unstructured.NestedString(u.Object, path...)
-	if err != nil {
-		t.Fatalf("read %v: %v", path, err)
-	}
-	if !found {
-		t.Fatalf("%v not found, want %q", path, want)
-	}
-	if got != want {
-		t.Errorf("%v = %q, want %q", path, got, want)
-	}
-}
-
-func decodeJSON(t *testing.T, raw string, v any) {
-	t.Helper()
-	if err := json.Unmarshal([]byte(raw), v); err != nil {
-		t.Fatalf("unmarshal %q: %v", raw, err)
-	}
-}
-
-func TestGCPID(t *testing.T) {
-	tests := []struct {
-		name      string
-		namespace string
-		objName   string
-	}{
-		{"short", "default", "gw1"},
-		{"long names", "a-very-long-namespace-name", "an-equally-long-gateway-resource-name"},
-		{"unicode-ish", "ns", "gateway-with-dashes-and-123"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := gcpID(tt.namespace, tt.objName)
-
-			if len(got) > gcpIDMaxLen {
-				t.Fatalf("gcpID length = %d, want <= %d (%q)", len(got), gcpIDMaxLen, got)
-			}
-			if !strings.HasPrefix(got, gcpIDPrefix) {
-				t.Fatalf("gcpID = %q, want prefix %q", got, gcpIDPrefix)
-			}
-			if got[0] < 'a' || got[0] > 'z' {
-				t.Fatalf("gcpID = %q, want leading letter", got)
-			}
-			body := strings.TrimPrefix(got, gcpIDPrefix)
-			for _, r := range body {
-				isLower := r >= 'a' && r <= 'z'
-				isB32Digit := r >= '2' && r <= '7'
-				if !isLower && !isB32Digit {
-					t.Fatalf("gcpID body %q has out-of-charset rune %q (want [a-z2-7])", body, r)
-				}
-			}
-
-			if again := gcpID(tt.namespace, tt.objName); again != got {
-				t.Fatalf("gcpID not deterministic: %q then %q", got, again)
-			}
-		})
-	}
-
-	t.Run("namespace qualified", func(t *testing.T) {
-		a := gcpID("ns-a", "gw")
-		b := gcpID("ns-b", "gw")
-		if a == b {
-			t.Fatalf("gcpID collides across namespaces: %q", a)
-		}
-	})
-}
-
-// TestHashedNamesArePinned fixes the exact bytes both hashedName callers produce, so a
-// prefix, digest, encoding or truncation change cannot silently rename live objects.
-func TestHashedNamesArePinned(t *testing.T) {
-	tests := []struct {
-		name string
-		got  string
-		want string
-	}{
-		{"gcp id", gcpID("default", "gw1"), "gw-aggomndtxrzb5qrg4d7sunz5muq"},
-		{
-			"clusterrolebinding",
-			linkClusterRoleBindingName(newGateway("edge", "wg-system", nil, nil)),
-			"gateway-link-cnvcej5geqr66udgtvezbh73rsj",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.got != tt.want {
-				t.Errorf("name = %q, want %q", tt.got, tt.want)
-			}
-		})
-	}
-}
-
-func TestBuildXGatewayGCP(t *testing.T) {
-	cfg := testConfig()
-	gw := newGateway("edge", "wg-system",
-		[]wgnetv1alpha1.Forward{
-			{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP},
-			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP},
-		},
-		[]string{"edge.example.com"},
-	)
-
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-	if err != nil {
-		t.Fatalf("buildXGatewayGCP: %v", err)
-	}
-
-	if got := u.GetAPIVersion(); got != xgatewayGCPAPIVersion {
-		t.Errorf("apiVersion = %q, want %q", got, xgatewayGCPAPIVersion)
-	}
-	if got := u.GetKind(); got != xgatewayGCPKind {
-		t.Errorf("kind = %q, want %q", got, xgatewayGCPKind)
-	}
-	if got := u.GetName(); got != "edge" {
-		t.Errorf("name = %q, want edge", got)
-	}
-	if got := u.GetNamespace(); got != "wg-system" {
-		t.Errorf("namespace = %q, want wg-system", got)
-	}
-
-	assertNestedString(t, u, "us-central1", "spec", "region")
-	assertNestedString(t, u, "us-central1-a", "spec", "zone")
-	assertNestedString(t, u, "e2-small", "spec", "machineType")
-	assertNestedString(t, u, cfg.UserData, "spec", "userData")
-
-	// sharedNetworkName flows from operator config; every other input flows from
-	// gw.Spec (here all defaulted).
-	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "sharedNetworkName")
-	assertNestedString(t, u, cfg.ProviderConfigName, "spec", "providerConfigName")
-
-	assertNestedString(t, u, "test-project", "spec", "projectID")
-	assertNestedString(t, u, effectiveGCPImage(gw), "spec", "image")
-	assertNestedString(t, u, effectiveWGGatewayAddress(gw), "spec", "wgGatewayAddress")
-	assertNestedString(t, u, effectiveWGLinkAddress(gw), "spec", "wgLinkAddress")
-	assertNestedString(t, u, effectiveWGSubnet(gw), "spec", "wgSubnet")
-
-	wantWGPort := int64(effectiveWireguardPort(gw))
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != wantWGPort {
-		t.Errorf("wgListenPort = %d, want %d", got, wantWGPort)
-	}
-	wantWGMTU := int64(effectiveWGMTU(gw))
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgMTU"); got != wantWGMTU {
-		t.Errorf("wgMTU = %d, want %d", got, wantWGMTU)
-	}
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "diskSizeGB"); got != int64(effectiveGCPDiskSizeGB(gw)) {
-		t.Errorf("diskSizeGB = %d, want %d", got, effectiveGCPDiskSizeGB(gw))
-	}
-	wantAddr := map[string]any{"type": "Reserved"}
-	gotAddr, found, err := unstructured.NestedMap(u.Object, "spec", "address")
-	if err != nil || !found {
-		t.Fatalf("read spec.address: found=%v err=%v", found, err)
-	}
-	if !reflect.DeepEqual(gotAddr, wantAddr) {
-		t.Errorf("spec.address = %#v, want %#v", gotAddr, wantAddr)
-	}
-	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "enableOsLogin"); got != cfg.EnableOSLogin {
-		t.Errorf("enableOsLogin = %v, want %v", got, cfg.EnableOSLogin)
-	}
-
-	assertNestedString(t, u, gcpID(gw.Namespace, gw.Name), "spec", "serviceAccountId")
-	assertNestedString(t, u, testRecordNameBase(t, gw), "spec", "secretId")
-
-	ports, _, err := unstructured.NestedSlice(u.Object, "spec", "allowedPorts")
-	if err != nil {
-		t.Fatalf("read allowedPorts: %v", err)
-	}
-	if len(ports) != 2 {
-		t.Fatalf("allowedPorts len = %d, want 2", len(ports))
-	}
-	byPort := map[int64]string{}
-	for _, raw := range ports {
-		p, ok := raw.(map[string]any)
-		if !ok {
-			t.Fatalf("allowedPort entry is %T, want map", raw)
-		}
-		port, ok := p["port"].(int64)
-		if !ok {
-			t.Fatalf("allowedPort port is %T, want int64", p["port"])
-		}
-		proto, _ := p["protocol"].(string)
-		byPort[port] = proto
-	}
-	if byPort[443] != "tcp" {
-		t.Errorf("allowedPort 443 protocol = %q, want tcp (lowercased)", byPort[443])
-	}
-	if byPort[1194] != "udp" {
-		t.Errorf("allowedPort 1194 protocol = %q, want udp (lowercased)", byPort[1194])
-	}
-
-	if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "status"); found {
-		t.Errorf("buildXGatewayGCP must not set status; serviceAccountEmail is GCP-observed")
-	}
-}
-
-// TestBuildXGatewayGCPAddress pins the 1:1 mapping from spec.gcp.address to the composite's
-// spec.address for each form, including the zero block's Reserved default.
-func TestBuildXGatewayGCPAddress(t *testing.T) {
-	cfg := testConfig()
-	tests := []struct {
-		name string
-		addr wgnetv1alpha1.GatewayGCPAddressSpec
-		want map[string]any
-	}{
-		{
-			name: "zero block defaults to Reserved",
-			addr: wgnetv1alpha1.GatewayGCPAddressSpec{},
-			want: map[string]any{"type": "Reserved"},
-		},
-		{
-			name: "explicit reserved",
-			addr: wgnetv1alpha1.GatewayGCPAddressSpec{Type: wgnetv1alpha1.GatewayGCPAddressReserved},
-			want: map[string]any{"type": "Reserved"},
-		},
-		{
-			name: "ephemeral",
-			addr: wgnetv1alpha1.GatewayGCPAddressSpec{Type: wgnetv1alpha1.GatewayGCPAddressEphemeral},
-			want: map[string]any{"type": "Ephemeral"},
-		},
-		{
-			name: "external by name",
-			addr: wgnetv1alpha1.GatewayGCPAddressSpec{
-				Type:     wgnetv1alpha1.GatewayGCPAddressExternal,
-				External: &wgnetv1alpha1.GatewayGCPExternalAddress{Name: "prod-edge-ip"},
-			},
-			want: map[string]any{"type": "External", "external": map[string]any{"name": "prod-edge-ip"}},
-		},
-		{
-			name: "external by ip",
-			addr: wgnetv1alpha1.GatewayGCPAddressSpec{
-				Type:     wgnetv1alpha1.GatewayGCPAddressExternal,
-				External: &wgnetv1alpha1.GatewayGCPExternalAddress{IP: "34.76.10.20"},
-			},
-			want: map[string]any{"type": "External", "external": map[string]any{"ip": "34.76.10.20"}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, nil)
-			gw.Spec.GCP.Address = tt.addr
-
-			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-			if err != nil {
-				t.Fatalf("buildXGatewayGCP: %v", err)
-			}
-			got, found, err := unstructured.NestedMap(u.Object, "spec", "address")
-			if err != nil || !found {
-				t.Fatalf("read spec.address: found=%v err=%v", found, err)
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("spec.address = %#v, want %#v", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestTemplateRevision verifies template-affecting inputs change the revision.
-func TestTemplateRevision(t *testing.T) {
-	cfg := testConfig()
-	base := func(t *testing.T, gw *wgnetv1alpha1.Gateway) string {
-		t.Helper()
-		return testRecordNameBase(t, gw)
-	}
-
-	tests := []struct {
-		name          string
-		mutate        func(gw *wgnetv1alpha1.Gateway)
-		wantIdentical bool
-	}{
-		{name: "unchanged inputs", mutate: func(*wgnetv1alpha1.Gateway) {}, wantIdentical: true},
-		{name: "same name, new uid", mutate: func(gw *wgnetv1alpha1.Gateway) {
-			gw.UID = types.UID("99998888-7777-6666-5555-444433332222")
-		}},
-		{name: "new project", mutate: func(gw *wgnetv1alpha1.Gateway) { gw.Spec.GCP.ProjectID = "other-project" }},
-		{name: "new machine type", mutate: func(gw *wgnetv1alpha1.Gateway) { gw.Spec.GCP.MachineType = "e2-medium" }},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, nil)
-			first := templateRevision(gw, cfg, base(t, gw))
-
-			other := newGateway("edge", "wg-system", nil, nil)
-			tt.mutate(other)
-			second := templateRevision(other, cfg, base(t, other))
-
-			if identical := first == second; identical != tt.wantIdentical {
-				t.Errorf("templateRevision = %q and %q, identical=%v, want identical=%v",
-					first, second, identical, tt.wantIdentical)
-			}
-		})
-	}
-}
-
-// testRecordNameBase is the record naming base the VM reads as its "secret-id" metadata
-// value and suffixes with its own name to derive its bundle id.
-func testRecordNameBase(t *testing.T, gw *wgnetv1alpha1.Gateway) string {
-	t.Helper()
-	base, err := gcpmembers.NameBase(string(gw.UID), gw.Spec.GCP.ProjectID)
-	if err != nil {
-		t.Fatalf("gcpmembers.NameBase(...) returned unexpected error: %v", err)
-	}
-	return base
-}
-
-// TestBuildXGatewayGCPBranches verifies the composite for both provisioning branches.
-func TestBuildXGatewayGCPBranches(t *testing.T) {
-	cfg := testConfig()
-	singleInstanceKeys := []string{
-		"address", "crossplane", "diskSizeGB", "enableOsLogin", "image", "machineType",
-		"projectID", "providerConfigName", "region", "secretId", "serviceAccountId",
-		"sharedNetworkName", "spot", "trafficPolicy", "userData", "wgGatewayAddress",
-		"wgLinkAddress", "wgListenPort", "wgMTU", "wgSubnet", "zone",
-	}
-	loadBalancedKeys := append(append([]string{}, singleInstanceKeys...),
-		"healthPort", "loadBalanced", "members", "sessionAffinity", "targetSize",
-		"templateRevision", "zones")
-	slices.Sort(loadBalancedKeys)
-
-	roster := func(t *testing.T, gw *wgnetv1alpha1.Gateway, name string) []gcpmembers.RosterEntry {
-		t.Helper()
-		names, err := gcpmembers.NameResourceNames(string(gw.UID), gw.Spec.GCP.ProjectID, name)
-		if err != nil {
-			t.Fatalf("gcpmembers.NameResourceNames(...) returned unexpected error: %v", err)
-		}
-		return []gcpmembers.RosterEntry{{Name: name, Slot: 0, TunnelAddress: "10.99.0.1", ManagedResourceNames: names}}
-	}
-
-	tests := []struct {
-		name           string
-		loadBalanced   bool
-		replicas       int32
-		result         func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result
-		wantKeys       []string
-		wantTargetSize int64
-		wantMembers    []any
-	}{
-		{
-			name:     "single instance without an observed name renders no roster",
-			wantKeys: singleInstanceKeys,
-		},
-		{
-			name: "single instance with an observed name renders one member",
-			result: func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result {
-				return &gcpmembers.Result{Roster: roster(t, gw, "gw-edge-9x2k")}
-			},
-			wantKeys:    slices.Sorted(slices.Values(append(append([]string{}, singleInstanceKeys...), "members"))),
-			wantMembers: []any{memberEntry("gw-edge-9x2k")},
-		},
-		{
-			name:           "load balanced without a result renders an empty roster",
-			loadBalanced:   true,
-			replicas:       2,
-			wantKeys:       loadBalancedKeys,
-			wantTargetSize: 2,
-			wantMembers:    []any{},
-		},
-		{
-			name:         "load balanced with a result renders its roster",
-			loadBalanced: true,
-			replicas:     2,
-			result: func(t *testing.T, gw *wgnetv1alpha1.Gateway) *gcpmembers.Result {
-				return &gcpmembers.Result{TargetSize: 1, Roster: roster(t, gw, "gw-edge-7f31")}
-			},
-			wantKeys:       loadBalancedKeys,
-			wantTargetSize: 1,
-			wantMembers:    []any{memberEntry("gw-edge-7f31")},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, nil)
-			gw.Spec.GCP.Replicas = tt.replicas
-			if tt.loadBalanced {
-				gw.Spec.GCP.LoadBalancer = &wgnetv1alpha1.GatewayGCPLoadBalancerSpec{SessionAffinity: "NONE"}
-			}
-			var result *gcpmembers.Result
-			if tt.result != nil {
-				result = tt.result(t, gw)
-			}
-
-			u, err := buildXGatewayGCP(gw, cfg, nil, tt.loadBalanced, result, clusterHealthPort)
-			if err != nil {
-				t.Fatalf("buildXGatewayGCP: %v", err)
-			}
-			specMap, found, err := unstructured.NestedMap(u.Object, "spec")
-			if err != nil || !found {
-				t.Fatalf("read spec: found=%v err=%v", found, err)
-			}
-			if got := slices.Sorted(maps.Keys(specMap)); !slices.Equal(got, tt.wantKeys) {
-				t.Errorf("spec keys = %v, want %v", got, tt.wantKeys)
-			}
-			if tt.loadBalanced {
-				if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "targetSize"); got != tt.wantTargetSize {
-					t.Errorf("spec.targetSize = %d, want %d", got, tt.wantTargetSize)
-				}
-				if got, _, _ := unstructured.NestedBool(u.Object, "spec", "loadBalanced"); !got {
-					t.Errorf("spec.loadBalanced = %v, want true", got)
-				}
-			}
-			if tt.wantMembers != nil {
-				got, _, err := unstructured.NestedSlice(u.Object, "spec", "members")
-				if err != nil {
-					t.Fatalf("read spec.members: %v", err)
-				}
-				if !reflect.DeepEqual(got, tt.wantMembers) {
-					t.Errorf("spec.members = %#v, want %#v", got, tt.wantMembers)
-				}
-			}
-		})
-	}
-}
-
-// memberEntry is the exact roster entry the composite carries for instanceName on the
-// fixture Gateway: names derived from the base plus the instance's own name.
-func memberEntry(instanceName string) map[string]any {
-	base := "gw-" + string(testGatewayUID) + "-test-project-" + instanceName
-	return map[string]any{
-		"name":                     instanceName,
-		"slot":                     int64(0),
-		"tunnelAddress":            "10.99.0.1",
-		"kubernetesSecretName":     base,
-		"cloudSecretName":          base,
-		"cloudSecretVersionName":   base + "-version",
-		"cloudSecretIamMemberName": base + "-iam",
-	}
-}
-
-// TestBuildXGatewayGCPKeySet pins the composite's exact spec key set: a stray or
-// dropped field fails here even when no other test reads it.
-func TestBuildXGatewayGCPKeySet(t *testing.T) {
-	cfg := testConfig()
-	gw := newGateway("edge", "wg-system",
-		[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP}},
-		nil,
-	)
-
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-	if err != nil {
-		t.Fatalf("buildXGatewayGCP: %v", err)
-	}
-	specMap, found, err := unstructured.NestedMap(u.Object, "spec")
-	if err != nil || !found {
-		t.Fatalf("read spec: found=%v err=%v", found, err)
-	}
-	got := slices.Sorted(maps.Keys(specMap))
-	want := []string{
-		"address", "allowedPorts", "crossplane", "diskSizeGB", "enableOsLogin", "image",
-		"machineType", "projectID", "providerConfigName", "region", "secretId",
-		"serviceAccountId", "sharedNetworkName", "spot", "trafficPolicy", "userData",
-		"wgGatewayAddress", "wgLinkAddress", "wgListenPort", "wgMTU",
-		"wgSubnet", "zone",
-	}
-	if !slices.Equal(got, want) {
-		t.Errorf("spec keys = %v, want %v", got, want)
-	}
-}
-
-// TestBuildXGatewayGCPOptionalFields pins the fields the builder omits when unconfigured
-// against image and diskSizeGB, which carry CRD defaults and are always set.
-func TestBuildXGatewayGCPOptionalFields(t *testing.T) {
-	cfg := testConfig()
-	cfg.UserData = ""
-	cfg.EnableOSLogin = false
-
-	gw := newGateway("edge", "wg-system", nil, nil)
-
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-	if err != nil {
-		t.Fatalf("buildXGatewayGCP: %v", err)
-	}
-
-	// enableOsLogin is set unconditionally from config, so a false config value
-	// surfaces as an explicit false rather than an omitted field.
-	if got, _, _ := unstructured.NestedBool(u.Object, "spec", "enableOsLogin"); got != false {
-		t.Errorf("enableOsLogin = %v, want false", got)
-	}
-
-	for _, field := range []string{"userData", "allowedPorts"} {
-		if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", field); found {
-			t.Errorf("spec.%s set, want omitted when unconfigured/empty", field)
-		}
-	}
-
-	// image and diskSizeGB are always present once defaulting is applied.
-	for _, field := range []string{"image", "diskSizeGB"} {
-		if _, found, _ := unstructured.NestedFieldNoCopy(u.Object, "spec", field); !found {
-			t.Errorf("spec.%s absent, want always set from defaulted gw.Spec", field)
-		}
-	}
-}
-
-// TestBuildXGatewayGCPWireguardListenPort pins that a non-default listen port flows
-// verbatim onto wgListenPort, so the gateway VM boots on the port the link dials.
-func TestBuildXGatewayGCPWireguardListenPort(t *testing.T) {
-	cfg := testConfig()
-	gw := newGateway("edge", "wg-system", nil, nil)
-	gw.Spec.Wireguard.ListenPort = 51999
-
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-	if err != nil {
-		t.Fatalf("buildXGatewayGCP: %v", err)
-	}
-
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgListenPort"); got != 51999 {
-		t.Errorf("wgListenPort = %d, want 51999 (non-default spec.wireguard.listenPort)", got)
-	}
-}
-
-// TestBuildXGatewayGCPWireguardMTU pins that a non-default mtu flows verbatim onto wgMTU, so
-// the VM sets wg0 to the same MTU the link uses rather than leaving it at the kernel default.
-func TestBuildXGatewayGCPWireguardMTU(t *testing.T) {
-	cfg := testConfig()
-	gw := newGateway("edge", "wg-system", nil, nil)
-	gw.Spec.Wireguard.MTU = 1280
-
-	u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-	if err != nil {
-		t.Fatalf("buildXGatewayGCP: %v", err)
-	}
-
-	if got, _, _ := unstructured.NestedInt64(u.Object, "spec", "wgMTU"); got != 1280 {
-		t.Errorf("wgMTU = %d, want 1280 (non-default spec.wireguard.mtu)", got)
-	}
 }
 
 func TestBuildBundleSecret(t *testing.T) {
@@ -647,7 +87,7 @@ func TestBuildLinkConfigMap(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -691,6 +131,23 @@ func TestBuildLinkConfigMap(t *testing.T) {
 	}
 }
 
+// TestBuildLinkConfigMapHealthPort pins that the healthPort argument flows verbatim onto
+// the RuntimeConfig's HealthPort field.
+func TestBuildLinkConfigMapHealthPort(t *testing.T) {
+	gw := newGateway("edge", "wg-system", nil, nil)
+
+	cm, err := buildLinkConfigMap(gw, "", nil, nil, "GATEWAY_PUB_TEST", nil, 8181, nil, "")
+	if err != nil {
+		t.Fatalf("buildLinkConfigMap: %v", err)
+	}
+	var rc link.RuntimeConfig
+	decodeJSON(t, cm.Data[linkConfigKey], &rc)
+
+	if rc.HealthPort != 8181 {
+		t.Errorf("healthPort = %d, want 8181", rc.HealthPort)
+	}
+}
+
 // TestBuildLinkConfigMapEndpoint pins that an empty address leaves the peer endpoint unset,
 // so the link waits and reloads in place once the gateway IP appears.
 func TestBuildLinkConfigMapEndpoint(t *testing.T) {
@@ -708,7 +165,7 @@ func TestBuildLinkConfigMapEndpoint(t *testing.T) {
 			gw := newGateway("edge", "wg-system",
 				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
 
-			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
+			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -741,7 +198,7 @@ func TestBuildLinkConfigMapTargetPortDefault(t *testing.T) {
 					{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: tt.targetPort},
 				}, nil)
 
-			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -767,7 +224,7 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 			{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "vpn"},
 		}, nil)
 
-	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
+	cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -788,27 +245,6 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 	}
 	if !slices.Equal(rc.Forwards, wantForwards) {
 		t.Errorf("loaded forwards = %+v, want %+v", rc.Forwards, wantForwards)
-	}
-}
-
-// TestEffectiveForwardNamespace pins the namespace-defaulting rule the FQDN builder and the
-// cross-namespace gate both depend on.
-func TestEffectiveForwardNamespace(t *testing.T) {
-	gw := newGateway("edge", "wg-system", nil, nil)
-	tests := []struct {
-		name    string
-		forward wgnetv1alpha1.Forward
-		want    string
-	}{
-		{"unset defaults to gateway namespace", wgnetv1alpha1.Forward{Service: "web"}, "wg-system"},
-		{"explicit namespace honored", wgnetv1alpha1.Forward{Service: "web", Namespace: "prod"}, "prod"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := effectiveForwardNamespace(tt.forward, gw); got != tt.want {
-				t.Errorf("effectiveForwardNamespace = %q, want %q", got, tt.want)
-			}
-		})
 	}
 }
 
@@ -834,7 +270,7 @@ func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system", []wgnetv1alpha1.Forward{tt.forward}, nil)
-			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort)
+			cm, err := buildLinkConfigMap(gw, "", clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -848,52 +284,6 @@ func TestBuildLinkConfigMapServiceFQDN(t *testing.T) {
 			}
 		})
 	}
-}
-
-// hasOpenEgressPort matches the 0.0.0.0/0 peer the link's forward and WireGuard rules use,
-// so the policy holds whether the CNI matches on ClusterIP or on pod IP.
-func hasOpenEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
-	for _, r := range rules {
-		open := false
-		for _, peer := range r.To {
-			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
-				open = true
-				break
-			}
-		}
-		if !open {
-			continue
-		}
-		for _, p := range r.Ports {
-			if p.Protocol != nil && *p.Protocol == proto && p.Port != nil && p.Port.IntVal == port {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// hasProtocolOnlyEgress reports whether any egress rule permits the whole of proto to a
-// 0.0.0.0/0 peer, the port-less shape an unresolved (named) backend port renders.
-func hasProtocolOnlyEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol) bool {
-	for _, r := range rules {
-		open := false
-		for _, peer := range r.To {
-			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
-				open = true
-				break
-			}
-		}
-		if !open {
-			continue
-		}
-		for _, p := range r.Ports {
-			if p.Protocol != nil && *p.Protocol == proto && p.Port == nil {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // hasNoPeerEgressPort matches a rule with no `to` peer, as the apiserver rule is, since
@@ -937,9 +327,27 @@ func hasDNSEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Pro
 	return false
 }
 
+// hasResponderEgress reports whether an egress rule permits proto/port to a single 0.0.0.0/0
+// peer with no pod selector: the shape needed for the DNAT-rewritten health probe.
+func hasResponderEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
+	for _, r := range rules {
+		if len(r.To) != 1 || r.To[0].IPBlock == nil || r.To[0].IPBlock.CIDR != "0.0.0.0/0" || r.To[0].PodSelector != nil {
+			continue
+		}
+		if len(r.Ports) != 1 {
+			continue
+		}
+		p := r.Ports[0]
+		if p.Protocol != nil && *p.Protocol == proto && p.Port != nil && p.Port.IntVal == port {
+			return true
+		}
+	}
+	return false
+}
+
 // fixedEgressRules is the count of egress rules buildLinkNetworkPolicy emits before the
-// per-forward ones: kube-dns, the WireGuard underlay, and the apiserver.
-const fixedEgressRules = 3
+// per-forward ones: kube-dns, the WireGuard underlay, the apiserver, and the responder Service.
+const fixedEgressRules = 4
 
 // TestBuildLinkNetworkPolicy pins each forward's rule to the Service port plus the pod-side
 // port it DNATs to, since CNIs evaluate egress before or after kube-proxy rewrites it.
@@ -1020,6 +428,9 @@ func TestBuildLinkNetworkPolicy(t *testing.T) {
 			}
 			if !hasNoPeerEgressPort(egress, corev1.ProtocolTCP, 6443) {
 				t.Errorf("egress missing apiserver TCP 6443 rule (Lease leader election): %+v", egress)
+			}
+			if !hasResponderEgress(egress, corev1.ProtocolTCP, effectiveResponderPort(gw)) {
+				t.Errorf("egress missing responder TCP %d rule: %+v", effectiveResponderPort(gw), egress)
 			}
 
 			if len(egress) != fixedEgressRules+len(tt.wantRules) {
@@ -1170,10 +581,18 @@ func TestBuildLinkDeployment(t *testing.T) {
 	}
 
 	// The link does not read the XGatewayGCP, so it carries no cluster-lookup env.
-	for _, gone := range []string{"GATEWAY_NAME", "GATEWAY_NAMESPACE", "GATEWAY_WG_LISTEN_PORT"} {
-		if _, present := env[gone]; present {
-			t.Errorf("env[%q] present, want removed", gone)
-		}
+	envNames := make([]string, 0, len(c.Env))
+	for _, e := range c.Env {
+		envNames = append(envNames, e.Name)
+	}
+	slices.Sort(envNames)
+	wantEnvNames := []string{
+		"GATEWAY_CONFIG_PATH", "GATEWAY_HEALTH_ADDR", "GATEWAY_LEASE_NAME",
+		"GATEWAY_RECONCILE_INTERVAL", "GATEWAY_WG_KEY_PATH", "GATEWAY_WG_PEER_PUBKEY_PATH",
+		"POD_NAME", "POD_NAMESPACE",
+	}
+	if !reflect.DeepEqual(envNames, wantEnvNames) {
+		t.Errorf("link container env names = %v, want %v", envNames, wantEnvNames)
 	}
 
 	// Leader election needs the projected ServiceAccount token, so the pod runs
@@ -1399,141 +818,6 @@ func TestBuildLinkPodDisruptionBudget(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPProviderSelector pins the compositionSelector provider label, so a
-// second provider's Composition cannot collide with the gcp one.
-func TestBuildXGatewayGCPProviderSelector(t *testing.T) {
-	cfg := testConfig()
-	tests := []struct {
-		name     string
-		provider wgnetv1alpha1.CloudProvider
-		want     string
-	}{
-		{"defaults to gcp when empty", "", "gcp"},
-		{"honors explicit provider", wgnetv1alpha1.ProviderGCP, "gcp"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, nil)
-			gw.Spec.Provider = tt.provider
-
-			u, err := buildXGatewayGCP(gw, cfg, gw.Spec.Forwards, false, nil, clusterHealthPort)
-			if err != nil {
-				t.Fatalf("buildXGatewayGCP: %v", err)
-			}
-			assertNestedString(t, u, tt.want, "spec", "crossplane", "compositionSelector", "matchLabels", "provider")
-		})
-	}
-}
-
-// TestBuildXGatewayNetwork pins the singleton shared-VPC composite, which carries no
-// ownerReference so deleting a Gateway never GCs the shared network.
-func TestBuildXGatewayNetwork(t *testing.T) {
-	cfg := testConfig()
-
-	u := buildXGatewayNetwork(cfg)
-
-	if got := u.GetAPIVersion(); got != xgatewayGCPAPIVersion {
-		t.Errorf("apiVersion = %q, want %q", got, xgatewayGCPAPIVersion)
-	}
-	if got := u.GetKind(); got != xgatewayNetworkKind {
-		t.Errorf("kind = %q, want %q", got, xgatewayNetworkKind)
-	}
-	if got := u.GetName(); got != cfg.SharedNetworkName {
-		t.Errorf("name = %q, want %q", got, cfg.SharedNetworkName)
-	}
-	if got := u.GetNamespace(); got != cfg.PodNamespace {
-		t.Errorf("namespace = %q, want %q", got, cfg.PodNamespace)
-	}
-
-	assertNestedString(t, u, cfg.SharedNetworkName, "spec", "name")
-	assertNestedString(t, u, cfg.ProviderConfigName, "spec", "providerConfigName")
-	assertNestedString(t, u, "gcp", "spec", "crossplane", "compositionSelector", "matchLabels", "provider")
-
-	if refs := u.GetOwnerReferences(); len(refs) != 0 {
-		t.Errorf("ownerReferences = %d, want 0 (shared network is refcount-managed, not Gateway-owned)", len(refs))
-	}
-}
-
-func TestBuildDNSEndpoint(t *testing.T) {
-	tests := []struct {
-		name      string
-		hostnames []string
-		address   string
-		wantNil   bool
-		wantHosts []string
-	}{
-		{"no hostnames", nil, "203.0.113.5", true, nil},
-		{"no address", []string{"a.example.com"}, "", true, nil},
-		{"two hostnames", []string{"a.example.com", "*.example.com"}, "203.0.113.5", false, []string{"a.example.com", "*.example.com"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, tt.hostnames)
-			u := buildDNSEndpoint(gw, tt.address)
-
-			if tt.wantNil {
-				if u != nil {
-					t.Fatalf("buildDNSEndpoint = %v, want nil", u.Object)
-				}
-				return
-			}
-			if u == nil {
-				t.Fatal("buildDNSEndpoint = nil, want object")
-			}
-
-			if got := u.GetAPIVersion(); got != dnsEndpointAPIVersion {
-				t.Errorf("apiVersion = %q, want %q", got, dnsEndpointAPIVersion)
-			}
-			if got := u.GetKind(); got != dnsEndpointKind {
-				t.Errorf("kind = %q, want %q", got, dnsEndpointKind)
-			}
-			if got := u.GetAnnotations()[cloudflareProxiedAnnotation]; got != "false" {
-				t.Errorf("%s = %q, want false", cloudflareProxiedAnnotation, got)
-			}
-
-			endpoints, _, err := unstructured.NestedSlice(u.Object, "spec", "endpoints")
-			if err != nil {
-				t.Fatalf("read endpoints: %v", err)
-			}
-			gotHosts := map[string]bool{}
-			for _, raw := range endpoints {
-				ep, ok := raw.(map[string]any)
-				if !ok {
-					t.Fatalf("endpoint is %T, want map", raw)
-				}
-				if ep["recordType"] != "A" {
-					t.Errorf("recordType = %v, want A", ep["recordType"])
-				}
-				targets, ok := ep["targets"].([]any)
-				if !ok || len(targets) != 1 || targets[0] != tt.address {
-					t.Errorf("targets = %v, want [%s]", ep["targets"], tt.address)
-				}
-				dnsName, ok := ep["dnsName"].(string)
-				if !ok {
-					t.Fatalf("dnsName is %T, want string", ep["dnsName"])
-				}
-				gotHosts[dnsName] = true
-			}
-			for _, h := range tt.wantHosts {
-				if !gotHosts[h] {
-					t.Errorf("missing endpoint for %q; got %v", h, gotHosts)
-				}
-			}
-		})
-	}
-}
-
-// TestGCPIDBase32Length documents the bound truncation relies on: sha256 base32-encodes to
-// 52 chars, so prefix+hash always exceeds the 30-char cap.
-func TestGCPIDBase32Length(t *testing.T) {
-	full := base32.StdEncoding.WithPadding(base32.NoPadding).EncodedLen(32)
-	if full+len(gcpIDPrefix) <= gcpIDMaxLen {
-		t.Fatalf("base32 length %d + prefix does not exceed cap %d; truncation untested", full, gcpIDMaxLen)
-	}
-}
-
 // TestEffectiveTrafficPolicy pins that an empty value reads as Cluster, so a Gateway that
 // bypassed CRD defaulting still builds a Cluster data path.
 func TestEffectiveTrafficPolicy(t *testing.T) {
@@ -1594,32 +878,6 @@ func TestLinkIdentityOf(t *testing.T) {
 	}
 }
 
-// TestBuildXGatewayGCPTrafficPolicy pins that the composite carries the mode lowercased,
-// which is the form the composition renders into the VM's traffic-policy metadata key.
-func TestBuildXGatewayGCPTrafficPolicy(t *testing.T) {
-	tests := []struct {
-		name   string
-		policy wgnetv1alpha1.TrafficPolicy
-		want   string
-	}{
-		{"unset renders cluster", "", "cluster"},
-		{"Cluster renders cluster", wgnetv1alpha1.TrafficPolicyCluster, "cluster"},
-		{"Local renders local", wgnetv1alpha1.TrafficPolicyLocal, "local"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gw := newGateway("edge", "wg-system", nil, nil)
-			gw.Spec.TrafficPolicy = tt.policy
-
-			u, err := buildXGatewayGCP(gw, testConfig(), nil, false, nil, clusterHealthPort)
-			if err != nil {
-				t.Fatalf("buildXGatewayGCP: %v", err)
-			}
-			assertNestedString(t, u, tt.want, "spec", "trafficPolicy")
-		})
-	}
-}
-
 // TestBuildLinkConfigMapLocal pins the Local-mode RuntimeConfig: the derived identity, the
 // widened allowed IPs and EndpointSlice-resolvable forwards instead of Service FQDNs.
 func TestBuildLinkConfigMapLocal(t *testing.T) {
@@ -1636,7 +894,8 @@ func TestBuildLinkConfigMapLocal(t *testing.T) {
 		{Forward: gw.Spec.Forwards[1], BackendPort: 5432, ServicePortName: "postgres"},
 	}
 
-	cm, err := buildLinkConfigMap(gw, "203.0.113.5", backends, linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw))
+	responders := map[string]string{"node-a": "10.244.9.9"}
+	cm, err := buildLinkConfigMap(gw, "203.0.113.5", backends, linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw), responders, "")
 	if err != nil {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
@@ -1673,6 +932,13 @@ func TestBuildLinkConfigMapLocal(t *testing.T) {
 	if !slices.Equal(rc.Forwards, wantForwards) {
 		t.Errorf("forwards = %+v, want %+v", rc.Forwards, wantForwards)
 	}
+
+	if !maps.Equal(rc.Responders, responders) {
+		t.Errorf("responders = %v, want %v", rc.Responders, responders)
+	}
+	if rc.ResponderPort != 27000 {
+		t.Errorf("responderPort = %d, want %d", rc.ResponderPort, 27000)
+	}
 }
 
 // TestBuildLinkConfigMapPodSelector pins that the pod selector is Local-only: the
@@ -1699,7 +965,7 @@ func TestBuildLinkConfigMapPodSelector(t *testing.T) {
 				endpoint = "203.0.113.5"
 			}
 
-			cm, err := buildLinkConfigMap(gw, endpoint, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw))
+			cm, err := buildLinkConfigMap(gw, endpoint, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw), "GATEWAY_PUB_TEST", nil, effectiveHealthPort(gw), nil, "")
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
@@ -1764,7 +1030,7 @@ func TestBuildLinkDaemonSet(t *testing.T) {
 		{"container ports", len(c.Ports), 0},
 		{"probe host", c.ReadinessProbe.HTTPGet.Host, "127.0.0.1"},
 		{"probe port", c.ReadinessProbe.HTTPGet.Port, intstr.FromInt32(27003)},
-		{"health addr", env["GATEWAY_HEALTH_ADDR"], ":27003"},
+		{"health addr", env["GATEWAY_HEALTH_ADDR"], "127.0.0.1:27003"},
 		{"host proc mount path", mounts["host-proc-sys-net"].MountPath, link.HostProcSysNetPath},
 		{"host proc mount writable", mounts["host-proc-sys-net"].ReadOnly, false},
 		{"host proc hostPath", volumes["host-proc-sys-net"].HostPath.Path, "/proc/sys/net"},
@@ -1821,22 +1087,36 @@ func TestBuildLinkDeploymentUnchangedInClusterMode(t *testing.T) {
 		t.Errorf("init containers = %d, want 1", len(podSpec.InitContainers))
 	}
 	assertHostnameAntiAffinity(t, podSpec.Affinity, linkSelectorLabels(gw))
-	if len(c.Ports) != 1 || c.Ports[0].Name != "health" || c.Ports[0].ContainerPort != 8080 {
-		t.Errorf("container ports = %+v, want a single health port 8080", c.Ports)
+	if len(c.Ports) != 1 || c.Ports[0].Name != "health" || c.Ports[0].ContainerPort != 27000 {
+		t.Errorf("container ports = %+v, want a single health port 27000", c.Ports)
 	}
 	if got := c.ReadinessProbe.HTTPGet; got.Host != "" || got.Port != intstr.FromString("health") {
 		t.Errorf("readiness probe = %+v, want the named health port with no host", got)
 	}
-	if env["GATEWAY_HEALTH_ADDR"] != ":8080" {
-		t.Errorf("GATEWAY_HEALTH_ADDR = %q, want :8080", env["GATEWAY_HEALTH_ADDR"])
+	if env["GATEWAY_HEALTH_ADDR"] != ":27000" {
+		t.Errorf("GATEWAY_HEALTH_ADDR = %q, want :27000", env["GATEWAY_HEALTH_ADDR"])
 	}
-	if _, present := env["NODE_NAME"]; present {
-		t.Error("NODE_NAME present, want it only in Local mode")
+	envNames := make([]string, 0, len(c.Env))
+	for _, e := range c.Env {
+		envNames = append(envNames, e.Name)
 	}
+	slices.Sort(envNames)
+	wantEnvNames := []string{
+		"GATEWAY_CONFIG_PATH", "GATEWAY_HEALTH_ADDR", "GATEWAY_LEASE_NAME",
+		"GATEWAY_RECONCILE_INTERVAL", "GATEWAY_WG_KEY_PATH", "GATEWAY_WG_PEER_PUBKEY_PATH",
+		"POD_NAME", "POD_NAMESPACE",
+	}
+	if !reflect.DeepEqual(envNames, wantEnvNames) {
+		t.Errorf("Cluster link container env names = %v, want %v", envNames, wantEnvNames)
+	}
+	volumeNames := make([]string, 0, len(podSpec.Volumes))
 	for _, v := range podSpec.Volumes {
-		if v.Name == "host-proc-sys-net" {
-			t.Error("host-proc-sys-net volume present, want it only in Local mode")
-		}
+		volumeNames = append(volumeNames, v.Name)
+	}
+	slices.Sort(volumeNames)
+	wantVolumeNames := []string{"config", "wg-keys"}
+	if !reflect.DeepEqual(volumeNames, wantVolumeNames) {
+		t.Errorf("Cluster link pod volume names = %v, want %v", volumeNames, wantVolumeNames)
 	}
 }
 
@@ -1952,19 +1232,23 @@ func TestLinkClusterRoleBindingNameDistinctAcrossNamespaces(t *testing.T) {
 // a reordered env slice cannot silently move the override onto another variable.
 func TestLinkPodSpecHealthAddr(t *testing.T) {
 	tests := []struct {
-		name   string
-		policy wgnetv1alpha1.TrafficPolicy
-		id     int32
-		want   string
+		name              string
+		policy            wgnetv1alpha1.TrafficPolicy
+		id                int32
+		healthPort        int32
+		want              string
+		wantContainerPort int32
 	}{
-		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, ":8080"},
-		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, ":27001"},
-		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, ":27007"},
+		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, 0, ":27000", 27000},
+		{"cluster custom health port", wgnetv1alpha1.TrafficPolicyCluster, 0, 8181, ":8181", 8181},
+		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, 0, "127.0.0.1:27001", 0},
+		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, 0, "127.0.0.1:27007", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system", nil, nil)
 			gw.Spec.TrafficPolicy = tt.policy
+			gw.Spec.Link.HealthPort = tt.healthPort
 			gw.Status.Link.ID = tt.id
 
 			spec := linkPodSpec(gw, testConfig(), linkIdentityOf(gw))
@@ -1980,6 +1264,45 @@ func TestLinkPodSpecHealthAddr(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("GATEWAY_HEALTH_ADDR = %q, want %q", got, tt.want)
+			}
+
+			ports := spec.Containers[0].Ports
+			if tt.wantContainerPort == 0 {
+				if len(ports) != 0 {
+					t.Errorf("container ports = %+v, want none in Local mode", ports)
+				}
+				return
+			}
+			if len(ports) != 1 || ports[0].Name != "health" || ports[0].ContainerPort != tt.wantContainerPort {
+				t.Errorf("container ports = %+v, want a single health port %d", ports, tt.wantContainerPort)
+			}
+		})
+	}
+}
+
+// TestEffectiveHealthPort pins effectiveHealthPort's precedence: Local always uses its
+// identity port; Cluster uses spec.link.healthPort when set, else the 27000 default.
+func TestEffectiveHealthPort(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     wgnetv1alpha1.TrafficPolicy
+		id         int32
+		healthPort int32
+		want       int
+	}{
+		{"cluster unset", wgnetv1alpha1.TrafficPolicyCluster, 0, 0, 27000},
+		{"cluster set 8181", wgnetv1alpha1.TrafficPolicyCluster, 0, 8181, 8181},
+		{"local ignores healthPort", wgnetv1alpha1.TrafficPolicyLocal, 3, 8181, 27003},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newGateway("edge", "wg-system", nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			gw.Spec.Link.HealthPort = tt.healthPort
+			gw.Status.Link.ID = tt.id
+
+			if got := effectiveHealthPort(gw); got != tt.want {
+				t.Errorf("effectiveHealthPort = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -2062,4 +1385,794 @@ func TestClusterHealthPortMatchesLinkDefault(t *testing.T) {
 	if clusterHealthPort != wantPort {
 		t.Errorf("clusterHealthPort = %d, want %d from link.Config's HealthAddr default", clusterHealthPort, wantPort)
 	}
+}
+
+// TestReconcileLinkPodDisruptionBudget asserts the PDB tracks the link replica count: absent at
+// one replica, present above it, removed on scale-back so a stale PDB cannot strand a drain.
+func TestReconcileLinkPodDisruptionBudget(t *testing.T) {
+	ctx := context.Background()
+	te, r, gw, key, _ := reconcileFixture(ctx, t)
+	cl := te.client
+	pdbKey := client.ObjectKey{Namespace: key.Namespace, Name: linkComponentName(gw)}
+
+	// Default single replica: the link provisions but carries no PDB.
+	drainReconcile(ctx, t, r, key)
+	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("pdb get at one replica = %v, want NotFound", err)
+	}
+
+	// Scaling to >1 must create the PDB, owner-ref'd for GC.
+	setLinkReplicas(ctx, t, cl, key, 3)
+	drainReconcile(ctx, t, r, key)
+	var pdb policyv1.PodDisruptionBudget
+	mustGet(ctx, t, cl, pdbKey, &pdb)
+	assertOwnedByGateway(t, &pdb, gw)
+	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
+		t.Errorf("pdb minAvailable = %+v, want 1", pdb.Spec.MinAvailable)
+	}
+
+	// Scaling back to one must delete the PDB so it cannot block a drain.
+	setLinkReplicas(ctx, t, cl, key, 1)
+	drainReconcile(ctx, t, r, key)
+	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
+		t.Errorf("pdb get after scaling 3->1 = %v, want NotFound (deleted)", err)
+	}
+}
+
+// setLinkReplicas sets spec.link.replicas on the live Gateway at key via a
+// read-modify-write, so the reconciler reads the updated count.
+func setLinkReplicas(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, replicas int32) {
+	t.Helper()
+	var gw wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &gw)
+	gw.Spec.Link.Replicas = replicas
+	if err := cl.Update(ctx, &gw); err != nil {
+		t.Fatalf("set link replicas to %d: %v", replicas, err)
+	}
+}
+
+// TestRejectReservedHealthPort covers rejectReservedHealthPort: a Local health-port forward is
+// rejected, another port stays valid, a Cluster forward is untouched: admission rejects it already.
+func TestRejectReservedHealthPort(t *testing.T) {
+	const localID = 7
+	localHealthPort := int32(link.NewGatewayIdentity(localID).HealthPort)
+
+	localGateway := func() *wgnetv1alpha1.Gateway {
+		gw := newGateway("gw", "ns", nil, nil)
+		gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+		gw.Status.Link.ID = localID
+		return gw
+	}
+
+	tests := []struct {
+		name         string
+		gw           *wgnetv1alpha1.Gateway
+		forward      wgnetv1alpha1.Forward
+		wantRejected bool
+	}{
+		{
+			name:         "local forward on its health port rejected",
+			gw:           localGateway(),
+			forward:      wgnetv1alpha1.Forward{Port: localHealthPort, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			wantRejected: true,
+		},
+		{
+			name:         "local forward on another port accepted",
+			gw:           localGateway(),
+			forward:      wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			wantRejected: false,
+		},
+		{
+			name:         "cluster forward on its own effective health port left valid unchanged",
+			gw:           newGateway("gw", "ns", nil, nil),
+			forward:      wgnetv1alpha1.Forward{Port: int32(clusterHealthPort), Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			wantRejected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := forwardBackend{Forward: tt.forward}
+			stillValid, invalid, rejected := rejectReservedHealthPort(tt.gw, []forwardBackend{backend}, nil)
+
+			if tt.wantRejected {
+				if len(stillValid) != 0 {
+					t.Errorf("stillValid = %v, want empty", stillValid)
+				}
+				if len(invalid) != 1 || invalid[0].reason != reasonReservedHealthPort {
+					t.Errorf("invalid = %v, want one entry with reason %q", invalid, reasonReservedHealthPort)
+				}
+				if len(rejected) != 1 || rejected[0] != tt.forward {
+					t.Errorf("rejected = %v, want [%v]", rejected, tt.forward)
+				}
+				return
+			}
+			if len(stillValid) != 1 || stillValid[0] != backend {
+				t.Errorf("stillValid = %v, want [%v]", stillValid, backend)
+			}
+			if len(invalid) != 0 {
+				t.Errorf("invalid = %v, want empty", invalid)
+			}
+			if len(rejected) != 0 {
+				t.Errorf("rejected = %v, want empty", rejected)
+			}
+		})
+	}
+}
+
+// TestLowestFreeLinkID pins the dense-range allocator: the lowest unused id, the caller's own id
+// reused, and exhaustion reported rather than wrapped.
+func TestLowestFreeLinkID(t *testing.T) {
+	self := client.ObjectKey{Namespace: "wg-system", Name: "edge"}
+
+	withIDs := func(ids ...int32) []wgnetv1alpha1.Gateway {
+		gateways := make([]wgnetv1alpha1.Gateway, 0, len(ids))
+		for i, id := range ids {
+			gateways = append(gateways, wgnetv1alpha1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "wg-system", Name: fmt.Sprintf("other-%d", i)},
+				Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: id}},
+			})
+		}
+		return gateways
+	}
+
+	all := make([]wgnetv1alpha1.Gateway, 0, link.MaxLinkID)
+	for id := int32(1); id <= link.MaxLinkID; id++ {
+		all = append(all, wgnetv1alpha1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "wg-system", Name: fmt.Sprintf("g-%d", id)},
+			Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: id}},
+		})
+	}
+
+	tests := []struct {
+		name     string
+		gateways []wgnetv1alpha1.Gateway
+		want     int32
+		wantOK   bool
+	}{
+		{"empty list allocates 1", nil, 1, true},
+		{"lowest gap taken", withIDs(1, 3), 2, true},
+		{"cluster gateways holding no id are ignored", withIDs(0, 0), 1, true},
+		{"whole range taken reports exhaustion", all, 0, false},
+		{
+			name: "annotated id reserves it even with status empty",
+			gateways: []wgnetv1alpha1.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "wg-system",
+					Name:        "restored",
+					Annotations: map[string]string{linkIDAnnotation: "1"},
+				},
+			}},
+			want:   2,
+			wantOK: true,
+		},
+		{
+			name: "malformed annotation reserves nothing",
+			gateways: []wgnetv1alpha1.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "wg-system",
+					Name:        "broken",
+					Annotations: map[string]string{linkIDAnnotation: "not-a-number"},
+				},
+			}},
+			want:   1,
+			wantOK: true,
+		},
+		{
+			name: "out-of-range annotation reserves nothing",
+			gateways: []wgnetv1alpha1.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   "wg-system",
+					Name:        "over",
+					Annotations: map[string]string{linkIDAnnotation: fmt.Sprint(link.MaxLinkID + 1)},
+				},
+			}},
+			want:   1,
+			wantOK: true,
+		},
+		{
+			name: "own annotation is reusable",
+			gateways: []wgnetv1alpha1.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:   self.Namespace,
+					Name:        self.Name,
+					Annotations: map[string]string{linkIDAnnotation: "1"},
+				},
+			}},
+			want:   1,
+			wantOK: true,
+		},
+		{
+			name: "own id is reusable",
+			gateways: []wgnetv1alpha1.Gateway{{
+				ObjectMeta: metav1.ObjectMeta{Namespace: self.Namespace, Name: self.Name},
+				Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: 1}},
+			}},
+			want:   1,
+			wantOK: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := lowestFreeLinkID(tt.gateways, self)
+			if ok != tt.wantOK {
+				t.Fatalf("lowestFreeLinkID ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.want {
+				t.Errorf("lowestFreeLinkID = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEnsureLinkIDIsAuthoritative pins that a persisted id is read, never recomputed even once a
+// lower id frees up: the names derived from it are what a restarting link reclaims.
+func TestEnsureLinkIDIsAuthoritative(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	// A squatter holds id 1 so the Gateway under test allocates 2, leaving a lower id
+	// to free up.
+	squatter := newGateway("squatter", "default", nil, nil)
+	squatter.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	mustCreate(ctx, t, cl, squatter)
+	squatter.Status.Link.ID = 1
+	if err := cl.Status().Update(ctx, squatter); err != nil {
+		t.Fatalf("seed squatter link id: %v", err)
+	}
+
+	r, key := localGatewayFixture(ctx, t, te, "lid-auth")
+	drainReconcile(ctx, t, r, key)
+
+	var got wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &got)
+	if got.Status.Link.ID != 2 {
+		t.Fatalf("status.link.id = %d, want 2 (1 is held by the squatter)", got.Status.Link.ID)
+	}
+
+	if err := cl.Delete(ctx, squatter); err != nil {
+		t.Fatalf("delete squatter: %v", err)
+	}
+	drainReconcile(ctx, t, r, key)
+
+	mustGet(ctx, t, cl, key, &got)
+	if got.Status.Link.ID != 2 {
+		t.Errorf("status.link.id = %d after id 1 freed, want the authoritative 2", got.Status.Link.ID)
+	}
+}
+
+// TestLinkConfigMapCarriesResponderInfo pins the RuntimeConfig keys each shape's link ConfigMap
+// carries: Cluster gets responderTarget/responderPort with no responders map; Local gets both.
+func TestLinkConfigMapCarriesResponderInfo(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	t.Run("cluster", func(t *testing.T) {
+		const ns = "responder-cfg-cluster"
+		r, key := linkGatewayFixture(ctx, t, te, ns, wgnetv1alpha1.TrafficPolicyCluster)
+		drainReconcile(ctx, t, r, key)
+
+		var gw wgnetv1alpha1.Gateway
+		mustGet(ctx, t, cl, key, &gw)
+
+		var svc corev1.Service
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: responderComponentName(&gw)}, &svc)
+		var linkSecret corev1.Secret
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: linkSecretName(&gw)}, &linkSecret)
+
+		var cm corev1.ConfigMap
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm)
+		var rc link.RuntimeConfig
+		decodeJSON(t, cm.Data[linkConfigKey], &rc)
+
+		want := link.RuntimeConfig{
+			TrafficPolicy:   string(wgnetv1alpha1.TrafficPolicyCluster),
+			HealthPort:      clusterHealthPort,
+			ResponderPort:   27000,
+			ResponderTarget: svc.Spec.ClusterIP,
+			WireGuard: link.WireGuard{
+				Address: effectiveWGLinkAddress(&gw) + "/29",
+				MTU:     int(effectiveWGMTU(&gw)),
+				Peers: []link.Peer{{
+					Slot:                0,
+					PublicKey:           string(linkSecret.Data[wg.LinkPeerPublicKey]),
+					AllowedIPs:          []string{effectiveWGSubnet(&gw)},
+					PersistentKeepalive: int(effectiveWGKeepalive(&gw)),
+				}},
+			},
+			Forwards: []link.Forward{{
+				Name:       "tcp-443",
+				PublicPort: 443,
+				Protocol:   "tcp",
+				Service:    forwardServiceFQDN(gw.Spec.Forwards[0], &gw),
+				TargetPort: 443,
+			}},
+		}
+		if !reflect.DeepEqual(rc, want) {
+			t.Errorf("link runtime config = %#v, want %#v", rc, want)
+		}
+	})
+
+	t.Run("local", func(t *testing.T) {
+		const ns = "responder-cfg-local"
+		r, key := localGatewayFixture(ctx, t, te, ns)
+		drainReconcile(ctx, t, r, key)
+
+		var gw wgnetv1alpha1.Gateway
+		mustGet(ctx, t, cl, key, &gw)
+		createLinkPod(ctx, t, cl, &gw, "gw-link-a", "node-a")
+		createResponderPod(ctx, t, cl, gw.Namespace, "responder-a", "node-a", "10.10.0.9", responderSelectorLabels(&gw))
+		drainReconcile(ctx, t, r, key)
+
+		mustGet(ctx, t, cl, key, &gw)
+		ident := linkIdentityOf(&gw)
+		if ident == nil {
+			t.Fatalf("linkIdentityOf(gw) = nil, want an allocated Local identity")
+		}
+		var linkSecret corev1.Secret
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: linkSecretName(&gw)}, &linkSecret)
+
+		var cm corev1.ConfigMap
+		mustGet(ctx, t, cl, client.ObjectKey{Namespace: ns, Name: "gw-link"}, &cm)
+		var rc link.RuntimeConfig
+		decodeJSON(t, cm.Data[linkConfigKey], &rc)
+
+		want := link.RuntimeConfig{
+			TrafficPolicy: string(wgnetv1alpha1.TrafficPolicyLocal),
+			Identity:      ident,
+			HealthPort:    ident.HealthPort,
+			ResponderPort: 27000,
+			PodSelector:   linkSelectorLabels(&gw),
+			Responders:    map[string]string{"node-a": "10.10.0.9"},
+			WireGuard: link.WireGuard{
+				Address: effectiveWGLinkAddress(&gw) + "/29",
+				MTU:     int(effectiveWGMTU(&gw)),
+				Peers: []link.Peer{{
+					Slot:                0,
+					PublicKey:           string(linkSecret.Data[wg.LinkPeerPublicKey]),
+					AllowedIPs:          []string{"0.0.0.0/0"},
+					PersistentKeepalive: int(effectiveWGKeepalive(&gw)),
+				}},
+			},
+			Forwards: []link.Forward{{
+				Name:            "tcp-443",
+				PublicPort:      443,
+				Protocol:        "tcp",
+				Namespace:       effectiveForwardNamespace(gw.Spec.Forwards[0], &gw),
+				ServiceName:     gw.Spec.Forwards[0].Service,
+				ServicePortName: "",
+			}},
+		}
+		if !reflect.DeepEqual(rc, want) {
+			t.Errorf("link runtime config = %#v, want %#v", rc, want)
+		}
+	})
+}
+
+// TestClusterLinkNetworkPolicyResponderEgress pins the Cluster link's egress rule to the
+// Gateway's own responder pods, the path its health-port DNAT traffic takes.
+func TestClusterLinkNetworkPolicyResponderEgress(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	r, key := linkGatewayFixture(ctx, t, te, "responder-netpol-cluster", wgnetv1alpha1.TrafficPolicyCluster)
+	drainReconcile(ctx, t, r, key)
+
+	var gw wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &gw)
+
+	var np networkingv1.NetworkPolicy
+	mustGet(ctx, t, cl, client.ObjectKey{Namespace: "responder-netpol-cluster", Name: "gw-link"}, &np)
+	if !hasResponderEgress(np.Spec.Egress, corev1.ProtocolTCP, effectiveResponderPort(&gw)) {
+		t.Errorf("egress missing responder TCP %d rule: %+v", effectiveResponderPort(&gw), np.Spec.Egress)
+	}
+}
+
+// seedLinkIDHolder creates a Local Gateway carrying the given status id and link id annotation,
+// standing in for another Gateway that already holds an id.
+func seedLinkIDHolder(ctx context.Context, t *testing.T, cl client.Client, ns, name string, statusID int32, annotation string) {
+	t.Helper()
+	holder := newGateway(name, ns, nil, nil)
+	holder.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	if annotation != "" {
+		holder.Annotations = map[string]string{linkIDAnnotation: annotation}
+	}
+	mustCreate(ctx, t, cl, holder)
+	if statusID == 0 {
+		return
+	}
+	holder.Status.Link.ID = statusID
+	if err := cl.Status().Update(ctx, holder); err != nil {
+		t.Fatalf("seed link id %d on %s/%s: %v", statusID, ns, name, err)
+	}
+}
+
+func setLinkIDAnnotation(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, value string) {
+	t.Helper()
+	var gw wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &gw)
+	if gw.Annotations == nil {
+		gw.Annotations = map[string]string{}
+	}
+	gw.Annotations[linkIDAnnotation] = value
+	if err := cl.Update(ctx, &gw); err != nil {
+		t.Fatalf("set link id annotation on %s: %v", key, err)
+	}
+}
+
+// TestEnsureLinkIDAnnotation pins the second record of the allocated id: an unheld annotated id
+// is adopted, so a Gateway restored without status keeps the id its node state is named after.
+func TestEnsureLinkIDAnnotation(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	tests := []struct {
+		name string
+		ns   string
+		// seed runs on the created Gateway before the first reconcile.
+		seed  func(key client.ObjectKey)
+		check func(t *testing.T, got *wgnetv1alpha1.Gateway)
+	}{
+		{
+			name: "restored gateway adopts its annotated id",
+			ns:   "lid-restored",
+			seed: func(key client.ObjectKey) { setLinkIDAnnotation(ctx, t, cl, key, "3") },
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				if got.Status.Link.ID != 3 {
+					t.Errorf("status.link.id = %d, want the annotated 3", got.Status.Link.ID)
+				}
+				if ann := got.Annotations[linkIDAnnotation]; ann != "3" {
+					t.Errorf("annotation = %q, want it left at \"3\"", ann)
+				}
+			},
+		},
+		{
+			name: "fresh gateway is annotated with its allocated id",
+			ns:   "lid-fresh",
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				assertLinkIDAnnotationMatchesStatus(t, got)
+			},
+		},
+		{
+			name: "annotated id held in another status is not adopted",
+			ns:   "lid-taken-status",
+			seed: func(key client.ObjectKey) {
+				seedLinkIDHolder(ctx, t, cl, key.Namespace, "status-holder", 40, "")
+				setLinkIDAnnotation(ctx, t, cl, key, "40")
+			},
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				if got.Status.Link.ID == 40 {
+					t.Errorf("status.link.id = 40, want an id other than the one held in status")
+				}
+				assertLinkIDAnnotationMatchesStatus(t, got)
+			},
+		},
+		{
+			name: "an id another gateway only annotates is skipped",
+			ns:   "lid-taken-annotation",
+			seed: func(key client.ObjectKey) {
+				seedLinkIDHolder(ctx, t, cl, key.Namespace, "annotation-holder", 0, "41")
+			},
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				if got.Status.Link.ID == 41 {
+					t.Errorf("status.link.id = 41, want an id another gateway does not annotate")
+				}
+				assertLinkIDAnnotationMatchesStatus(t, got)
+			},
+		},
+		{
+			name: "status wins over a differing annotation",
+			ns:   "lid-status-wins",
+			seed: func(key client.ObjectKey) {
+				setLinkIDAnnotation(ctx, t, cl, key, "42")
+				var gw wgnetv1alpha1.Gateway
+				mustGet(ctx, t, cl, key, &gw)
+				gw.Status.Link.ID = 43
+				if err := cl.Status().Update(ctx, &gw); err != nil {
+					t.Fatalf("seed status link id: %v", err)
+				}
+			},
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				if got.Status.Link.ID != 43 {
+					t.Errorf("status.link.id = %d, want the authoritative 43", got.Status.Link.ID)
+				}
+				assertLinkIDAnnotationMatchesStatus(t, got)
+			},
+		},
+		{
+			name: "malformed annotation is replaced by a fresh allocation",
+			ns:   "lid-malformed",
+			seed: func(key client.ObjectKey) { setLinkIDAnnotation(ctx, t, cl, key, "not-a-number") },
+			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
+				t.Helper()
+				assertLinkIDAnnotationMatchesStatus(t, got)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, key := localGatewayFixture(ctx, t, te, tt.ns)
+			if tt.seed != nil {
+				tt.seed(key)
+			}
+			drainReconcile(ctx, t, r, key)
+
+			var got wgnetv1alpha1.Gateway
+			mustGet(ctx, t, cl, key, &got)
+			tt.check(t, &got)
+		})
+	}
+}
+
+// assertLinkIDAnnotationMatchesStatus fails unless an id was allocated and the annotation
+// records exactly it, which is what makes the annotation usable on a restore.
+func assertLinkIDAnnotationMatchesStatus(t *testing.T, gw *wgnetv1alpha1.Gateway) {
+	t.Helper()
+	if gw.Status.Link.ID <= 0 {
+		t.Fatalf("status.link.id = %d, want an allocated id", gw.Status.Link.ID)
+	}
+	want := strconv.FormatInt(int64(gw.Status.Link.ID), 10)
+	if got := gw.Annotations[linkIDAnnotation]; got != want {
+		t.Errorf("annotation = %q, want %q (status.link.id)", got, want)
+	}
+}
+
+// TestEnsureLinkIDClusterConsumesNone pins that a Cluster Gateway allocates no id, so
+// the dense range is not spent on Gateways whose data path derives nothing from it.
+func TestEnsureLinkIDClusterConsumesNone(t *testing.T) {
+	ctx := context.Background()
+	te, r, _, key, _ := reconcileFixture(ctx, t)
+	drainReconcile(ctx, t, r, key)
+
+	var got wgnetv1alpha1.Gateway
+	mustGet(ctx, t, te.client, key, &got)
+	if got.Status.Link.ID != 0 {
+		t.Errorf("status.link.id = %d, want 0 in Cluster mode", got.Status.Link.ID)
+	}
+}
+
+// TestEnsureLinkIDExhausted pins the exhaustion path: ReconcileFailed and a regular-interval
+// requeue, rather than an error backoff or reusing an id another link is programming under.
+func TestEnsureLinkIDExhausted(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	mustCreate(ctx, t, cl, namespaceWithLabels("lid-full", nil))
+	for id := int32(1); id <= link.MaxLinkID; id++ {
+		holder := newGateway(fmt.Sprintf("holder-%d", id), "lid-full", nil, nil)
+		holder.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+		mustCreate(ctx, t, cl, holder)
+		holder.Status.Link.ID = id
+		if err := cl.Status().Update(ctx, holder); err != nil {
+			t.Fatalf("seed holder link id %d: %v", id, err)
+		}
+	}
+
+	r, key := localGatewayFixture(ctx, t, te, "lid-exhausted")
+	// The shared fixture requeues immediately; a real interval makes the reported
+	// (non-error) requeue observable.
+	r.Config.RequeueInterval = 30 * time.Second
+	req := ctrl.Request{NamespacedName: key}
+
+	// The finalizer-add pass succeeds; the pass that reaches allocation reports the
+	// exhaustion and requeues on the regular cadence instead of erroring.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("reconcile (finalizer pass): %v", err)
+	}
+	res, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("reconcile = %v, want nil error on exhaustion", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("RequeueAfter = %v, want the regular requeue interval", res.RequeueAfter)
+	}
+
+	var got wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &got)
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if cond == nil {
+		t.Fatal("Ready condition absent")
+	}
+	if cond.Status != metav1.ConditionFalse || cond.Reason != reasonReconcileFailed {
+		t.Errorf("Ready = %s/%s, want False/%s", cond.Status, cond.Reason, reasonReconcileFailed)
+	}
+	if !strings.Contains(cond.Message, "no free link id") {
+		t.Errorf("Ready message = %q, want it to name the exhaustion", cond.Message)
+	}
+	if got.Status.Link.ID != 0 {
+		t.Errorf("status.link.id = %d, want 0 when allocation failed", got.Status.Link.ID)
+	}
+}
+
+// TestReconcileLocalAppliesDaemonSetNotDeployment pins the Local-mode workload swap through the
+// operator's own RBAC, including the cluster-scoped grant that must be reaped explicitly.
+func TestReconcileLocalAppliesDaemonSetNotDeployment(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	r, key := localGatewayFixture(ctx, t, te, "local-ds")
+	drainReconcile(ctx, t, r, key)
+
+	var gw wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &gw)
+
+	linkKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
+	if err := cl.Get(ctx, linkKey, &appsv1.DaemonSet{}); err != nil {
+		t.Fatalf("get link daemonset %s: %v", linkKey, err)
+	}
+	for _, absent := range []struct {
+		kind string
+		obj  client.Object
+	}{
+		{"deployment", &appsv1.Deployment{}},
+		{"networkpolicy", &networkingv1.NetworkPolicy{}},
+		{"poddisruptionbudget", &policyv1.PodDisruptionBudget{}},
+	} {
+		if err := cl.Get(ctx, linkKey, absent.obj); !apierrors.IsNotFound(err) {
+			t.Errorf("get link %s: err = %v, want NotFound in Local mode", absent.kind, err)
+		}
+	}
+
+	crbKey := client.ObjectKey{Name: linkClusterRoleBindingName(&gw)}
+	var crb rbacv1.ClusterRoleBinding
+	if err := cl.Get(ctx, crbKey, &crb); err != nil {
+		t.Fatalf("get link clusterrolebinding %s: %v", crbKey, err)
+	}
+	if crb.RoleRef.Name != linkEndpointSliceClusterRole {
+		t.Errorf("roleRef = %q, want %q", crb.RoleRef.Name, linkEndpointSliceClusterRole)
+	}
+
+	if err := cl.Delete(ctx, &gw); err != nil {
+		t.Fatalf("delete gateway: %v", err)
+	}
+	drainReconcile(ctx, t, r, key)
+
+	if err := cl.Get(ctx, crbKey, &rbacv1.ClusterRoleBinding{}); !apierrors.IsNotFound(err) {
+		t.Errorf("get link clusterrolebinding after delete: err = %v, want NotFound", err)
+	}
+}
+
+// TestLinkStatusActiveNode pins that status.link.activeNode follows the Lease holder pod's node
+// and clears once the holder is gone, so kubectl names the node carrying traffic.
+func TestLinkStatusActiveNode(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	cl := te.client
+
+	mustCreate(ctx, t, cl, namespaceWithLabels("active-node", nil))
+	mustCreate(ctx, t, cl, portedClusterIPService("active-node", "web", 443, corev1.ProtocolTCP))
+
+	gw := newGateway("gw", "active-node", []wgnetv1alpha1.Forward{
+		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+	}, nil)
+	mustCreate(ctx, t, cl, gw)
+	key := client.ObjectKeyFromObject(gw)
+
+	gen, _ := countingKeyGen()
+	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
+
+	drainReconcile(ctx, t, r, key)
+	setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.50", "sa@example.iam.gserviceaccount.com", "")
+	setLinkLeaseActive(ctx, t, cl, key, "gw-link-0", true, "node-a")
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile with a holder on node-a: %v", err)
+	}
+	var got wgnetv1alpha1.Gateway
+	mustGet(ctx, t, cl, key, &got)
+	if got.Status.Link.ActiveNode != "node-a" {
+		t.Errorf("status.link.activeNode = %q, want node-a", got.Status.Link.ActiveNode)
+	}
+
+	holderKey := client.ObjectKey{Namespace: "active-node", Name: "gw-link-0"}
+	// envtest runs no kubelet, so a graceful pod delete would hang in Terminating
+	// forever; force it so the holder is genuinely gone.
+	holder := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: holderKey.Namespace, Name: holderKey.Name}}
+	if err := cl.Delete(ctx, holder, client.GracePeriodSeconds(0)); err != nil {
+		t.Fatalf("delete holder pod: %v", err)
+	}
+	eventually(ctx, t, "holder pod gone", func() bool {
+		return apierrors.IsNotFound(cl.Get(ctx, holderKey, &corev1.Pod{}))
+	})
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile after the holder disappeared: %v", err)
+	}
+	mustGet(ctx, t, cl, key, &got)
+	if got.Status.Link.ActiveNode != "" {
+		t.Errorf("status.link.activeNode = %q, want it cleared once the holder is gone", got.Status.Link.ActiveNode)
+	}
+}
+
+// TestEnsureSecretsWritesThePairWhole verifies either missing Secret rewrites both.
+func TestEnsureSecretsWritesThePairWhole(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+
+	stalePriv, stalePub := testMemberKeypair(t)
+	tests := []struct {
+		name string
+		// present is the half already in the namespace when the pass runs, holding key
+		// material the other half never saw.
+		present func(gw *wgnetv1alpha1.Gateway) *corev1.Secret
+	}{
+		{
+			name: "bundle present, link secret missing",
+			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
+				return buildBundleSecret(gw, stalePriv, stalePub)
+			},
+		},
+		{
+			name: "link secret present, bundle missing",
+			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
+				return buildLinkSecret(gw, stalePriv, stalePub)
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("half-written-pair-%d", i)
+			mustCreate(ctx, t, te.client, namespaceWithLabels(ns, nil))
+			gw := newGateway(ns, ns, nil, nil)
+			mustCreate(ctx, t, te.client, gw)
+			mustGet(ctx, t, te.client, client.ObjectKeyFromObject(gw), gw)
+			mustCreate(ctx, t, te.client, tt.present(gw))
+
+			r := &GatewayReconciler{Client: te.client, APIReader: te.client, Scheme: te.scheme,
+				Config: reconcileConfig(), Recorder: &fakeEventRecorder{}}
+			if err := r.ensureSecrets(ctx, gw); err != nil {
+				t.Fatalf("ensureSecrets: %v", err)
+			}
+
+			var bundle, linkSecret corev1.Secret
+			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &bundle)
+			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: linkSecretName(gw)}, &linkSecret)
+
+			if got := slices.Sorted(maps.Keys(bundle.Data)); !slices.Equal(got, []string{wg.BundleKey}) {
+				t.Fatalf("bundle Secret data keys = %v, want exactly %v", got, []string{wg.BundleKey})
+			}
+			wantLinkKeys := []string{wg.LinkPeerPublicKey, wg.LinkPrivateKey}
+			slices.Sort(wantLinkKeys)
+			if got := slices.Sorted(maps.Keys(linkSecret.Data)); !slices.Equal(got, wantLinkKeys) {
+				t.Fatalf("link Secret data keys = %v, want exactly %v", got, wantLinkKeys)
+			}
+
+			gatewayPriv, rest, _ := strings.Cut(string(bundle.Data[wg.BundleKey]), "\n")
+			linkPub, _, _ := strings.Cut(rest, "\n")
+			linkPriv := string(linkSecret.Data[wg.LinkPrivateKey])
+			gatewayPub := string(linkSecret.Data[wg.LinkPeerPublicKey])
+
+			if got := publicKeyOf(t, gatewayPriv); got != gatewayPub {
+				t.Errorf("public key of the bundle's private key = %q, want the link Secret's peer public key %q", got, gatewayPub)
+			}
+			if got := publicKeyOf(t, linkPriv); got != linkPub {
+				t.Errorf("public key of the link Secret's private key = %q, want the bundle's peer public key %q", got, linkPub)
+			}
+		})
+	}
+}
+
+// publicKeyOf derives a WireGuard public key from its private key, the relation each key
+// Secret's peer public key must satisfy against the other Secret's private key.
+func publicKeyOf(t *testing.T, privateKey string) string {
+	t.Helper()
+	key, err := wgtypes.ParseKey(privateKey)
+	if err != nil {
+		t.Fatalf("parse private key %q: %v", privateKey, err)
+	}
+	return key.PublicKey().String()
 }

@@ -1,27 +1,30 @@
 package controller
 
 import (
-	"crypto/sha256"
-	"encoding/base32"
-	"encoding/hex"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	gcp "github.com/greg2010/wireguard-gateway-operator/internal/crossplane/gcp"
 	"github.com/greg2010/wireguard-gateway-operator/internal/gcpmembers"
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
@@ -29,94 +32,79 @@ import (
 )
 
 const (
-	// gcpIDPrefix supplies the leading letter GCP requires on hash-derived
-	// service-account and secret IDs and namespaces them apart from other tenants.
-	gcpIDPrefix = "gw-"
-	// gcpIDMaxLen is GCP's service-account-ID length cap; secret IDs share the
-	// derived value so both fit this bound.
-	gcpIDMaxLen = 30
-
 	// linkConfigKey is the data key under which the link Deployment's RuntimeConfig
 	// JSON is stored in its ConfigMap and mounted into the container.
 	linkConfigKey = "config.json"
-
 	// componentLink labels and names the in-cluster link objects.
 	componentLink = "link"
-
-	// xgatewayGCPAPIVersion and xgatewayGCPKind identify the Crossplane composite the
-	// operator builds; it is unstructured because the typed view models only spec/status.
-	xgatewayGCPAPIVersion = "infra.wgnet.dev/v1alpha1"
-	xgatewayGCPKind       = "XGatewayGCP"
-
-	// xgatewayNetworkKind is the singleton composite that provisions the shared VPC. It
-	// shares xgatewayGCPAPIVersion: both composites live in the same group/version.
-	xgatewayNetworkKind = "XGatewayNetwork"
-
-	// providerLabelKey is the matchLabels key under spec.crossplane.compositionSelector
-	// pinning the provider-specific Composition, so two providers can coexist.
-	providerLabelKey = "provider"
-
-	// dnsEndpointAPIVersion and dnsEndpointKind identify the published external-dns
-	// DNSEndpoint; unstructured because its CRD is an optional install prerequisite.
-	dnsEndpointAPIVersion = "externaldns.k8s.io/v1alpha1"
-	dnsEndpointKind       = "DNSEndpoint"
-	// cloudflareProxiedAnnotation keeps published records DNS-only: gateway
-	// traffic is raw WireGuard/TCP and must never sit behind a proxy.
-	cloudflareProxiedAnnotation = "external-dns.alpha.kubernetes.io/cloudflare-proxied"
-
 	// linkEndpointSliceClusterRole is the chart-shipped ClusterRole granting EndpointSlice
 	// reads; a fixed cluster-scoped name, the resourceName of the operator's bind grant.
 	linkEndpointSliceClusterRole = "gateway-link-endpointslice-reader"
-
 	// linkClusterRoleBindingPrefix leads every per-Gateway ClusterRoleBinding name so
 	// the objects are identifiable in a cluster-wide listing.
 	linkClusterRoleBindingPrefix = "gateway-link-"
 	// linkClusterRoleBindingMaxLen caps the hashed ClusterRoleBinding name, leaving 27
 	// base32 digest characters, far more than collision resistance needs here.
 	linkClusterRoleBindingMaxLen = len(linkClusterRoleBindingPrefix) + 27
-
 	// ownerNamespaceLabel and ownerNameLabel name the owning Gateway on a cluster-scoped
 	// child, which cannot carry an ownerReference to a namespaced owner.
 	ownerNamespaceLabel = "wgnet.dev/gateway-namespace"
 	ownerNameLabel      = "wgnet.dev/gateway-name"
-
-	// clusterHealthPort is the Cluster-mode readiness port; it must match the
-	// GATEWAY_HEALTH_ADDR default in internal/link/config.go. Local mode binds loopback.
-	clusterHealthPort = 8080
-
-	// bootstrapScriptRevision is bumped whenever files/gcp/keyfetch.sh's contract changes,
-	// folding that change into templateRevision's hash.
-	bootstrapScriptRevision = "v1"
+	// clusterHealthPort is the Cluster-mode default readiness port when spec.link.healthPort
+	// is unset; it must match link.Config's GATEWAY_HEALTH_ADDR default. Local binds loopback.
+	clusterHealthPort = 27000
 )
 
-// templateRevision hashes only inputs that affect the instance template.
-func templateRevision(gw *wgnetv1alpha1.Gateway, cfg Config, secretID string) string {
-	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%t\x00%t\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00%s\x00%s",
-		bootstrapScriptRevision, effectiveGCPImage(gw), gw.Spec.GCP.MachineType,
-		effectiveGCPDiskSizeGB(gw), effectiveGCPSpot(gw), cfg.EnableOSLogin, cfg.UserData,
-		cfg.SharedNetworkName, effectiveWireguardPort(gw), effectiveWGMTU(gw),
-		effectiveWGLinkAddress(gw), strings.ToLower(string(effectiveTrafficPolicy(gw))),
-		gw.Spec.GCP.ProjectID, secretID)
-	return hex.EncodeToString(h.Sum(nil))[:16]
+const (
+	reasonReservedHealthPort = "ReservedHealthPort"
+)
+
+// linkIDAnnotation records the allocated Local link id on the Gateway itself, so an id
+// outlives a restore that keeps metadata and spec but drops status.
+const linkIDAnnotation = "wgnet.dev/link-id"
+
+// reservedHealthPortWarnKeyPrefix distinguishes warnReservedHealthPort's suppression entries
+// from the other warn helpers' in the shared unresolvedWarned map.
+const reservedHealthPortWarnKeyPrefix = "health-port/"
+
+// invalidTunnelWarnKeyPrefix distinguishes warnInvalidTunnelAddresses' suppression entries
+// from warnUnresolvedBackendPorts' in the shared unresolvedWarned map.
+const invalidTunnelWarnKeyPrefix = "tunnel/"
+
+// capacityWarnKeyPrefix distinguishes warnInsufficientTunnelAddresses' suppression entries
+// from the other warn helpers' in the shared unresolvedWarned map.
+const capacityWarnKeyPrefix = "capacity/"
+
+// errNoFreeLinkID reports that every id in 1..link.MaxLinkID is held. Only deleting a
+// Local Gateway frees one, so it is surfaced on Ready instead of retried with backoff.
+var errNoFreeLinkID = errors.New("no free link id")
+
+// linkStatus is what the operator observes about a Gateway's link from the Lease and
+// the pod holding it.
+type linkStatus struct {
+	// Active requires both holder PodReady and its tunnel-ready annotation; idle standbys
+	// are PodReady too, so readiness must use the Lease holder rather than availability.
+	Active bool
+	// PodReady is checked before the tunnel annotation; this window needs a faster requeue.
+	// The holder's first Lease write reports the tunnel after the probe latches ready.
+	PodReady bool
+	// Node is the holder pod's node name, empty when there is no readable holder.
+	Node string
+	// FaultReason and FaultMessage carry the holder's link-fault annotations.
+	FaultReason  string
+	FaultMessage string
 }
 
-// hashedName derives prefix + lowercase base32 of SHA-256 over "<namespace>/<name>",
-// truncated to maxLen. The input is namespace-qualified so equal names do not collide.
-func hashedName(prefix, namespace, name string, maxLen int) string {
-	sum := sha256.Sum256([]byte(namespace + "/" + name))
-	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:])
-	id := prefix + strings.ToLower(enc)
-	if len(id) > maxLen {
-		id = id[:maxLen]
+// knownLinkFaults are the fault reasons a link may publish. An unrecognised value is
+// ignored rather than copied into the API-validated Ready condition reason.
+var knownLinkFaults = func() map[string]bool {
+	faults := link.KnownFaults()
+	m := make(map[string]bool, len(faults))
+	for _, reason := range faults {
+		m[reason] = true
 	}
-	return id
-}
-
-// gcpID derives a project-unique, GCP-valid service-account/secret ID.
-func gcpID(namespace, name string) string {
-	return hashedName(gcpIDPrefix, namespace, name, gcpIDMaxLen)
-}
+	return m
+}()
 
 // bundleSecretName and linkSecretName name the two WireGuard key Secrets a Gateway
 // owns, per-Gateway so two Gateways in a namespace do not share key material.
@@ -133,221 +121,19 @@ func linkClusterRoleBindingName(gw *wgnetv1alpha1.Gateway) string {
 	return hashedName(linkClusterRoleBindingPrefix, gw.Namespace, gw.Name, linkClusterRoleBindingMaxLen)
 }
 
-// rosterOf is result's roster, empty when no pass has produced one yet.
-func rosterOf(result *gcpmembers.Result) []gcpmembers.RosterEntry {
-	if result == nil {
-		return nil
-	}
-	return result.Roster
-}
-
-// commonLabels are the identifying labels stamped on every child object.
-func commonLabels(gw *wgnetv1alpha1.Gateway, component string) map[string]string {
+// linkSelectorLabels are the pod-template and selector labels for the link
+// Deployment; a stable subset of the common labels.
+func linkSelectorLabels(gw *wgnetv1alpha1.Gateway) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "wireguard-gateway-operator",
-		"app.kubernetes.io/instance":   gw.Name,
-		"app.kubernetes.io/component":  component,
-		"app.kubernetes.io/managed-by": "gateway-operator",
+		"app.kubernetes.io/name":      "wireguard-gateway-operator",
+		"app.kubernetes.io/instance":  gw.Name,
+		"app.kubernetes.io/component": componentLink,
 	}
 }
 
-// xgatewayMember aliases the generated composite's roster entry, so both branches render the
-// roster through one helper.
-type xgatewayMember = struct {
-	CloudSecretIamMemberName string `json:"cloudSecretIamMemberName"`
-	CloudSecretName          string `json:"cloudSecretName"`
-	CloudSecretVersionName   string `json:"cloudSecretVersionName"`
-	KubernetesSecretName     string `json:"kubernetesSecretName"`
-	Name                     string `json:"name"`
-	Slot                     int    `json:"slot"`
-	TunnelAddress            string `json:"tunnelAddress"`
-}
-
-func rosterMembers(roster []gcpmembers.RosterEntry) []xgatewayMember {
-	members := make([]xgatewayMember, 0, len(roster))
-	for _, e := range roster {
-		members = append(members, xgatewayMember{
-			CloudSecretIamMemberName: e.CloudSecretIAMMemberName,
-			CloudSecretName:          e.CloudSecretName,
-			CloudSecretVersionName:   e.CloudSecretVersionName,
-			KubernetesSecretName:     e.KubernetesSecretName,
-			Name:                     e.Name,
-			Slot:                     e.Slot,
-			TunnelAddress:            e.TunnelAddress,
-		})
-	}
-	return members
-}
-
-// buildXGatewayGCP builds the composite for either gateway provisioning branch.
-func buildXGatewayGCP(gw *wgnetv1alpha1.Gateway, cfg Config, forwards []wgnetv1alpha1.Forward, loadBalanced bool, result *gcpmembers.Result, healthPort int) (*unstructured.Unstructured, error) {
-	id := gcpID(gw.Namespace, gw.Name)
-	secretID, err := gcpmembers.NameBase(string(gw.UID), gw.Spec.GCP.ProjectID)
-	if err != nil {
-		return nil, fmt.Errorf("derive bundle secret id: %w", err)
-	}
-	image := effectiveGCPImage(gw)
-	diskSizeGB := int(effectiveGCPDiskSizeGB(gw))
-	addr := effectiveGCPAddress(gw)
-	addrType := string(addr.Type)
-	xgAddress := &struct {
-		External *struct {
-			Ip   *string `json:"ip,omitempty"` //nolint:revive // name fixed by the generated composite schema
-			Name *string `json:"name,omitempty"`
-		} `json:"external,omitempty"`
-		Type *string `json:"type,omitempty"`
-	}{Type: &addrType}
-	if addr.External != nil {
-		extName := addr.External.Name
-		extIP := addr.External.IP
-		ext := &struct {
-			Ip   *string `json:"ip,omitempty"` //nolint:revive // name fixed by the generated composite schema
-			Name *string `json:"name,omitempty"`
-		}{}
-		if extName != "" {
-			ext.Name = &extName
-		}
-		if extIP != "" {
-			ext.Ip = &extIP
-		}
-		xgAddress.External = ext
-	}
-	spot := effectiveGCPSpot(gw)
-	projectID := gw.Spec.GCP.ProjectID
-	wgGatewayAddress := effectiveWGGatewayAddress(gw)
-	wgLinkAddress := effectiveWGLinkAddress(gw)
-	wgSubnet := effectiveWGSubnet(gw)
-
-	spec := gcp.XGatewayGCPSpec{
-		Address:            xgAddress,
-		Region:             gw.Spec.GCP.Region,
-		Zone:               gw.Spec.GCP.Zone,
-		MachineType:        gw.Spec.GCP.MachineType,
-		SharedNetworkName:  cfg.SharedNetworkName,
-		ProviderConfigName: &cfg.ProviderConfigName,
-		Image:              &image,
-		DiskSizeGB:         &diskSizeGB,
-		WgListenPort:       int(effectiveWireguardPort(gw)),
-		WgMTU:              int(effectiveWGMTU(gw)),
-		WgGatewayAddress:   &wgGatewayAddress,
-		WgLinkAddress:      &wgLinkAddress,
-		WgSubnet:           &wgSubnet,
-		ProjectID:          &projectID,
-		TrafficPolicy:      new(strings.ToLower(string(effectiveTrafficPolicy(gw)))),
-		Spot:               &spot,
-		EnableOsLogin:      new(cfg.EnableOSLogin),
-		ServiceAccountId:   &id,
-		SecretId:           secretID,
-	}
-
-	if cfg.UserData != "" {
-		spec.UserData = &cfg.UserData
-	}
-
-	if loadBalanced {
-		enabled := true
-		sessionAffinity := gw.Spec.GCP.LoadBalancer.SessionAffinity
-		targetSize := int(gw.Spec.GCP.Replicas)
-		if result != nil {
-			targetSize = int(result.TargetSize)
-		}
-		zones := effectiveZones(gw)
-		revision := templateRevision(gw, cfg, secretID)
-		hp := healthPort
-
-		spec.LoadBalanced = &enabled
-		spec.SessionAffinity = &sessionAffinity
-		spec.TargetSize = &targetSize
-		spec.Zones = &zones
-		spec.TemplateRevision = &revision
-		spec.HealthPort = &hp
-
-		members := rosterMembers(rosterOf(result))
-		spec.Members = &members
-	} else if roster := rosterOf(result); len(roster) > 0 {
-		members := rosterMembers(roster)
-		spec.Members = &members
-	}
-
-	if len(forwards) > 0 {
-		ports := make([]struct {
-			Port     int    `json:"port"`
-			Protocol string `json:"protocol"`
-		}, 0, len(forwards))
-		for _, f := range forwards {
-			ports = append(ports, struct {
-				Port     int    `json:"port"`
-				Protocol string `json:"protocol"`
-			}{Port: int(f.Port), Protocol: strings.ToLower(string(f.Protocol))})
-		}
-		spec.AllowedPorts = &ports
-	}
-
-	specMap, err := toUnstructuredMap(&spec)
-	if err != nil {
-		return nil, fmt.Errorf("encode xgatewaygcp spec: %w", err)
-	}
-
-	specMap["crossplane"] = map[string]any{
-		"compositionSelector": map[string]any{
-			"matchLabels": map[string]any{providerLabelKey: string(gatewayProvider(gw))},
-		},
-	}
-
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": xgatewayGCPAPIVersion,
-		"kind":       xgatewayGCPKind,
-		"spec":       specMap,
-	}}
-	u.SetName(gw.Name)
-	u.SetNamespace(gw.Namespace)
-	u.SetLabels(commonLabels(gw, "gateway"))
-	return u, nil
-}
-
-// buildXGatewayNetwork builds the singleton shared-VPC composite in cfg.PodNamespace.
-// It carries no ownerReference: its lifecycle is refcount-managed across Gateways.
-func buildXGatewayNetwork(cfg Config) *unstructured.Unstructured {
-	spec := map[string]any{
-		"name":               cfg.SharedNetworkName,
-		"providerConfigName": cfg.ProviderConfigName,
-		"crossplane": map[string]any{
-			"compositionSelector": map[string]any{
-				"matchLabels": map[string]any{providerLabelKey: string(wgnetv1alpha1.ProviderGCP)},
-			},
-		},
-	}
-
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": xgatewayGCPAPIVersion,
-		"kind":       xgatewayNetworkKind,
-		"spec":       spec,
-	}}
-	u.SetName(cfg.SharedNetworkName)
-	u.SetNamespace(cfg.PodNamespace)
-	u.SetLabels(map[string]string{
-		"app.kubernetes.io/name":       "wireguard-gateway-operator",
-		"app.kubernetes.io/component":  "shared-network",
-		"app.kubernetes.io/managed-by": "gateway-operator",
-	})
-	return u
-}
-
-// gatewayProvider defaults an empty provider to gcp, guarding in-memory Gateways
-// that bypassed CRD defaulting.
-func gatewayProvider(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.CloudProvider {
-	if gw.Spec.Provider == "" {
-		return wgnetv1alpha1.ProviderGCP
-	}
-	return gw.Spec.Provider
-}
-
-// The default consts mirror the CRD defaults; the effective* accessors apply them only
-// to in-memory Gateways that bypassed CRD defaulting.
 const (
-	gcpDefaultImage            = "projects/kinvolk-public/global/images/family/flatcar-stable"
-	gcpDefaultDiskSizeGB int32 = 20
-
+	// The default consts mirror the CRD defaults; the effective* accessors apply them only
+	// to in-memory Gateways that bypassed CRD defaulting.
 	wgDefaultListenPort        int32 = 51820
 	wgDefaultSubnet                  = "10.99.0.0/29"
 	wgDefaultGatewayAddress          = "10.99.0.1"
@@ -355,40 +141,8 @@ const (
 	wgDefaultKeepalive         int32 = 25
 	wgDefaultMTU               int32 = 1380
 	wgDefaultReconcileInterval       = "10s"
-
-	linkDefaultReplicas int32 = 1
+	linkDefaultReplicas        int32 = 1
 )
-
-// effectiveGCPImage returns the gateway VM boot image, defaulting an unset value.
-func effectiveGCPImage(gw *wgnetv1alpha1.Gateway) string {
-	if gw.Spec.GCP.Image == "" {
-		return gcpDefaultImage
-	}
-	return gw.Spec.GCP.Image
-}
-
-// effectiveGCPDiskSizeGB returns the gateway VM boot disk size, defaulting an
-// unset value.
-func effectiveGCPDiskSizeGB(gw *wgnetv1alpha1.Gateway) int32 {
-	if gw.Spec.GCP.DiskSizeGB == 0 {
-		return gcpDefaultDiskSizeGB
-	}
-	return gw.Spec.GCP.DiskSizeGB
-}
-
-// effectiveGCPAddress returns the address block, defaulting an unset Type to Reserved
-// for in-memory Gateways that bypassed CRD defaulting.
-func effectiveGCPAddress(gw *wgnetv1alpha1.Gateway) wgnetv1alpha1.GatewayGCPAddressSpec {
-	addr := gw.Spec.GCP.Address
-	if addr.Type == "" {
-		addr.Type = wgnetv1alpha1.GatewayGCPAddressReserved
-	}
-	return addr
-}
-
-func effectiveGCPSpot(gw *wgnetv1alpha1.Gateway) bool {
-	return gw.Spec.GCP.Spot
-}
 
 // effectiveWireguardPort returns the Gateway's WireGuard listen port, defaulting an
 // unset value to wgDefaultListenPort for in-memory Gateways that bypassed CRD defaulting.
@@ -483,36 +237,16 @@ func linkIdentityOf(gw *wgnetv1alpha1.Gateway) *link.GatewayIdentity {
 	return &ident
 }
 
-// effectiveHealthPort returns the local identity port or the cluster default.
+// effectiveHealthPort returns the local identity port, spec.link.healthPort, or the
+// cluster default, in that order.
 func effectiveHealthPort(gw *wgnetv1alpha1.Gateway) int {
 	if ident := linkIdentityOf(gw); ident != nil {
 		return ident.HealthPort
 	}
+	if gw.Spec.Link.HealthPort > 0 {
+		return int(gw.Spec.Link.HealthPort)
+	}
 	return clusterHealthPort
-}
-
-// XGatewayGCPGVK is the composite's GroupVersionKind, exported so the manager can
-// register an unstructured Owns watch on it.
-var XGatewayGCPGVK = schema.GroupVersionKind{Group: "infra.wgnet.dev", Version: "v1alpha1", Kind: "XGatewayGCP"}
-
-// newXGatewayGCP returns an empty unstructured XGatewayGCP with its GVK set, for Get,
-// CreateOrUpdate, and the Owns watch.
-func newXGatewayGCP() *unstructured.Unstructured {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(XGatewayGCPGVK)
-	return u
-}
-
-// XGatewayNetworkGVK is the shared-VPC composite's GroupVersionKind, exported so
-// the manager can register an unstructured watch on it.
-var XGatewayNetworkGVK = schema.GroupVersionKind{Group: "infra.wgnet.dev", Version: "v1alpha1", Kind: "XGatewayNetwork"}
-
-// newXGatewayNetwork returns an empty unstructured XGatewayNetwork with its GVK
-// set, for Get, CreateOrUpdate, and the watch.
-func newXGatewayNetwork() *unstructured.Unstructured {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(XGatewayNetworkGVK)
-	return u
 }
 
 // buildBundleSecret builds the Secret read by the XGatewayGCP's SecretVersion; its
@@ -573,8 +307,10 @@ func fleetLinkPeers(gw *wgnetv1alpha1.Gateway, fleetPeers []gcpmembers.Peer) []l
 	return peers
 }
 
-// buildLinkConfigMap renders the link configuration for either gateway branch.
-func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int) (*corev1.ConfigMap, error) {
+// buildLinkConfigMap renders the link configuration for either gateway branch. responders is
+// Local mode only; responderTarget (the responder Service ClusterIP) is Cluster mode only.
+func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int, responders map[string]string, responderTarget string) (*corev1.ConfigMap, error) {
+	responderPort := int(effectiveResponderPort(gw))
 	wgSubnet := effectiveWGSubnet(gw)
 	suffix := wgSubnet
 	if i := strings.LastIndex(suffix, "/"); i >= 0 {
@@ -633,6 +369,7 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []fo
 		TrafficPolicy: string(effectiveTrafficPolicy(gw)),
 		Identity:      ident,
 		HealthPort:    healthPort,
+		ResponderPort: responderPort,
 		WireGuard: link.WireGuard{
 			Address:    fmt.Sprintf("%s/%s", effectiveWGLinkAddress(gw), suffix),
 			ListenPort: 0,
@@ -643,6 +380,9 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []fo
 	}
 	if local {
 		rc.PodSelector = linkSelectorLabels(gw)
+		rc.Responders = responders
+	} else {
+		rc.ResponderTarget = responderTarget
 	}
 
 	data, err := json.Marshal(rc)
@@ -660,8 +400,8 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []fo
 	}, nil
 }
 
-// buildLinkNetworkPolicy allows egress to cluster DNS, the apiserver, the WireGuard
-// underlay and each forward's backend ports; nftables default-DROP contains the rest.
+// buildLinkNetworkPolicy permits egress to cluster DNS, the apiserver, the WireGuard underlay,
+// the responder Service (health DNAT target) and each forward's backend; nftables DROPs the rest.
 func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend) *networkingv1.NetworkPolicy {
 	dnsPort53UDP := corev1.ProtocolUDP
 	dnsPort53TCP := corev1.ProtocolTCP
@@ -702,6 +442,14 @@ func buildLinkNetworkPolicy(gw *wgnetv1alpha1.Gateway, backends []forwardBackend
 				{Protocol: &apiserverProto, Port: &port443},
 				{Protocol: &apiserverProto, Port: &port6443},
 			},
+		},
+		{
+			// Peer is 0.0.0.0/0, like a forward's backend rule: DNAT rewrites the probe to the
+			// responder Service ClusterIP, which no pod selector matches; a pod-selector peer would deny it.
+			To: []networkingv1.NetworkPolicyPeer{{
+				IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"},
+			}},
+			Ports: responderEgressPorts(gw),
 		},
 	}
 
@@ -745,49 +493,6 @@ func backendEgressPorts(b forwardBackend) []networkingv1.NetworkPolicyPort {
 	return ports
 }
 
-// corev1ProtocolOf maps a Gateway L4 protocol to its corev1 equivalent, falling back to
-// TCP rather than the empty protocol the API would reject.
-func corev1ProtocolOf(p wgnetv1alpha1.Protocol) corev1.Protocol {
-	if p == wgnetv1alpha1.ProtocolUDP {
-		return corev1.ProtocolUDP
-	}
-	return corev1.ProtocolTCP
-}
-
-// effectiveForwardNamespace is the namespace a forward's Service lives in: its
-// explicit Namespace, or the Gateway's own namespace when left unset.
-func effectiveForwardNamespace(f wgnetv1alpha1.Forward, gw *wgnetv1alpha1.Gateway) string {
-	if f.Namespace != "" {
-		return f.Namespace
-	}
-	return gw.Namespace
-}
-
-// forwardServiceFQDN is the fully-qualified cluster DNS name of a forward's backend,
-// built here so resolution does not depend on the pod's resolv.conf ndots.
-func forwardServiceFQDN(f wgnetv1alpha1.Forward, gw *wgnetv1alpha1.Gateway) string {
-	return fmt.Sprintf("%s.%s.svc.cluster.local", f.Service, effectiveForwardNamespace(f, gw))
-}
-
-// effectiveServicePort is the forward's TargetPort, or its public Port when unset. It is
-// the Service's published port, not the pod-side port the Service may remap it to.
-func effectiveServicePort(f wgnetv1alpha1.Forward) int32 {
-	if f.TargetPort == 0 {
-		return f.Port
-	}
-	return f.TargetPort
-}
-
-// linkSelectorLabels are the pod-template and selector labels for the link
-// Deployment; a stable subset of the common labels.
-func linkSelectorLabels(gw *wgnetv1alpha1.Gateway) map[string]string {
-	return map[string]string{
-		"app.kubernetes.io/name":      "wireguard-gateway-operator",
-		"app.kubernetes.io/instance":  gw.Name,
-		"app.kubernetes.io/component": componentLink,
-	}
-}
-
 // linkPodSpec builds the pod spec both link workloads share. A nil ident selects Cluster
 // mode (own netns, init container enables ip_forward); non-nil selects host-netns Local.
 func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.GatewayIdentity) corev1.PodSpec {
@@ -806,11 +511,12 @@ func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.GatewayIdent
 		hostProcSysNetVolume = "host-proc-sys-net"
 	)
 
-	healthAddr := ":" + strconv.Itoa(clusterHealthPort)
+	healthPort := effectiveHealthPort(gw)
+	healthAddr := ":" + strconv.Itoa(healthPort)
 	if ident != nil {
-		// Wildcard, not loopback: a load-balanced Local Gateway's health check can arrive
-		// over the tunnel interface, not just from the local node.
-		healthAddr = ":" + strconv.Itoa(ident.HealthPort)
+		// Loopback: the probe reaches a responder pod through the holder's health-port DNAT,
+		// never this listener directly, which the kubelet alone still needs to reach.
+		healthAddr = "127.0.0.1:" + strconv.Itoa(ident.HealthPort)
 	}
 
 	env := []corev1.EnvVar{
@@ -915,7 +621,7 @@ func linkPodSpec(gw *wgnetv1alpha1.Gateway, cfg Config, ident *link.GatewayIdent
 		}
 		ports = []corev1.ContainerPort{{
 			Name:          "health",
-			ContainerPort: clusterHealthPort,
+			ContainerPort: int32(healthPort),
 			Protocol:      corev1.ProtocolTCP,
 		}}
 		probeHandler = corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("health")}
@@ -1116,36 +822,449 @@ func buildLinkPodDisruptionBudget(gw *wgnetv1alpha1.Gateway) *policyv1.PodDisrup
 	}
 }
 
-// buildDNSEndpoint maps each hostname to the gateway address as an A record, returning
-// nil when there are no hostnames or the address is not yet known.
-func buildDNSEndpoint(gw *wgnetv1alpha1.Gateway, address string) *unstructured.Unstructured {
-	if len(gw.Spec.DNSHostnames) == 0 || address == "" {
+// bundleInputs are the values every member's bundle payload carries beside its own key,
+// address and slot: they are uniform across a Gateway.
+func bundleInputs(gw *wgnetv1alpha1.Gateway, linkPublicKey string) gcpmembers.BundleInputs {
+	return gcpmembers.BundleInputs{
+		SubnetPrefix:   subnetPrefix(effectiveWGSubnet(gw)),
+		PeerPublicKey:  linkPublicKey,
+		PeerAllowedIPs: effectiveWGLinkAddress(gw) + "/32",
+	}
+}
+
+// ensureSecrets writes both key Secrets from one pair when either is missing.
+func (r *GatewayReconciler) ensureSecrets(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
+	bundleExists, err := r.objectExists(ctx, gw.Namespace, bundleSecretName(gw), &corev1.Secret{})
+	if err != nil {
+		return err
+	}
+	linkExists, err := r.objectExists(ctx, gw.Namespace, linkSecretName(gw), &corev1.Secret{})
+	if err != nil {
+		return err
+	}
+	if bundleExists && linkExists {
 		return nil
 	}
 
-	endpoints := make([]any, 0, len(gw.Spec.DNSHostnames))
-	for _, host := range gw.Spec.DNSHostnames {
-		endpoints = append(endpoints, map[string]any{
-			"dnsName":    host,
-			"recordType": "A",
-			"targets":    []any{address},
-		})
+	gen := r.GenerateKey
+	if gen == nil {
+		gen = wg.GenerateKeypair
+	}
+	gatewayPriv, gatewayPub, err := gen()
+	if err != nil {
+		return fmt.Errorf("generate gateway keypair: %w", err)
+	}
+	linkPriv, linkPub, err := gen()
+	if err != nil {
+		return fmt.Errorf("generate link keypair: %w", err)
 	}
 
-	u := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": dnsEndpointAPIVersion,
-		"kind":       dnsEndpointKind,
-		"spec":       map[string]any{"endpoints": endpoints},
-	}}
-	u.SetName(gw.Name)
-	u.SetNamespace(gw.Namespace)
-	u.SetLabels(commonLabels(gw, "dns"))
-	u.SetAnnotations(map[string]string{cloudflareProxiedAnnotation: "false"})
-	return u
+	if err := r.apply(ctx, gw, buildBundleSecret(gw, gatewayPriv, linkPub)); err != nil {
+		return fmt.Errorf("write bundle secret: %w", err)
+	}
+	if err := r.apply(ctx, gw, buildLinkSecret(gw, linkPriv, gatewayPub)); err != nil {
+		return fmt.Errorf("write link secret: %w", err)
+	}
+	return nil
 }
 
-// toUnstructuredMap converts via the runtime converter, so integers become int64 rather
-// than the float64 a JSON round-trip yields (which NestedInt64 and the API server reject).
-func toUnstructuredMap(v any) (map[string]any, error) {
-	return runtime.DefaultUnstructuredConverter.ToUnstructured(v)
+// ensureLink applies common link resources and the mode-specific workload. responderTarget is
+// the responder Service ClusterIP, folded into a Cluster Gateway's health DNAT target.
+func (r *GatewayReconciler) ensureLink(ctx context.Context, gw *wgnetv1alpha1.Gateway, address string, backends []forwardBackend, ident *link.GatewayIdentity, gatewayPublicKey string, fleetPeers []link.Peer, healthPort int, responders map[string]string, responderTarget string) error {
+	if err := r.apply(ctx, gw, buildLinkServiceAccount(gw)); err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, buildLinkRole(gw)); err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, buildLinkRoleBinding(gw)); err != nil {
+		return err
+	}
+
+	cm, err := buildLinkConfigMap(gw, address, backends, ident, gatewayPublicKey, fleetPeers, healthPort, responders, responderTarget)
+	if err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, cm); err != nil {
+		return err
+	}
+
+	if ident != nil {
+		if err := r.apply(ctx, nil, buildLinkClusterRoleBinding(gw)); err != nil {
+			return err
+		}
+		return r.apply(ctx, gw, buildLinkDaemonSet(gw, r.Config, ident))
+	}
+
+	if err := r.apply(ctx, gw, buildLinkNetworkPolicy(gw, backends)); err != nil {
+		return err
+	}
+	if err := r.apply(ctx, gw, buildLinkDeployment(gw, r.Config)); err != nil {
+		return err
+	}
+
+	if effectiveLinkReplicas(gw) > 1 {
+		return r.apply(ctx, gw, buildLinkPodDisruptionBudget(gw))
+	}
+	// A scale-down to one replica must not leave a PDB behind to block node drains.
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: linkComponentName(gw), Namespace: gw.Namespace},
+	}
+	return r.deleteIfPresent(ctx, pdb)
+}
+
+// ensureLinkID records the Local link id in status and in linkIDAnnotation, which outlives a
+// restore that drops status. A status id wins: it names node state a restarting link reclaims.
+func (r *GatewayReconciler) ensureLinkID(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
+	if !isLocal(gw) {
+		return nil
+	}
+	if gw.Status.Link.ID > 0 {
+		return r.persistLinkIDAnnotation(ctx, gw, gw.Status.Link.ID)
+	}
+
+	var gateways wgnetv1alpha1.GatewayList
+	if err := r.APIReader.List(ctx, &gateways); err != nil {
+		return fmt.Errorf("list gateways for link id allocation: %w", err)
+	}
+	self := client.ObjectKeyFromObject(gw)
+
+	id, ok := r.adoptableLinkID(ctx, gw, gateways.Items, self)
+	if !ok {
+		if id, ok = lowestFreeLinkID(gateways.Items, self); !ok {
+			return errNoFreeLinkID
+		}
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh wgnetv1alpha1.Gateway
+		// Re-Get uncached: the cache can still hold the copy whose resourceVersion lost
+		// the conflict, so a cached retry would resubmit the same stale object forever.
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
+			return fmt.Errorf("get gateway for link id update: %w", err)
+		}
+		if fresh.Status.Link.ID > 0 {
+			id = fresh.Status.Link.ID
+			return nil
+		}
+		fresh.Status.Link.ID = id
+		if err := r.Status().Update(ctx, &fresh); err != nil {
+			return fmt.Errorf("update gateway link id: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	gw.Status.Link.ID = id
+	return r.persistLinkIDAnnotation(ctx, gw, id)
+}
+
+// adoptableLinkID reports the id gw's annotation claims when well-formed and unheld elsewhere.
+// Rejections are logged: the Gateway then takes an id its node state is not named after.
+func (r *GatewayReconciler) adoptableLinkID(ctx context.Context, gw *wgnetv1alpha1.Gateway, gateways []wgnetv1alpha1.Gateway, self client.ObjectKey) (int32, bool) {
+	raw, present := gw.Annotations[linkIDAnnotation]
+	if !present {
+		return 0, false
+	}
+	logger := log.FromContext(ctx)
+	claimed, err := parseLinkID(raw)
+	if err != nil {
+		logger.Info("ignoring link id annotation, allocating a fresh id",
+			"gateway", self.String(), "annotation", raw, "reason", err.Error())
+		return 0, false
+	}
+	if holder, taken := linkIDHolders(gateways, self)[claimed]; taken {
+		logger.Info("ignoring link id annotation, allocating a fresh id",
+			"gateway", self.String(), "annotation", raw, "reason", "held by "+holder.String())
+		return 0, false
+	}
+	return claimed, true
+}
+
+// persistLinkIDAnnotation records id in gw's linkIDAnnotation, both on the server and on
+// the in-memory copy. It is a no-op when the annotation already matches.
+func (r *GatewayReconciler) persistLinkIDAnnotation(ctx context.Context, gw *wgnetv1alpha1.Gateway, id int32) error {
+	want := strconv.FormatInt(int64(id), 10)
+	if gw.Annotations[linkIDAnnotation] == want {
+		return nil
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh wgnetv1alpha1.Gateway
+		// Re-Get uncached: the cache can still hold the copy whose resourceVersion lost
+		// the conflict, so a cached retry would resubmit the same stale object forever.
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(gw), &fresh); err != nil {
+			return fmt.Errorf("get gateway for link id annotation update: %w", err)
+		}
+		if fresh.Annotations[linkIDAnnotation] == want {
+			return nil
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = make(map[string]string, 1)
+		}
+		fresh.Annotations[linkIDAnnotation] = want
+		if err := r.Update(ctx, &fresh); err != nil {
+			return fmt.Errorf("update gateway link id annotation: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if gw.Annotations == nil {
+		gw.Annotations = make(map[string]string, 1)
+	}
+	gw.Annotations[linkIDAnnotation] = want
+	return nil
+}
+
+// parseLinkID reads an annotated id, rejecting anything outside 1..link.MaxLinkID.
+func parseLinkID(raw string) (int32, error) {
+	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("malformed link id annotation %q", raw)
+	}
+	if parsed < 1 || parsed > link.MaxLinkID {
+		return 0, fmt.Errorf("link id annotation %q out of range 1..%d", raw, link.MaxLinkID)
+	}
+	return int32(parsed), nil
+}
+
+// linkIDHolders maps each held id to its Gateway, skipping self. Status id and annotated id both
+// reserve: reallocating an annotated id would hand two links the same node-global names.
+func linkIDHolders(gateways []wgnetv1alpha1.Gateway, self client.ObjectKey) map[int32]client.ObjectKey {
+	holders := make(map[int32]client.ObjectKey, len(gateways))
+	for i := range gateways {
+		g := &gateways[i]
+		key := client.ObjectKeyFromObject(g)
+		if key == self {
+			continue
+		}
+		if g.Status.Link.ID > 0 {
+			holders[g.Status.Link.ID] = key
+		}
+		if raw, ok := g.Annotations[linkIDAnnotation]; ok {
+			if id, err := parseLinkID(raw); err == nil {
+				holders[id] = key
+			}
+		}
+	}
+	return holders
+}
+
+// lowestFreeLinkID returns the lowest id in 1..link.MaxLinkID held by no Gateway,
+// skipping self. A single active operator serialises the allocation.
+func lowestFreeLinkID(gateways []wgnetv1alpha1.Gateway, self client.ObjectKey) (int32, bool) {
+	taken := linkIDHolders(gateways, self)
+	for id := int32(1); id <= link.MaxLinkID; id++ {
+		if _, ok := taken[id]; !ok {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// deleteLinkLease removes the leader-election Lease the link pods create. It must run
+// only once no link pod is left, or a live elector re-creates it.
+func (r *GatewayReconciler) deleteLinkLease(ctx context.Context, gw *wgnetv1alpha1.Gateway) error {
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gw.Namespace, Name: linkComponentName(gw)},
+	}
+	if err := r.Delete(ctx, lease); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete link lease %s/%s: %w", lease.Namespace, lease.Name, err)
+	}
+	return nil
+}
+
+// readGatewayKeys reads the key material ensureSecrets generated once: the VM's own private
+// key and the link's public key, both from the Gateway's bundle Secret.
+func (r *GatewayReconciler) readGatewayKeys(ctx context.Context, gw *wgnetv1alpha1.Gateway) (gatewayPrivateKey, linkPublicKey string, err error) {
+	var secret corev1.Secret
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: bundleSecretName(gw)}
+	if err := r.Get(ctx, key, &secret); err != nil {
+		return "", "", fmt.Errorf("get bundle secret %s: %w", key, err)
+	}
+	gatewayPrivateKey, rest, _ := strings.Cut(string(secret.Data[wg.BundleKey]), "\n")
+	linkPublicKey, _, _ = strings.Cut(rest, "\n")
+	if gatewayPrivateKey == "" || linkPublicKey == "" {
+		return "", "", fmt.Errorf("bundle secret %s carries no gateway key pair", key)
+	}
+	return gatewayPrivateKey, linkPublicKey, nil
+}
+
+// readLinkPeerPublicKey reads the single-instance peer key from the link Secret.
+func (r *GatewayReconciler) readLinkPeerPublicKey(ctx context.Context, gw *wgnetv1alpha1.Gateway) (string, error) {
+	var secret corev1.Secret
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: linkSecretName(gw)}
+	if err := r.Get(ctx, key, &secret); err != nil {
+		return "", fmt.Errorf("get link secret %s for peer public key: %w", key, err)
+	}
+	return string(secret.Data[wg.LinkPeerPublicKey]), nil
+}
+
+// appliedLinkPeers reads the peer list already applied to the link ConfigMap, nil when there is
+// no ConfigMap yet. It is the last usable pass's membership, which an unusable pass keeps.
+func (r *GatewayReconciler) appliedLinkPeers(ctx context.Context, gw *wgnetv1alpha1.Gateway) ([]link.Peer, error) {
+	var cm corev1.ConfigMap
+	key := client.ObjectKey{Namespace: gw.Namespace, Name: linkComponentName(gw)}
+	if err := r.Get(ctx, key, &cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get link configmap %s: %w", key, err)
+	}
+	var rc link.RuntimeConfig
+	if err := json.Unmarshal([]byte(cm.Data[linkConfigKey]), &rc); err != nil {
+		return nil, fmt.Errorf("decode link runtime config %s: %w", key, err)
+	}
+	return rc.WireGuard.Peers, nil
+}
+
+// rejectReservedHealthPort rejects a Local Gateway's TCP forward colliding with its own health
+// port (27000 + link id, unknown at admission); Cluster's admission CEL rule catches this already.
+func rejectReservedHealthPort(gw *wgnetv1alpha1.Gateway, valid []forwardBackend, invalid []invalidForward) ([]forwardBackend, []invalidForward, []wgnetv1alpha1.Forward) {
+	if !isLocal(gw) {
+		return valid, invalid, nil
+	}
+	healthPort := effectiveHealthPort(gw)
+	var rejected []wgnetv1alpha1.Forward
+	stillValid := make([]forwardBackend, 0, len(valid))
+	for _, b := range valid {
+		if b.Forward.Protocol == wgnetv1alpha1.ProtocolTCP && int(b.Forward.Port) == healthPort {
+			invalid = append(invalid, invalidForward{reasonReservedHealthPort,
+				fmt.Sprintf("forward TCP port %d collides with this gateway's own health port", healthPort)})
+			rejected = append(rejected, b.Forward)
+			continue
+		}
+		stillValid = append(stillValid, b)
+	}
+	return stillValid, invalid, rejected
+}
+
+// partitionTerminatingLinkPods splits link pods into those teardown waits for and those deleted
+// longer ago than their grace period plus linkTeardownSlack. Sorted, so messages stay stable.
+func partitionTerminatingLinkPods(pods []corev1.Pod) (holding, stuck []string) {
+	for i := range pods {
+		pod := &pods[i]
+		deletedAt := pod.DeletionTimestamp
+		grace := int64(corev1.DefaultTerminationGracePeriodSeconds)
+		if pod.Spec.TerminationGracePeriodSeconds != nil {
+			grace = *pod.Spec.TerminationGracePeriodSeconds
+		}
+		if deletedAt.IsZero() || time.Since(deletedAt.Time) <= time.Duration(grace)*time.Second+linkTeardownSlack {
+			holding = append(holding, pod.Name)
+			continue
+		}
+		stuck = append(stuck, pod.Name)
+	}
+	slices.Sort(holding)
+	slices.Sort(stuck)
+	return holding, stuck
+}
+
+// markTerminatingOnLinkPods publishes why the delete is still held, so a Gateway waiting
+// on its link pods names them rather than showing a stale condition from before the delete.
+func (r *GatewayReconciler) markTerminatingOnLinkPods(ctx context.Context, gw *wgnetv1alpha1.Gateway, pods []string) error {
+	if changed := meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{
+		Type:               conditionReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonTerminating,
+		Message:            "waiting for link pods to exit: " + strings.Join(pods, ", "),
+		ObservedGeneration: gw.Generation,
+	}); changed {
+		if err := r.Status().Update(ctx, gw); err != nil {
+			return fmt.Errorf("update gateway status: %w", err)
+		}
+	}
+	return nil
+}
+
+// linkStatusOf reports the Lease holder's readiness, node and fault; a missing holder is a zero
+// value, not an error. It reads the holder, not the expiry, which fail-static leaves stale.
+func (r *GatewayReconciler) linkStatusOf(ctx context.Context, gw *wgnetv1alpha1.Gateway) (linkStatus, error) {
+	var lease coordinationv1.Lease
+	leaseKey := client.ObjectKey{Namespace: gw.Namespace, Name: linkComponentName(gw)}
+	if err := r.APIReader.Get(ctx, leaseKey, &lease); err != nil {
+		if apierrors.IsNotFound(err) {
+			return linkStatus{}, nil
+		}
+		return linkStatus{}, fmt.Errorf("get link lease %s: %w", leaseKey, err)
+	}
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" {
+		return linkStatus{}, nil
+	}
+
+	var ls linkStatus
+	if reason := lease.Annotations[link.LeaseFaultAnnotation]; knownLinkFaults[reason] {
+		ls.FaultReason = reason
+		ls.FaultMessage = truncateFaultMessage(lease.Annotations[link.LeaseFaultMessageAnnotation])
+		if ls.FaultMessage == "" {
+			ls.FaultMessage = fmt.Sprintf("link reported %s", reason)
+		}
+	}
+
+	var holder corev1.Pod
+	holderKey := client.ObjectKey{Namespace: gw.Namespace, Name: *lease.Spec.HolderIdentity}
+	if err := r.APIReader.Get(ctx, holderKey, &holder); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ls, nil
+		}
+		return linkStatus{}, fmt.Errorf("get link lease holder pod %s: %w", holderKey, err)
+	}
+	ls.Node = holder.Spec.NodeName
+	ls.PodReady = podReady(&holder)
+	ls.Active = ls.PodReady && lease.Annotations[link.LeaseTunnelReadyAnnotation] == "true"
+	return ls, nil
+}
+
+// warnReservedHealthPort emits one Warning per forward rejected for taking the link's own health
+// port, while the rejected set is unchanged, mirroring warnUnresolvedBackendPorts.
+func (r *GatewayReconciler) warnReservedHealthPort(gw *wgnetv1alpha1.Gateway, rejected []wgnetv1alpha1.Forward) {
+	if r.Recorder == nil {
+		return
+	}
+	key := reservedHealthPortWarnKeyPrefix + unresolvedWarnKey(gw)
+	if len(rejected) == 0 {
+		r.unresolvedWarned.Delete(key)
+		return
+	}
+	signature := fmt.Sprintf("%v", rejected)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == signature {
+		return
+	}
+	r.unresolvedWarned.Store(key, signature)
+	for _, f := range rejected {
+		r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonReservedHealthPort, actionReconcile,
+			"forward %s port %d to Service %q collides with this gateway's own health port",
+			strings.ToLower(string(f.Protocol)), f.Port, f.Service)
+	}
+}
+
+// warnInvalidTunnelAddresses emits one Warning per distinct invalid-tunnel-address reason,
+// suppressing a repeat while the reason stays unchanged, mirroring warnUnresolvedBackendPorts.
+func (r *GatewayReconciler) warnInvalidTunnelAddresses(gw *wgnetv1alpha1.Gateway, reason string) {
+	if r.Recorder == nil {
+		return
+	}
+	key := invalidTunnelWarnKeyPrefix + unresolvedWarnKey(gw)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == reason {
+		return
+	}
+	r.unresolvedWarned.Store(key, reason)
+	r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonInvalidTunnelAddresses, actionReconcile, "%s", reason)
+}
+
+// warnInsufficientTunnelAddresses emits one Warning while the capacity message is unchanged,
+// mirroring warnInvalidTunnelAddresses.
+func (r *GatewayReconciler) warnInsufficientTunnelAddresses(gw *wgnetv1alpha1.Gateway, message string) {
+	if r.Recorder == nil {
+		return
+	}
+	key := capacityWarnKeyPrefix + unresolvedWarnKey(gw)
+	if prev, ok := r.unresolvedWarned.Load(key); ok && prev == message {
+		return
+	}
+	r.unresolvedWarned.Store(key, message)
+	r.Recorder.Eventf(gw, nil, corev1.EventTypeWarning, reasonInsufficientTunnelAddresses, actionReconcile, "%s", message)
 }

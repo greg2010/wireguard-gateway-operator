@@ -5,10 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"reflect"
-	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,20 +15,19 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/greg2010/wireguard-gateway-operator/internal/link"
 	"github.com/greg2010/wireguard-gateway-operator/internal/wg"
@@ -50,6 +46,7 @@ func reconcileConfig() Config {
 		// Zero requeue keeps the test from depending on wall-clock requeue timing;
 		// the test re-invokes Reconcile explicitly.
 		RequeueInterval: 0,
+		ResponderImage:  "registry.example.com/gateway-responder:test",
 	}
 }
 
@@ -263,50 +260,6 @@ func TestReconcileLifecycle(t *testing.T) {
 			t.Errorf("shared network get after last gateway purge = %v, want NotFound", err)
 		}
 	})
-}
-
-// TestReconcileLinkPodDisruptionBudget asserts the PDB tracks the link replica count: absent at
-// one replica, present above it, removed on scale-back so a stale PDB cannot strand a drain.
-func TestReconcileLinkPodDisruptionBudget(t *testing.T) {
-	ctx := context.Background()
-	te, r, gw, key, _ := reconcileFixture(ctx, t)
-	cl := te.client
-	pdbKey := client.ObjectKey{Namespace: key.Namespace, Name: linkComponentName(gw)}
-
-	// Default single replica: the link provisions but carries no PDB.
-	drainReconcile(ctx, t, r, key)
-	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("pdb get at one replica = %v, want NotFound", err)
-	}
-
-	// Scaling to >1 must create the PDB, owner-ref'd for GC.
-	setLinkReplicas(ctx, t, cl, key, 3)
-	drainReconcile(ctx, t, r, key)
-	var pdb policyv1.PodDisruptionBudget
-	mustGet(ctx, t, cl, pdbKey, &pdb)
-	assertOwnedByGateway(t, &pdb, gw)
-	if pdb.Spec.MinAvailable == nil || pdb.Spec.MinAvailable.IntVal != 1 {
-		t.Errorf("pdb minAvailable = %+v, want 1", pdb.Spec.MinAvailable)
-	}
-
-	// Scaling back to one must delete the PDB so it cannot block a drain.
-	setLinkReplicas(ctx, t, cl, key, 1)
-	drainReconcile(ctx, t, r, key)
-	if err := cl.Get(ctx, pdbKey, &policyv1.PodDisruptionBudget{}); !apierrors.IsNotFound(err) {
-		t.Errorf("pdb get after scaling 3->1 = %v, want NotFound (deleted)", err)
-	}
-}
-
-// setLinkReplicas sets spec.link.replicas on the live Gateway at key via a
-// read-modify-write, so the reconciler reads the updated count.
-func setLinkReplicas(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, replicas int32) {
-	t.Helper()
-	var gw wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &gw)
-	gw.Spec.Link.Replicas = replicas
-	if err := cl.Update(ctx, &gw); err != nil {
-		t.Fatalf("set link replicas to %d: %v", replicas, err)
-	}
 }
 
 // TestReconcileIdempotent asserts a converged Gateway is not rewritten (resourceVersion stays
@@ -649,346 +602,6 @@ func portedClusterIPService(ns, name string, port int32, proto corev1.Protocol) 
 	}
 }
 
-// portedNodePortService builds a NodePort Service publishing port/proto; like ClusterIP it
-// carries a real ClusterIP, so classification must accept it when the port matches.
-func portedNodePortService(ns, name string, port int32, proto corev1.Protocol) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec: corev1.ServiceSpec{
-			Type:  corev1.ServiceTypeNodePort,
-			Ports: []corev1.ServicePort{{Port: port, Protocol: proto}},
-		},
-	}
-}
-
-// externalNameService builds an ExternalName Service, which has no ClusterIP and
-// must be rejected by forward classification.
-func externalNameService(ns, name string) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec: corev1.ServiceSpec{
-			Type:         corev1.ServiceTypeExternalName,
-			ExternalName: "example.com",
-		},
-	}
-}
-
-// headlessService builds a headless ClusterIP Service (clusterIP None), which has no
-// stable VIP and so backs a forward in Local mode only.
-func headlessService(ns, name string) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-		Spec: corev1.ServiceSpec{
-			Type:      corev1.ServiceTypeClusterIP,
-			ClusterIP: corev1.ClusterIPNone,
-			Ports:     []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP}},
-		},
-	}
-}
-
-func TestClassifyForwards(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	type outcome struct {
-		// accepted means classification passed and provisioning ran.
-		accepted bool
-		// wantReason is the expected Ready reason on a denial (ignored when accepted).
-		wantReason string
-		// wantRequeue is the expected RequeueAfter from the reconcile that ran
-		// classification; zero means none asserted.
-		wantRequeue time.Duration
-	}
-
-	tests := []struct {
-		name string
-		// setup creates the prerequisite namespaces/services for the case in the
-		// given gateway namespace and returns the forward under test.
-		setup func(t *testing.T, gwNS string) wgnetv1alpha1.Forward
-		want  outcome
-	}{
-		{
-			name: "same-namespace ClusterIP service accepted",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 443, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{accepted: true},
-		},
-		{
-			name: "NodePort service accepted",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, portedNodePortService(gwNS, "web", 443, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{accepted: true},
-		},
-		{
-			name: "target port matching a published service port accepted",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 8443, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", TargetPort: 8443}
-			},
-			want: outcome{accepted: true},
-		},
-		{
-			name: "ExternalName service rejected",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, externalNameService(gwNS, "web"))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{wantReason: reasonUnsupportedServiceType},
-		},
-		{
-			name: "headless service rejected in cluster mode",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, headlessService(gwNS, "web"))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{wantReason: reasonUnsupportedServiceType},
-		},
-		{
-			name: "target port not among published ports rejected",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 80, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{wantReason: reasonTargetPortNotListening, wantRequeue: validationRequeueAfter},
-		},
-		{
-			name: "target port published under a different protocol rejected",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				mustCreate(ctx, t, cl, portedClusterIPService(gwNS, "web", 443, corev1.ProtocolUDP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{wantReason: reasonTargetPortNotListening, wantRequeue: validationRequeueAfter},
-		},
-		{
-			name: "cross-namespace with consent label accepted",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				target := gwNS + "-target"
-				mustCreate(ctx, t, cl, namespaceWithLabels(target, map[string]string{
-					crossNamespaceIngressLabel: crossNamespaceIngressValue,
-				}))
-				mustCreate(ctx, t, cl, portedClusterIPService(target, "web", 443, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: target}
-			},
-			want: outcome{accepted: true},
-		},
-		{
-			name: "cross-namespace without consent label denied",
-			setup: func(t *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				target := gwNS + "-target"
-				mustCreate(ctx, t, cl, namespaceWithLabels(target, nil))
-				mustCreate(ctx, t, cl, portedClusterIPService(target, "web", 443, corev1.ProtocolTCP))
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: target}
-			},
-			want: outcome{wantReason: reasonCrossNamespaceForwardDenied},
-		},
-		{
-			name: "cross-namespace target namespace missing denied",
-			setup: func(_ *testing.T, gwNS string) wgnetv1alpha1.Forward {
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web", Namespace: gwNS + "-ghost"}
-			},
-			want: outcome{wantReason: reasonTargetNamespaceNotFound, wantRequeue: validationRequeueAfter},
-		},
-		{
-			name: "backend service not found requeues",
-			setup: func(_ *testing.T, _ string) wgnetv1alpha1.Forward {
-				return wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			},
-			want: outcome{wantReason: reasonServiceNotFound, wantRequeue: validationRequeueAfter},
-		},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gwNS := fmt.Sprintf("vf-%d", i)
-			mustCreate(ctx, t, cl, namespaceWithLabels(gwNS, nil))
-
-			forward := tt.setup(t, gwNS)
-			gw := newGateway(gwNS, gwNS, []wgnetv1alpha1.Forward{forward}, nil)
-			mustCreate(ctx, t, cl, gw)
-
-			gen, _ := countingKeyGen()
-			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
-			key := client.ObjectKeyFromObject(gw)
-
-			result := reconcileToClassification(ctx, t, r, key)
-
-			var got wgnetv1alpha1.Gateway
-			mustGet(ctx, t, cl, key, &got)
-			cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
-
-			bundleExists := !apierrors.IsNotFound(
-				cl.Get(ctx, client.ObjectKey{Namespace: gwNS, Name: bundleSecretName(gw)}, &corev1.Secret{}))
-
-			if tt.want.accepted {
-				if !bundleExists {
-					t.Errorf("accepted forward did not provision: bundle Secret absent")
-				}
-				if cond != nil && isValidationDenialReason(cond.Reason) {
-					t.Errorf("accepted forward carries denial reason %q", cond.Reason)
-				}
-				return
-			}
-
-			if bundleExists {
-				t.Errorf("denied forward provisioned children: bundle Secret present")
-			}
-			if cond == nil || cond.Status != metav1.ConditionFalse {
-				t.Fatalf("Ready condition = %+v, want False", cond)
-			}
-			if cond.Reason != tt.want.wantReason {
-				t.Errorf("Ready reason = %q, want %q (message: %q)", cond.Reason, tt.want.wantReason, cond.Message)
-			}
-			if tt.want.wantRequeue != 0 && result.RequeueAfter != tt.want.wantRequeue {
-				t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, tt.want.wantRequeue)
-			}
-		})
-	}
-}
-
-// TestBackendPortOf pins the pod-side port classification hands to the NetworkPolicy builder.
-// An unset targetPort is not a case here: the API server defaults it, so envtest covers it.
-func TestBackendPortOf(t *testing.T) {
-	tests := []struct {
-		name string
-		port corev1.ServicePort
-		want int32
-	}{
-		{
-			name: "numeric target port resolves to the pod port",
-			port: corev1.ServicePort{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10443)},
-			want: 10443,
-		},
-		{
-			name: "named target port is unresolved",
-			port: corev1.ServicePort{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("https")},
-			want: 0,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := backendPortOf(&tt.port); got != tt.want {
-				t.Errorf("backendPortOf = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestClassifyForwardsResolvesBackendPort runs against a real API server: every case turns on
-// server-side behaviour the fake client does not reproduce, starting with targetPort defaulting.
-func TestClassifyForwardsResolvesBackendPort(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	tests := []struct {
-		name string
-		// ports are the backing Service's published ports.
-		ports []corev1.ServicePort
-		// forwardPort is the public port of the single forward under test; the forward
-		// carries no TargetPort, so it matches the Service port of the same number.
-		forwardPort int32
-		want        int32
-		// wantWarning expects one UnresolvedBackendPort Warning event.
-		wantWarning bool
-		// local runs the case under the Local traffic policy.
-		local bool
-	}{
-		{
-			name:        "api server defaults an unset target port to the service port",
-			ports:       []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP}},
-			forwardPort: 443,
-			want:        443,
-		},
-		{
-			name: "forward matching the second published port resolves that port's target",
-			ports: []corev1.ServicePort{
-				{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10443)},
-				{Name: "http", Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(10080)},
-			},
-			forwardPort: 80,
-			want:        10080,
-		},
-		{
-			name:        "named target port stays unresolved and warns",
-			ports:       []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("https")}},
-			forwardPort: 443,
-			want:        0,
-			wantWarning: true,
-		},
-		{
-			name:        "named target port in local mode warns about nothing",
-			ports:       []corev1.ServicePort{{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("https")}},
-			forwardPort: 443,
-			want:        0,
-			local:       true,
-		},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gwNS := fmt.Sprintf("bp-%d", i)
-			mustCreate(ctx, t, cl, namespaceWithLabels(gwNS, nil))
-
-			mustCreate(ctx, t, cl, &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: gwNS},
-				Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, Ports: tt.ports},
-			})
-
-			gw := newGateway(gwNS, gwNS, []wgnetv1alpha1.Forward{
-				{Port: tt.forwardPort, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
-			}, nil)
-			if tt.local {
-				gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
-			}
-			rec := &fakeEventRecorder{}
-			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), Recorder: rec})
-
-			valid, invalid, err := r.classifyForwards(ctx, gw)
-			if err != nil {
-				t.Fatalf("classify forwards: %v", err)
-			}
-			if len(invalid) != 0 {
-				t.Fatalf("invalid = %+v, want none", invalid)
-			}
-			if len(valid) != 1 {
-				t.Fatalf("valid = %d, want 1", len(valid))
-			}
-			if got := valid[0].BackendPort; got != tt.want {
-				t.Errorf("backend port = %d, want %d", got, tt.want)
-			}
-
-			// A second pass stands in for the steady-state requeue: the warning is tied to
-			// the unresolved set changing, so the event counts also assert it is not re-emitted.
-			if _, _, err := r.classifyForwards(ctx, gw); err != nil {
-				t.Fatalf("classify forwards (second pass): %v", err)
-			}
-
-			if !tt.wantWarning {
-				if len(rec.events) != 0 {
-					t.Errorf("recorded %+v, want no events", rec.events)
-				}
-				return
-			}
-			if len(rec.events) != 1 {
-				t.Fatalf("recorded %d events, want 1: %+v", len(rec.events), rec.events)
-			}
-			ev := rec.events[0]
-			if ev.eventtype != corev1.EventTypeWarning || ev.reason != reasonUnresolvedBackendPort {
-				t.Errorf("event = %s/%s, want %s/%s", ev.eventtype, ev.reason, corev1.EventTypeWarning, reasonUnresolvedBackendPort)
-			}
-			if !strings.Contains(ev.note, "https") {
-				t.Errorf("event note = %q, want it to name the unresolved targetPort", ev.note)
-			}
-		})
-	}
-}
-
 // TestReconcileNetworkPolicyAllowsRemappedBackendPort pins port resolution through a real apply:
 // egress must open the pod port kube-proxy DNATs to, and a named targetPort a protocol-only rule.
 func TestReconcileNetworkPolicyAllowsRemappedBackendPort(t *testing.T) {
@@ -1057,33 +670,6 @@ func TestReconcileNetworkPolicyAllowsRemappedBackendPort(t *testing.T) {
 			}
 		})
 	}
-}
-
-// isValidationDenialReason reports whether reason is one of the forward-validation denial
-// reasons, used to assert an accepted forward did not land in a denied state.
-func isValidationDenialReason(reason string) bool {
-	switch reason {
-	case reasonCrossNamespaceForwardDenied, reasonTargetNamespaceNotFound,
-		reasonUnsupportedServiceType, reasonServiceNotFound, reasonTargetPortNotListening:
-		return true
-	default:
-		return false
-	}
-}
-
-// reconcileToClassification reconciles past the finalizer-add pass, which requeues before
-// classification runs, and returns the result of the second pass.
-func reconcileToClassification(ctx context.Context, t *testing.T, r *GatewayReconciler, key client.ObjectKey) ctrl.Result {
-	t.Helper()
-	req := ctrl.Request{NamespacedName: key}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("reconcile (finalizer pass): %v", err)
-	}
-	result, err := r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile (classification pass): %v", err)
-	}
-	return result
 }
 
 // TestGatewayReadyProvisioningMessage exercises the operator-side fold: the composite's
@@ -1388,85 +974,6 @@ func TestReconcilerFailEmitsEvent(t *testing.T) {
 	}
 }
 
-// linkConfigForwards reads the link ConfigMap rendered for the Gateway at key and returns its
-// runtime forwards, the assertion surface for which forwards the operator exposed.
-func linkConfigForwards(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) []link.Forward {
-	t.Helper()
-	var cm corev1.ConfigMap
-	cmKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
-	if err := cl.Get(ctx, cmKey, &cm); err != nil {
-		t.Fatalf("get link configmap %s: %v", cmKey, err)
-	}
-	raw, ok := cm.Data[linkConfigKey]
-	if !ok {
-		t.Fatalf("link configmap %s missing %q", cmKey, linkConfigKey)
-	}
-	var rc link.RuntimeConfig
-	decodeJSON(t, raw, &rc)
-	return rc.Forwards
-}
-
-// forwardServiceNames returns the Service FQDNs of the given runtime forwards, the
-// stable field for asserting which forwards a link config carries.
-func forwardServiceNames(forwards []link.Forward) []string {
-	names := make([]string, 0, len(forwards))
-	for _, f := range forwards {
-		names = append(names, f.Service)
-	}
-	return names
-}
-
-// TestMixedForwards covers per-forward classification: one valid and one invalid forward still
-// provisions, exposes only the valid forward, and reports Ready=False with the invalid reason.
-func TestMixedForwards(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	const ns = "mixed"
-	mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
-	mustCreate(ctx, t, cl, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
-
-	gw := newGateway("mixed-gw", ns, []wgnetv1alpha1.Forward{
-		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
-		{Port: 1194, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "absent"},
-	}, nil)
-	mustCreate(ctx, t, cl, gw)
-
-	gen, _ := countingKeyGen()
-	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
-	key := client.ObjectKeyFromObject(gw)
-
-	result := reconcileToClassification(ctx, t, r, key)
-
-	// A valid forward exists, so the Gateway provisions: the bundle Secret appears.
-	if err := cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &corev1.Secret{}); err != nil {
-		t.Fatalf("mixed Gateway did not provision (bundle Secret absent): %v", err)
-	}
-
-	// The link config carries only the valid forward, not the invalid one.
-	got := forwardServiceNames(linkConfigForwards(ctx, t, cl, key))
-	want := []string{"web." + ns + ".svc.cluster.local"}
-	if !slices.Equal(got, want) {
-		t.Errorf("link config forwards = %v, want %v (only the valid forward)", got, want)
-	}
-
-	// Ready=False with the invalid forward's reason.
-	var live wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &live)
-	cond := apimeta.FindStatusCondition(live.Status.Conditions, conditionReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse {
-		t.Fatalf("Ready condition = %+v, want False", cond)
-	}
-	if cond.Reason != reasonServiceNotFound {
-		t.Errorf("Ready reason = %q, want %q (message: %q)", cond.Reason, reasonServiceNotFound, cond.Message)
-	}
-	// The invalid forward's reason is transient, so the reconcile requeues.
-	if result.RequeueAfter != validationRequeueAfter {
-		t.Errorf("RequeueAfter = %v, want %v (transient invalid forward)", result.RequeueAfter, validationRequeueAfter)
-	}
-}
-
 // TestLinkActiveReadyGate covers the active-tunnel gate: readiness follows the lease holder pod,
 // so a Ready idle standby must not mask a holder that is not Ready.
 func TestLinkActiveReadyGate(t *testing.T) {
@@ -1609,6 +1116,9 @@ func startManager(ctx context.Context, t *testing.T, te *testEnv) client.Client 
 		// Disable the metrics listener so parallel managers in one test binary do
 		// not contend for a port.
 		Metrics: metricsserver.Options{BindAddress: "0"},
+		// Every manager registers a controller named "gateway"; skip the process-global
+		// uniqueness check so more than one startManager test can run in one binary.
+		Controller: config.Controller{SkipNameValidation: new(true)},
 	})
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -1667,6 +1177,38 @@ func pollUntil(ctx context.Context, t *testing.T, timeout time.Duration, msg str
 // transitionTimeout bounds each manager-backed transition wait, generous because it
 // covers a watch event firing, a reconcile running, and the dependent status patches.
 const transitionTimeout = 30 * time.Second
+
+// waitForReconcileQuiescence waits until key's resourceVersion holds steady for several checks,
+// evidence the self-triggering burst of reconciles a Gateway creation sets off has settled.
+func waitForReconcileQuiescence(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey) {
+	t.Helper()
+	const stableChecksNeeded = 5
+	const checkInterval = 200 * time.Millisecond
+
+	var lastRV string
+	stableChecks := 0
+	deadline := time.Now().Add(transitionTimeout)
+	for time.Now().Before(deadline) {
+		var gw wgnetv1alpha1.Gateway
+		if err := cl.Get(ctx, key, &gw); err == nil {
+			if gw.ResourceVersion == lastRV {
+				stableChecks++
+				if stableChecks >= stableChecksNeeded {
+					return
+				}
+			} else {
+				lastRV = gw.ResourceVersion
+				stableChecks = 0
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for gateway %s reconcile quiescence: context done: %v", key, ctx.Err())
+		case <-time.After(checkInterval):
+		}
+	}
+	t.Fatalf("timed out waiting for gateway %s reconcile to settle", key)
+}
 
 // gatewayReadyReason fetches the Gateway at key with cl and returns its Ready
 // condition status and reason, or empty strings if the condition is absent.
@@ -1969,6 +1511,109 @@ func TestForwardValidationTransitions(t *testing.T) {
 	})
 }
 
+// TestResponderServiceWatchCorrectsDrift pins that an out-of-band Service edit self-heals via
+// the Owns watch alone (RequeueInterval is zero here): apiserver never bumps a Service generation.
+func TestResponderServiceWatchCorrectsDrift(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	direct := te.client
+	startManager(ctx, t, te)
+
+	const ns = "responder-service-drift"
+	mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+	mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+
+	gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+	}, nil)
+	mustCreate(ctx, t, direct, gw)
+	key := client.ObjectKeyFromObject(gw)
+
+	// Wait for the post-finalizer requeue and its self-triggered cascade to run their course
+	// before mutating, so the only reconcile left that can correct the drift is the Service watch.
+	waitForReconcileQuiescence(ctx, t, direct, key)
+
+	svcKey := client.ObjectKey{Namespace: ns, Name: "gw-responder"}
+	var svc corev1.Service
+	pollUntil(ctx, t, transitionTimeout, "responder service created for "+key.String(), func() bool {
+		return direct.Get(ctx, svcKey, &svc) == nil && svc.Labels["app.kubernetes.io/component"] != ""
+	})
+
+	svc.Labels["app.kubernetes.io/component"] = "drifted"
+	if err := direct.Update(ctx, &svc); err != nil {
+		t.Fatalf("drift responder service label: %v", err)
+	}
+	// Confirm the write actually landed on the server before polling for its correction:
+	// otherwise a stale first poll read could observe the pre-drift value and pass by luck.
+	var confirmed corev1.Service
+	pollUntil(ctx, t, transitionTimeout, "drift observed on the server before polling for its correction", func() bool {
+		return direct.Get(ctx, svcKey, &confirmed) == nil && confirmed.Labels["app.kubernetes.io/component"] == "drifted"
+	})
+
+	pollUntil(ctx, t, transitionTimeout, "responder service label restored after drift", func() bool {
+		var got corev1.Service
+		if err := direct.Get(ctx, svcKey, &got); err != nil {
+			return false
+		}
+		return got.Labels["app.kubernetes.io/component"] == componentResponder
+	})
+}
+
+// TestLinkWorkloadStatusEventTriggersReconcile pins that a Local Gateway's link DaemonSet status
+// update alone drives status.link.activeNode, since link pods carry no watch of their own.
+func TestLinkWorkloadStatusEventTriggersReconcile(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtestRBAC(t)
+	direct := te.client
+	startManager(ctx, t, te)
+
+	const ns = "link-workload-status-event"
+	mustCreate(ctx, t, direct, namespaceWithLabels(ns, nil))
+	mustCreate(ctx, t, direct, portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP))
+
+	gw := newGateway("gw", ns, []wgnetv1alpha1.Forward{
+		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+	}, nil)
+	gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+	mustCreate(ctx, t, direct, gw)
+	key := client.ObjectKeyFromObject(gw)
+
+	workloadKey := client.ObjectKey{Namespace: ns, Name: linkComponentName(gw)}
+	var ds appsv1.DaemonSet
+	pollUntil(ctx, t, transitionTimeout, "link daemonset created for "+key.String(), func() bool {
+		return direct.Get(ctx, workloadKey, &ds) == nil
+	})
+
+	// Wait for the post-finalizer requeue's cascade to settle before creating the holder pod,
+	// so the DaemonSet status update below is the only trigger left to see it become ready.
+	waitForReconcileQuiescence(ctx, t, direct, key)
+
+	podName := linkComponentName(gw) + "-0"
+	createLinkPod(ctx, t, direct, gw, podName, "node-a")
+	var pod corev1.Pod
+	mustGet(ctx, t, direct, client.ObjectKey{Namespace: ns, Name: podName}, &pod)
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := direct.Status().Update(ctx, &pod); err != nil {
+		t.Fatalf("mark link pod ready: %v", err)
+	}
+	upsertLeaseHolder(ctx, t, direct, workloadKey, podName, nil)
+
+	mustGet(ctx, t, direct, workloadKey, &ds)
+	ds.Status.DesiredNumberScheduled = 1
+	ds.Status.NumberReady = 1
+	if err := direct.Status().Update(ctx, &ds); err != nil {
+		t.Fatalf("update link daemonset status: %v", err)
+	}
+
+	eventually(ctx, t, "status.link.activeNode reflects the ready holder pod", func() bool {
+		var got wgnetv1alpha1.Gateway
+		if err := direct.Get(ctx, key, &got); err != nil {
+			return false
+		}
+		return got.Status.Link.ActiveNode == "node-a"
+	})
+}
+
 // jsonUnmarshalString unmarshals raw into v, returning the error so a poll predicate can treat
 // a not-yet-written ConfigMap as "keep waiting" rather than failing the test.
 func jsonUnmarshalString(raw string, v any) error {
@@ -2109,112 +1754,6 @@ func TestGatewayTrafficPolicyImmutable(t *testing.T) {
 	}
 }
 
-// TestLowestFreeLinkID pins the dense-range allocator: the lowest unused id, the caller's own id
-// reused, and exhaustion reported rather than wrapped.
-func TestLowestFreeLinkID(t *testing.T) {
-	self := client.ObjectKey{Namespace: "wg-system", Name: "edge"}
-
-	withIDs := func(ids ...int32) []wgnetv1alpha1.Gateway {
-		gateways := make([]wgnetv1alpha1.Gateway, 0, len(ids))
-		for i, id := range ids {
-			gateways = append(gateways, wgnetv1alpha1.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "wg-system", Name: fmt.Sprintf("other-%d", i)},
-				Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: id}},
-			})
-		}
-		return gateways
-	}
-
-	all := make([]wgnetv1alpha1.Gateway, 0, link.MaxLinkID)
-	for id := int32(1); id <= link.MaxLinkID; id++ {
-		all = append(all, wgnetv1alpha1.Gateway{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "wg-system", Name: fmt.Sprintf("g-%d", id)},
-			Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: id}},
-		})
-	}
-
-	tests := []struct {
-		name     string
-		gateways []wgnetv1alpha1.Gateway
-		want     int32
-		wantOK   bool
-	}{
-		{"empty list allocates 1", nil, 1, true},
-		{"lowest gap taken", withIDs(1, 3), 2, true},
-		{"cluster gateways holding no id are ignored", withIDs(0, 0), 1, true},
-		{"whole range taken reports exhaustion", all, 0, false},
-		{
-			name: "annotated id reserves it even with status empty",
-			gateways: []wgnetv1alpha1.Gateway{{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace:   "wg-system",
-					Name:        "restored",
-					Annotations: map[string]string{linkIDAnnotation: "1"},
-				},
-			}},
-			want:   2,
-			wantOK: true,
-		},
-		{
-			name: "malformed annotation reserves nothing",
-			gateways: []wgnetv1alpha1.Gateway{{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace:   "wg-system",
-					Name:        "broken",
-					Annotations: map[string]string{linkIDAnnotation: "not-a-number"},
-				},
-			}},
-			want:   1,
-			wantOK: true,
-		},
-		{
-			name: "out-of-range annotation reserves nothing",
-			gateways: []wgnetv1alpha1.Gateway{{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace:   "wg-system",
-					Name:        "over",
-					Annotations: map[string]string{linkIDAnnotation: fmt.Sprint(link.MaxLinkID + 1)},
-				},
-			}},
-			want:   1,
-			wantOK: true,
-		},
-		{
-			name: "own annotation is reusable",
-			gateways: []wgnetv1alpha1.Gateway{{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace:   self.Namespace,
-					Name:        self.Name,
-					Annotations: map[string]string{linkIDAnnotation: "1"},
-				},
-			}},
-			want:   1,
-			wantOK: true,
-		},
-		{
-			name: "own id is reusable",
-			gateways: []wgnetv1alpha1.Gateway{{
-				ObjectMeta: metav1.ObjectMeta{Namespace: self.Namespace, Name: self.Name},
-				Status:     wgnetv1alpha1.GatewayStatus{Link: wgnetv1alpha1.GatewayLinkStatus{ID: 1}},
-			}},
-			want:   1,
-			wantOK: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := lowestFreeLinkID(tt.gateways, self)
-			if ok != tt.wantOK {
-				t.Fatalf("lowestFreeLinkID ok = %v, want %v", ok, tt.wantOK)
-			}
-			if got != tt.want {
-				t.Errorf("lowestFreeLinkID = %d, want %d", got, tt.want)
-			}
-		})
-	}
-}
-
 // localGatewayFixture creates a namespace, a backend Service and a Local Gateway in it,
 // returning a reconciler authorized as the operator and the Gateway's key.
 func localGatewayFixture(ctx context.Context, t *testing.T, te *testEnv, ns string) (*GatewayReconciler, client.ObjectKey) {
@@ -2241,313 +1780,63 @@ func linkGatewayFixture(ctx context.Context, t *testing.T, te *testEnv, ns strin
 	return r, client.ObjectKeyFromObject(gw)
 }
 
-// TestEnsureLinkIDIsAuthoritative pins that a persisted id is read, never recomputed even once a
-// lower id frees up: the names derived from it are what a restarting link reclaims.
-func TestEnsureLinkIDIsAuthoritative(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	// A squatter holds id 1 so the Gateway under test allocates 2, leaving a lower id
-	// to free up.
-	squatter := newGateway("squatter", "default", nil, nil)
-	squatter.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
-	mustCreate(ctx, t, cl, squatter)
-	squatter.Status.Link.ID = 1
-	if err := cl.Status().Update(ctx, squatter); err != nil {
-		t.Fatalf("seed squatter link id: %v", err)
-	}
-
-	r, key := localGatewayFixture(ctx, t, te, "lid-auth")
-	drainReconcile(ctx, t, r, key)
-
-	var got wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &got)
-	if got.Status.Link.ID != 2 {
-		t.Fatalf("status.link.id = %d, want 2 (1 is held by the squatter)", got.Status.Link.ID)
-	}
-
-	if err := cl.Delete(ctx, squatter); err != nil {
-		t.Fatalf("delete squatter: %v", err)
-	}
-	drainReconcile(ctx, t, r, key)
-
-	mustGet(ctx, t, cl, key, &got)
-	if got.Status.Link.ID != 2 {
-		t.Errorf("status.link.id = %d after id 1 freed, want the authoritative 2", got.Status.Link.ID)
-	}
-}
-
-// seedLinkIDHolder creates a Local Gateway carrying the given status id and link id annotation,
-// standing in for another Gateway that already holds an id.
-func seedLinkIDHolder(ctx context.Context, t *testing.T, cl client.Client, ns, name string, statusID int32, annotation string) {
+// createLinkPod creates a Running pod carrying gw's link selector labels and nodeName, standing
+// in for a Local Gateway's DaemonSet pod, which envtest's absent kubelet never schedules.
+func createLinkPod(ctx context.Context, t *testing.T, cl client.Client, gw *wgnetv1alpha1.Gateway, name, nodeName string) {
 	t.Helper()
-	holder := newGateway(name, ns, nil, nil)
-	holder.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
-	if annotation != "" {
-		holder.Annotations = map[string]string{linkIDAnnotation: annotation}
-	}
-	mustCreate(ctx, t, cl, holder)
-	if statusID == 0 {
-		return
-	}
-	holder.Status.Link.ID = statusID
-	if err := cl.Status().Update(ctx, holder); err != nil {
-		t.Fatalf("seed link id %d on %s/%s: %v", statusID, ns, name, err)
-	}
+	createLinkPodWithPhase(ctx, t, cl, gw, name, nodeName, corev1.PodRunning)
 }
 
-func setLinkIDAnnotation(ctx context.Context, t *testing.T, cl client.Client, key client.ObjectKey, value string) {
+// createLinkPodWithPhase is createLinkPod with an explicit phase, letting a test create a link
+// pod responderMissingNodes' phase filter must skip.
+func createLinkPodWithPhase(ctx context.Context, t *testing.T, cl client.Client, gw *wgnetv1alpha1.Gateway, name, nodeName string, phase corev1.PodPhase) {
 	t.Helper()
-	var gw wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &gw)
-	if gw.Annotations == nil {
-		gw.Annotations = map[string]string{}
-	}
-	gw.Annotations[linkIDAnnotation] = value
-	if err := cl.Update(ctx, &gw); err != nil {
-		t.Fatalf("set link id annotation on %s: %v", key, err)
-	}
-}
-
-// TestEnsureLinkIDAnnotation pins the second record of the allocated id: an unheld annotated id
-// is adopted, so a Gateway restored without status keeps the id its node state is named after.
-func TestEnsureLinkIDAnnotation(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	tests := []struct {
-		name string
-		ns   string
-		// seed runs on the created Gateway before the first reconcile.
-		seed  func(key client.ObjectKey)
-		check func(t *testing.T, got *wgnetv1alpha1.Gateway)
-	}{
-		{
-			name: "restored gateway adopts its annotated id",
-			ns:   "lid-restored",
-			seed: func(key client.ObjectKey) { setLinkIDAnnotation(ctx, t, cl, key, "3") },
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				if got.Status.Link.ID != 3 {
-					t.Errorf("status.link.id = %d, want the annotated 3", got.Status.Link.ID)
-				}
-				if ann := got.Annotations[linkIDAnnotation]; ann != "3" {
-					t.Errorf("annotation = %q, want it left at \"3\"", ann)
-				}
-			},
-		},
-		{
-			name: "fresh gateway is annotated with its allocated id",
-			ns:   "lid-fresh",
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				assertLinkIDAnnotationMatchesStatus(t, got)
-			},
-		},
-		{
-			name: "annotated id held in another status is not adopted",
-			ns:   "lid-taken-status",
-			seed: func(key client.ObjectKey) {
-				seedLinkIDHolder(ctx, t, cl, key.Namespace, "status-holder", 40, "")
-				setLinkIDAnnotation(ctx, t, cl, key, "40")
-			},
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				if got.Status.Link.ID == 40 {
-					t.Errorf("status.link.id = 40, want an id other than the one held in status")
-				}
-				assertLinkIDAnnotationMatchesStatus(t, got)
-			},
-		},
-		{
-			name: "an id another gateway only annotates is skipped",
-			ns:   "lid-taken-annotation",
-			seed: func(key client.ObjectKey) {
-				seedLinkIDHolder(ctx, t, cl, key.Namespace, "annotation-holder", 0, "41")
-			},
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				if got.Status.Link.ID == 41 {
-					t.Errorf("status.link.id = 41, want an id another gateway does not annotate")
-				}
-				assertLinkIDAnnotationMatchesStatus(t, got)
-			},
-		},
-		{
-			name: "status wins over a differing annotation",
-			ns:   "lid-status-wins",
-			seed: func(key client.ObjectKey) {
-				setLinkIDAnnotation(ctx, t, cl, key, "42")
-				var gw wgnetv1alpha1.Gateway
-				mustGet(ctx, t, cl, key, &gw)
-				gw.Status.Link.ID = 43
-				if err := cl.Status().Update(ctx, &gw); err != nil {
-					t.Fatalf("seed status link id: %v", err)
-				}
-			},
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				if got.Status.Link.ID != 43 {
-					t.Errorf("status.link.id = %d, want the authoritative 43", got.Status.Link.ID)
-				}
-				assertLinkIDAnnotationMatchesStatus(t, got)
-			},
-		},
-		{
-			name: "malformed annotation is replaced by a fresh allocation",
-			ns:   "lid-malformed",
-			seed: func(key client.ObjectKey) { setLinkIDAnnotation(ctx, t, cl, key, "not-a-number") },
-			check: func(t *testing.T, got *wgnetv1alpha1.Gateway) {
-				t.Helper()
-				assertLinkIDAnnotationMatchesStatus(t, got)
-			},
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: gw.Namespace, Name: name, Labels: linkSelectorLabels(gw)},
+		Spec: corev1.PodSpec{
+			NodeName:   nodeName,
+			Containers: []corev1.Container{{Name: "link", Image: "registry.example.com/gateway-link:test"}},
 		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r, key := localGatewayFixture(ctx, t, te, tt.ns)
-			if tt.seed != nil {
-				tt.seed(key)
-			}
-			drainReconcile(ctx, t, r, key)
-
-			var got wgnetv1alpha1.Gateway
-			mustGet(ctx, t, cl, key, &got)
-			tt.check(t, &got)
-		})
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("create link pod %s/%s: %v", gw.Namespace, name, err)
+	}
+	pod.Status.Phase = phase
+	if err := cl.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("update link pod %s/%s status: %v", gw.Namespace, name, err)
 	}
 }
 
-// assertLinkIDAnnotationMatchesStatus fails unless an id was allocated and the annotation
-// records exactly it, which is what makes the annotation usable on a restore.
-func assertLinkIDAnnotationMatchesStatus(t *testing.T, gw *wgnetv1alpha1.Gateway) {
+// createResponderPod creates a Running, Ready responder pod with a pod IP, in namespace, on
+// nodeName, carrying labels (typically responderSelectorLabels(gw)).
+func createResponderPod(ctx context.Context, t *testing.T, cl client.Client, namespace, name, nodeName, podIP string, labels map[string]string) {
 	t.Helper()
-	if gw.Status.Link.ID <= 0 {
-		t.Fatalf("status.link.id = %d, want an allocated id", gw.Status.Link.ID)
-	}
-	want := strconv.FormatInt(int64(gw.Status.Link.ID), 10)
-	if got := gw.Annotations[linkIDAnnotation]; got != want {
-		t.Errorf("annotation = %q, want %q (status.link.id)", got, want)
-	}
+	createResponderPodWithReady(ctx, t, cl, namespace, name, nodeName, podIP, labels, true)
 }
 
-// TestEnsureLinkIDClusterConsumesNone pins that a Cluster Gateway allocates no id, so
-// the dense range is not spent on Gateways whose data path derives nothing from it.
-func TestEnsureLinkIDClusterConsumesNone(t *testing.T) {
-	ctx := context.Background()
-	te, r, _, key, _ := reconcileFixture(ctx, t)
-	drainReconcile(ctx, t, r, key)
-
-	var got wgnetv1alpha1.Gateway
-	mustGet(ctx, t, te.client, key, &got)
-	if got.Status.Link.ID != 0 {
-		t.Errorf("status.link.id = %d, want 0 in Cluster mode", got.Status.Link.ID)
+// createResponderPodWithReady is createResponderPod with an explicit PodReady status, letting a
+// test create a Running-but-not-Ready responder pod.
+func createResponderPodWithReady(ctx context.Context, t *testing.T, cl client.Client, namespace, name, nodeName, podIP string, labels map[string]string, ready bool) {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels},
+		Spec: corev1.PodSpec{
+			NodeName:   nodeName,
+			Containers: []corev1.Container{{Name: "responder", Image: "registry.example.com/responder:test"}},
+		},
 	}
-}
-
-// TestEnsureLinkIDExhausted pins the exhaustion path: ReconcileFailed and a regular-interval
-// requeue, rather than an error backoff or reusing an id another link is programming under.
-func TestEnsureLinkIDExhausted(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	mustCreate(ctx, t, cl, namespaceWithLabels("lid-full", nil))
-	for id := int32(1); id <= link.MaxLinkID; id++ {
-		holder := newGateway(fmt.Sprintf("holder-%d", id), "lid-full", nil, nil)
-		holder.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
-		mustCreate(ctx, t, cl, holder)
-		holder.Status.Link.ID = id
-		if err := cl.Status().Update(ctx, holder); err != nil {
-			t.Fatalf("seed holder link id %d: %v", id, err)
-		}
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("create responder pod %s/%s: %v", namespace, name, err)
 	}
-
-	r, key := localGatewayFixture(ctx, t, te, "lid-exhausted")
-	// The shared fixture requeues immediately; a real interval makes the reported
-	// (non-error) requeue observable.
-	r.Config.RequeueInterval = 30 * time.Second
-	req := ctrl.Request{NamespacedName: key}
-
-	// The finalizer-add pass succeeds; the pass that reaches allocation reports the
-	// exhaustion and requeues on the regular cadence instead of erroring.
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("reconcile (finalizer pass): %v", err)
+	readyStatus := corev1.ConditionFalse
+	if ready {
+		readyStatus = corev1.ConditionTrue
 	}
-	res, err := r.Reconcile(ctx, req)
-	if err != nil {
-		t.Fatalf("reconcile = %v, want nil error on exhaustion", err)
-	}
-	if res.RequeueAfter <= 0 {
-		t.Errorf("RequeueAfter = %v, want the regular requeue interval", res.RequeueAfter)
-	}
-
-	var got wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &got)
-	cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
-	if cond == nil {
-		t.Fatal("Ready condition absent")
-	}
-	if cond.Status != metav1.ConditionFalse || cond.Reason != reasonReconcileFailed {
-		t.Errorf("Ready = %s/%s, want False/%s", cond.Status, cond.Reason, reasonReconcileFailed)
-	}
-	if !strings.Contains(cond.Message, "no free link id") {
-		t.Errorf("Ready message = %q, want it to name the exhaustion", cond.Message)
-	}
-	if got.Status.Link.ID != 0 {
-		t.Errorf("status.link.id = %d, want 0 when allocation failed", got.Status.Link.ID)
-	}
-}
-
-// TestReconcileLocalAppliesDaemonSetNotDeployment pins the Local-mode workload swap through the
-// operator's own RBAC, including the cluster-scoped grant that must be reaped explicitly.
-func TestReconcileLocalAppliesDaemonSetNotDeployment(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	r, key := localGatewayFixture(ctx, t, te, "local-ds")
-	drainReconcile(ctx, t, r, key)
-
-	var gw wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &gw)
-
-	linkKey := client.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-link"}
-	if err := cl.Get(ctx, linkKey, &appsv1.DaemonSet{}); err != nil {
-		t.Fatalf("get link daemonset %s: %v", linkKey, err)
-	}
-	for _, absent := range []struct {
-		kind string
-		obj  client.Object
-	}{
-		{"deployment", &appsv1.Deployment{}},
-		{"networkpolicy", &networkingv1.NetworkPolicy{}},
-		{"poddisruptionbudget", &policyv1.PodDisruptionBudget{}},
-	} {
-		if err := cl.Get(ctx, linkKey, absent.obj); !apierrors.IsNotFound(err) {
-			t.Errorf("get link %s: err = %v, want NotFound in Local mode", absent.kind, err)
-		}
-	}
-
-	crbKey := client.ObjectKey{Name: linkClusterRoleBindingName(&gw)}
-	var crb rbacv1.ClusterRoleBinding
-	if err := cl.Get(ctx, crbKey, &crb); err != nil {
-		t.Fatalf("get link clusterrolebinding %s: %v", crbKey, err)
-	}
-	if crb.RoleRef.Name != linkEndpointSliceClusterRole {
-		t.Errorf("roleRef = %q, want %q", crb.RoleRef.Name, linkEndpointSliceClusterRole)
-	}
-
-	if err := cl.Delete(ctx, &gw); err != nil {
-		t.Fatalf("delete gateway: %v", err)
-	}
-	drainReconcile(ctx, t, r, key)
-
-	if err := cl.Get(ctx, crbKey, &rbacv1.ClusterRoleBinding{}); !apierrors.IsNotFound(err) {
-		t.Errorf("get link clusterrolebinding after delete: err = %v, want NotFound", err)
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIP = podIP
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: readyStatus}}
+	if err := cl.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("update responder pod %s/%s status: %v", namespace, name, err)
 	}
 }
 
@@ -2698,193 +1987,6 @@ func TestLinkReadyReasonPrecedence(t *testing.T) {
 			cond = apimeta.FindStatusCondition(got.Status.Conditions, conditionReady)
 			if cond.Status != metav1.ConditionTrue || cond.Reason != reasonReady {
 				t.Errorf("Ready after clearing the fault = %s/%s, want True/%s", cond.Status, cond.Reason, reasonReady)
-			}
-		})
-	}
-}
-
-// TestLinkStatusActiveNode pins that status.link.activeNode follows the Lease holder pod's node
-// and clears once the holder is gone, so kubectl names the node carrying traffic.
-func TestLinkStatusActiveNode(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	mustCreate(ctx, t, cl, namespaceWithLabels("active-node", nil))
-	mustCreate(ctx, t, cl, portedClusterIPService("active-node", "web", 443, corev1.ProtocolTCP))
-
-	gw := newGateway("gw", "active-node", []wgnetv1alpha1.Forward{
-		{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
-	}, nil)
-	mustCreate(ctx, t, cl, gw)
-	key := client.ObjectKeyFromObject(gw)
-
-	gen, _ := countingKeyGen()
-	r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), GenerateKey: gen})
-
-	drainReconcile(ctx, t, r, key)
-	setXGatewayGCPStatus(ctx, t, cl, key, "203.0.113.50", "sa@example.iam.gserviceaccount.com", "")
-	setLinkLeaseActive(ctx, t, cl, key, "gw-link-0", true, "node-a")
-
-	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("reconcile with a holder on node-a: %v", err)
-	}
-	var got wgnetv1alpha1.Gateway
-	mustGet(ctx, t, cl, key, &got)
-	if got.Status.Link.ActiveNode != "node-a" {
-		t.Errorf("status.link.activeNode = %q, want node-a", got.Status.Link.ActiveNode)
-	}
-
-	holderKey := client.ObjectKey{Namespace: "active-node", Name: "gw-link-0"}
-	// envtest runs no kubelet, so a graceful pod delete would hang in Terminating
-	// forever; force it so the holder is genuinely gone.
-	holder := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: holderKey.Namespace, Name: holderKey.Name}}
-	if err := cl.Delete(ctx, holder, client.GracePeriodSeconds(0)); err != nil {
-		t.Fatalf("delete holder pod: %v", err)
-	}
-	eventually(ctx, t, "holder pod gone", func() bool {
-		return apierrors.IsNotFound(cl.Get(ctx, holderKey, &corev1.Pod{}))
-	})
-
-	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
-		t.Fatalf("reconcile after the holder disappeared: %v", err)
-	}
-	mustGet(ctx, t, cl, key, &got)
-	if got.Status.Link.ActiveNode != "" {
-		t.Errorf("status.link.activeNode = %q, want it cleared once the holder is gone", got.Status.Link.ActiveNode)
-	}
-}
-
-// TestClassifyForwardsRecordsServicePortName pins that the matched Service port name is carried
-// through: a Local link matches it in the EndpointSlice, and an unnamed port stays empty.
-func TestClassifyForwardsRecordsServicePortName(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	tests := []struct {
-		name  string
-		ports []corev1.ServicePort
-		want  string
-	}{
-		{
-			name:  "unnamed single port carries no name",
-			ports: []corev1.ServicePort{{Port: 443, Protocol: corev1.ProtocolTCP}},
-			want:  "",
-		},
-		{
-			name: "named port carries its name",
-			ports: []corev1.ServicePort{
-				{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(8443)},
-				{Name: "http", Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(8080)},
-			},
-			want: "https",
-		},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ns := fmt.Sprintf("spn-%d", i)
-			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
-			mustCreate(ctx, t, cl, &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: ns},
-				Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, Ports: tt.ports},
-			})
-
-			gw := newGateway(ns, ns, []wgnetv1alpha1.Forward{
-				{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
-			}, nil)
-			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig(), Recorder: &fakeEventRecorder{}})
-
-			valid, invalid, err := r.classifyForwards(ctx, gw)
-			if err != nil {
-				t.Fatalf("classify forwards: %v", err)
-			}
-			if len(invalid) != 0 || len(valid) != 1 {
-				t.Fatalf("valid = %d, invalid = %+v, want 1 valid and none invalid", len(valid), invalid)
-			}
-			if got := valid[0].ServicePortName; got != tt.want {
-				t.Errorf("servicePortName = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-// TestClassifyForwardsHeadlessByTrafficPolicy pins which backend shapes each policy accepts:
-// only Cluster mode DNATs to a ClusterIP, so only it needs one.
-func TestClassifyForwardsHeadlessByTrafficPolicy(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtestRBAC(t)
-	cl := te.client
-
-	tests := []struct {
-		name   string
-		policy wgnetv1alpha1.TrafficPolicy
-		// service builds the forward's backend in ns.
-		service func(ns string) *corev1.Service
-		// wantValid expects the forward to classify as valid.
-		wantValid bool
-	}{
-		{
-			name:      "cluster mode rejects a headless service",
-			policy:    wgnetv1alpha1.TrafficPolicyCluster,
-			service:   func(ns string) *corev1.Service { return headlessService(ns, "web") },
-			wantValid: false,
-		},
-		{
-			name:      "local mode accepts a headless service",
-			policy:    wgnetv1alpha1.TrafficPolicyLocal,
-			service:   func(ns string) *corev1.Service { return headlessService(ns, "web") },
-			wantValid: true,
-		},
-		{
-			name:      "local mode rejects an externalname service",
-			policy:    wgnetv1alpha1.TrafficPolicyLocal,
-			service:   func(ns string) *corev1.Service { return externalNameService(ns, "web") },
-			wantValid: false,
-		},
-		{
-			name:   "cluster mode accepts a clusterip service",
-			policy: wgnetv1alpha1.TrafficPolicyCluster,
-			service: func(ns string) *corev1.Service {
-				return portedClusterIPService(ns, "web", 443, corev1.ProtocolTCP)
-			},
-			wantValid: true,
-		},
-	}
-
-	for i, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gwNS := fmt.Sprintf("hl-%d", i)
-			mustCreate(ctx, t, cl, namespaceWithLabels(gwNS, nil))
-			mustCreate(ctx, t, cl, tt.service(gwNS))
-
-			forward := wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}
-			gw := newGateway(gwNS, gwNS, []wgnetv1alpha1.Forward{forward}, nil)
-			gw.Spec.TrafficPolicy = tt.policy
-			mustCreate(ctx, t, cl, gw)
-
-			r := newOperatorReconciler(te, &GatewayReconciler{Config: reconcileConfig()})
-			valid, invalid, err := r.classifyForwards(ctx, gw)
-			if err != nil {
-				t.Fatalf("classify forwards: %v", err)
-			}
-
-			if !tt.wantValid {
-				if len(valid) != 0 {
-					t.Fatalf("valid = %+v, want the forward rejected", valid)
-				}
-				if len(invalid) != 1 || invalid[0].reason != reasonUnsupportedServiceType {
-					t.Fatalf("invalid = %+v, want one %s", invalid, reasonUnsupportedServiceType)
-				}
-				return
-			}
-
-			if len(invalid) != 0 {
-				t.Fatalf("invalid = %+v, want none", invalid)
-			}
-			if len(valid) != 1 || valid[0].Forward != forward {
-				t.Fatalf("valid = %+v, want the forward carried through", valid)
 			}
 		})
 	}
@@ -3279,82 +2381,128 @@ func removePodFinalizer(ctx context.Context, t *testing.T, cl client.Client, key
 	}
 }
 
-// TestEnsureSecretsWritesThePairWhole verifies either missing Secret rewrites both.
-func TestEnsureSecretsWritesThePairWhole(t *testing.T) {
-	ctx := context.Background()
-	te := setupEnvtest(t)
+// testConfig is the operator-level config the builder tests fold into Gateways.
+func testConfig() Config {
+	return Config{
+		LinkImage:           "registry.example.com/gateway-link:test",
+		LinkImagePullPolicy: "IfNotPresent",
+		UserData:            "#ignition\n",
+		EnableOSLogin:       true,
+		RequeueInterval:     0,
+		SharedNetworkName:   "wgnet-test",
+		ProviderConfigName:  "test-provider-config",
+		PodNamespace:        "gateway-operator",
+		ResponderImage:      "registry.example.com/gateway-responder:test",
+	}
+}
 
-	stalePriv, stalePub := testMemberKeypair(t)
+// testGatewayUID is a stable UID for builder assertions.
+const testGatewayUID = types.UID("11112222-3333-4444-5555-666677778888")
+
+func newGateway(name, namespace string, forwards []wgnetv1alpha1.Forward, hostnames []string) *wgnetv1alpha1.Gateway {
+	return &wgnetv1alpha1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: testGatewayUID},
+		Spec: wgnetv1alpha1.GatewaySpec{
+			GCP: wgnetv1alpha1.GatewayGCPSpec{
+				ProjectID:   "test-project",
+				Region:      "us-central1",
+				Zone:        "us-central1-a",
+				MachineType: "e2-small",
+			},
+			Forwards:     forwards,
+			DNSHostnames: hostnames,
+		},
+	}
+}
+
+func assertNestedString(t *testing.T, u *unstructured.Unstructured, want string, path ...string) {
+	t.Helper()
+	got, found, err := unstructured.NestedString(u.Object, path...)
+	if err != nil {
+		t.Fatalf("read %v: %v", path, err)
+	}
+	if !found {
+		t.Fatalf("%v not found, want %q", path, want)
+	}
+	if got != want {
+		t.Errorf("%v = %q, want %q", path, got, want)
+	}
+}
+
+func decodeJSON(t *testing.T, raw string, v any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(raw), v); err != nil {
+		t.Fatalf("unmarshal %q: %v", raw, err)
+	}
+}
+
+// TestHashedNamesArePinned fixes the exact bytes both hashedName callers produce, so a
+// prefix, digest, encoding or truncation change cannot silently rename live objects.
+func TestHashedNamesArePinned(t *testing.T) {
 	tests := []struct {
 		name string
-		// present is the half already in the namespace when the pass runs, holding key
-		// material the other half never saw.
-		present func(gw *wgnetv1alpha1.Gateway) *corev1.Secret
+		got  string
+		want string
 	}{
+		{"gcp id", gcpID("default", "gw1"), "gw-aggomndtxrzb5qrg4d7sunz5muq"},
 		{
-			name: "bundle present, link secret missing",
-			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
-				return buildBundleSecret(gw, stalePriv, stalePub)
-			},
-		},
-		{
-			name: "link secret present, bundle missing",
-			present: func(gw *wgnetv1alpha1.Gateway) *corev1.Secret {
-				return buildLinkSecret(gw, stalePriv, stalePub)
-			},
+			"clusterrolebinding",
+			linkClusterRoleBindingName(newGateway("edge", "wg-system", nil, nil)),
+			"gateway-link-cnvcej5geqr66udgtvezbh73rsj",
 		},
 	}
 
-	for i, tt := range tests {
+	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ns := fmt.Sprintf("half-written-pair-%d", i)
-			mustCreate(ctx, t, te.client, namespaceWithLabels(ns, nil))
-			gw := newGateway(ns, ns, nil, nil)
-			mustCreate(ctx, t, te.client, gw)
-			mustGet(ctx, t, te.client, client.ObjectKeyFromObject(gw), gw)
-			mustCreate(ctx, t, te.client, tt.present(gw))
-
-			r := &GatewayReconciler{Client: te.client, APIReader: te.client, Scheme: te.scheme,
-				Config: reconcileConfig(), Recorder: &fakeEventRecorder{}}
-			if err := r.ensureSecrets(ctx, gw); err != nil {
-				t.Fatalf("ensureSecrets: %v", err)
-			}
-
-			var bundle, linkSecret corev1.Secret
-			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: bundleSecretName(gw)}, &bundle)
-			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: linkSecretName(gw)}, &linkSecret)
-
-			if got := slices.Sorted(maps.Keys(bundle.Data)); !slices.Equal(got, []string{wg.BundleKey}) {
-				t.Fatalf("bundle Secret data keys = %v, want exactly %v", got, []string{wg.BundleKey})
-			}
-			wantLinkKeys := []string{wg.LinkPeerPublicKey, wg.LinkPrivateKey}
-			slices.Sort(wantLinkKeys)
-			if got := slices.Sorted(maps.Keys(linkSecret.Data)); !slices.Equal(got, wantLinkKeys) {
-				t.Fatalf("link Secret data keys = %v, want exactly %v", got, wantLinkKeys)
-			}
-
-			gatewayPriv, rest, _ := strings.Cut(string(bundle.Data[wg.BundleKey]), "\n")
-			linkPub, _, _ := strings.Cut(rest, "\n")
-			linkPriv := string(linkSecret.Data[wg.LinkPrivateKey])
-			gatewayPub := string(linkSecret.Data[wg.LinkPeerPublicKey])
-
-			if got := publicKeyOf(t, gatewayPriv); got != gatewayPub {
-				t.Errorf("public key of the bundle's private key = %q, want the link Secret's peer public key %q", got, gatewayPub)
-			}
-			if got := publicKeyOf(t, linkPriv); got != linkPub {
-				t.Errorf("public key of the link Secret's private key = %q, want the bundle's peer public key %q", got, linkPub)
+			if tt.got != tt.want {
+				t.Errorf("name = %q, want %q", tt.got, tt.want)
 			}
 		})
 	}
 }
 
-// publicKeyOf derives a WireGuard public key from its private key, the relation each key
-// Secret's peer public key must satisfy against the other Secret's private key.
-func publicKeyOf(t *testing.T, privateKey string) string {
-	t.Helper()
-	key, err := wgtypes.ParseKey(privateKey)
-	if err != nil {
-		t.Fatalf("parse private key %q: %v", privateKey, err)
+// hasOpenEgressPort matches the 0.0.0.0/0 peer the link's forward and WireGuard rules use,
+// so the policy holds whether the CNI matches on ClusterIP or on pod IP.
+func hasOpenEgressPort(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol, port int32) bool {
+	for _, r := range rules {
+		open := false
+		for _, peer := range r.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				open = true
+				break
+			}
+		}
+		if !open {
+			continue
+		}
+		for _, p := range r.Ports {
+			if p.Protocol != nil && *p.Protocol == proto && p.Port != nil && p.Port.IntVal == port {
+				return true
+			}
+		}
 	}
-	return key.PublicKey().String()
+	return false
+}
+
+// hasProtocolOnlyEgress reports whether any egress rule permits the whole of proto to a
+// 0.0.0.0/0 peer, the port-less shape an unresolved (named) backend port renders.
+func hasProtocolOnlyEgress(rules []networkingv1.NetworkPolicyEgressRule, proto corev1.Protocol) bool {
+	for _, r := range rules {
+		open := false
+		for _, peer := range r.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "0.0.0.0/0" {
+				open = true
+				break
+			}
+		}
+		if !open {
+			continue
+		}
+		for _, p := range r.Ports {
+			if p.Protocol != nil && *p.Protocol == proto && p.Port == nil {
+				return true
+			}
+		}
+	}
+	return false
 }

@@ -1,0 +1,24 @@
+worker_processes 1;
+pid /tmp/nginx.pid;
+events {}
+http {
+  access_log off;
+  error_log /dev/stderr warn;
+  client_body_temp_path /tmp/client_temp;
+  proxy_temp_path /tmp/proxy_temp;
+  fastcgi_temp_path /tmp/fastcgi_temp;
+  uwsgi_temp_path /tmp/uwsgi_temp;
+  scgi_temp_path /tmp/scgi_temp;
+
+  server {
+    listen %d;
+
+    location = %s {
+      return 200;
+    }
+
+    location / {
+      return 404;
+    }
+  }
+}

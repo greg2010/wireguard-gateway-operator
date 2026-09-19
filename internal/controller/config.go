@@ -2,7 +2,9 @@
 // key Secrets, link Deployments and RBAC, and optional DNSEndpoints.
 package controller
 
-import "time"
+import (
+	"time"
+)
 
 // Config carries install-wide inputs folded into every Gateway's children, not Gateway spec values.
 // It is populated from the process environment.
@@ -45,4 +47,8 @@ type Config struct {
 	// GCPAddressRefreshInterval paces the periodic instance-detail refresh, an order of
 	// magnitude slower than GCPDiscoveryInterval; it only catches a missed address change.
 	GCPAddressRefreshInterval time.Duration `envconfig:"GATEWAY_GCP_ADDRESS_REFRESH_INTERVAL" default:"10m"`
+
+	// ResponderImage is the default container image for a Gateway's responder workload,
+	// used when the Gateway's own spec.responder.image is unset.
+	ResponderImage string `envconfig:"GATEWAY_RESPONDER_IMAGE" required:"true"`
 }

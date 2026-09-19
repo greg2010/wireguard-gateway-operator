@@ -138,7 +138,7 @@ func TestMirrorStatusMembersShape(t *testing.T) {
 	}
 	result := &gcpmembers.Result{Members: wantMembers, TargetSize: 2}
 
-	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{}, readySignals{LoadBalanced: true}, result); err != nil {
+	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{}, readySignals{LoadBalanced: true}, result, nil); err != nil {
 		t.Fatalf("mirrorStatusWithForwards: %v", err)
 	}
 
@@ -169,14 +169,14 @@ func TestMirrorStatusUnusablePassPreservesMembers(t *testing.T) {
 		{Name: "gw-a", State: wgnetv1alpha1.GatewayGCPMemberActive, TunnelAddress: "10.99.0.1"},
 	}
 	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{}, readySignals{LoadBalanced: true},
-		&gcpmembers.Result{Members: settled}); err != nil {
+		&gcpmembers.Result{Members: settled}, nil); err != nil {
 		t.Fatalf("mirrorStatusWithForwards (settle): %v", err)
 	}
 
 	// An unusable pass: Result carries no Members, only Unusable true.
 	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{},
 		readySignals{LoadBalanced: true, DiscoveryFailed: true, DiscoveryMessage: "unusable"},
-		&gcpmembers.Result{Unusable: true}); err != nil {
+		&gcpmembers.Result{Unusable: true}, nil); err != nil {
 		t.Fatalf("mirrorStatusWithForwards (unusable): %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestMirrorStatusMembersReadiness(t *testing.T) {
 
 			signals := readySignals{LoadBalanced: true, PeerCount: len(tt.members), MembersNotReady: !tt.active}
 			if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{Active: tt.active}, signals,
-				&gcpmembers.Result{Members: tt.members}); err != nil {
+				&gcpmembers.Result{Members: tt.members}, nil); err != nil {
 				t.Fatalf("mirror status: %v", err)
 			}
 
@@ -256,7 +256,7 @@ func TestMirrorStatusMembersReadiness(t *testing.T) {
 			if !tt.active {
 				if err := r.mirrorStatusWithForwards(ctx, gw, "", "", linkStatus{Active: true},
 					readySignals{LoadBalanced: true, PeerCount: len(tt.members)},
-					&gcpmembers.Result{Members: tt.members}); err != nil {
+					&gcpmembers.Result{Members: tt.members}, nil); err != nil {
 					t.Fatalf("mirror cleared member readiness: %v", err)
 				}
 				mustGet(ctx, t, te.client, client.ObjectKeyFromObject(gw), &got)
@@ -385,7 +385,7 @@ func TestReconcileMembersBlockedCleanupSurfacing(t *testing.T) {
 		LinkFaultMessage: ls.FaultMessage,
 		MembersNotReady:  !ls.Active,
 	}
-	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", ls, signals, result); err != nil {
+	if err := r.mirrorStatusWithForwards(ctx, gw, "", "", ls, signals, result, nil); err != nil {
 		t.Fatalf("mirror status: %v", err)
 	}
 

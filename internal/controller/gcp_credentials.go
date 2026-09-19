@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"strings"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -58,4 +59,16 @@ func (c *gcpCredentialCache) clientFor(ctx context.Context, apiReader client.Rea
 	c.hasHash = true
 	c.client = built
 	return c.client, nil
+}
+
+// parseCredentialsSecretRef accepts an empty setting or exactly "<namespace>/<name>".
+func parseCredentialsSecretRef(setting string) (namespace, name string, err error) {
+	if setting == "" {
+		return "", "", nil
+	}
+	namespace, name, found := strings.Cut(setting, "/")
+	if !found || namespace == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("gcp credentials secret %q: want \"<namespace>/<name>\"", setting)
+	}
+	return namespace, name, nil
 }

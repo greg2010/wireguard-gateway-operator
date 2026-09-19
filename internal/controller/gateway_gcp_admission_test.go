@@ -126,6 +126,7 @@ func TestGatewayGCPNameLengthAdmission(t *testing.T) {
 	cl := te.client
 
 	const wantNameBound = "a load-balanced Gateway name is at most 37 characters"
+	const wantGeneralNameBound = "metadata.name must be a DNS-1035 label of at most 53 characters"
 
 	tests := []struct {
 		name        string
@@ -147,6 +148,26 @@ func TestGatewayGCPNameLengthAdmission(t *testing.T) {
 			name:   "38 character name accepted without load balancer",
 			build:  func(ns string) *wgnetv1alpha1.Gateway { return newGateway(strings.Repeat("a", 38), ns, nil, nil) },
 			accept: true,
+		},
+		{
+			name:   "53 character name accepted without load balancer",
+			build:  func(ns string) *wgnetv1alpha1.Gateway { return newGateway("gw-"+strings.Repeat("a", 50), ns, nil, nil) },
+			accept: true,
+		},
+		{
+			name:        "54 character name rejected without load balancer",
+			build:       func(ns string) *wgnetv1alpha1.Gateway { return newGateway("gw-"+strings.Repeat("a", 51), ns, nil, nil) },
+			wantMessage: wantGeneralNameBound,
+		},
+		{
+			name:        "name starting with a digit rejected",
+			build:       func(ns string) *wgnetv1alpha1.Gateway { return newGateway("1gw", ns, nil, nil) },
+			wantMessage: wantGeneralNameBound,
+		},
+		{
+			name:        "dotted name rejected",
+			build:       func(ns string) *wgnetv1alpha1.Gateway { return newGateway("gw.one", ns, nil, nil) },
+			wantMessage: wantGeneralNameBound,
 		},
 	}
 
@@ -291,7 +312,7 @@ func TestGatewayGCPLoadBalancerUpdateAdmission(t *testing.T) {
 	}
 }
 
-// TestGatewayForwardHealthPortAdmission covers: the Cluster-mode TCP/8080 forward CEL
+// TestGatewayForwardHealthPortAdmission covers: the Cluster-mode TCP/27000 forward CEL
 // rule and its UDP/other-policy escapes.
 func TestGatewayForwardHealthPortAdmission(t *testing.T) {
 	ctx := context.Background()
@@ -302,26 +323,55 @@ func TestGatewayForwardHealthPortAdmission(t *testing.T) {
 		name        string
 		forward     wgnetv1alpha1.Forward
 		policy      wgnetv1alpha1.TrafficPolicy
+		healthPort  int32
 		accept      bool
 		wantMessage string
 	}{
 		{
-			name:        "cluster forward 8080 TCP rejected at admission",
-			forward:     wgnetv1alpha1.Forward{Port: 8080, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			name:        "cluster forward 27000 TCP rejected at admission",
+			forward:     wgnetv1alpha1.Forward{Port: 27000, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
 			policy:      wgnetv1alpha1.TrafficPolicyCluster,
-			wantMessage: "a TCP forward on port 8080 is rejected under trafficPolicy Cluster",
+			wantMessage: "a TCP forward on spec.link.healthPort (27000 when unset) is rejected under trafficPolicy Cluster",
 		},
 		{
 			name:    "same port udp accepted",
-			forward: wgnetv1alpha1.Forward{Port: 8080, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "web"},
+			forward: wgnetv1alpha1.Forward{Port: 27000, Protocol: wgnetv1alpha1.ProtocolUDP, Service: "web"},
 			policy:  wgnetv1alpha1.TrafficPolicyCluster,
 			accept:  true,
 		},
 		{
 			name:    "same port other policy accepted",
-			forward: wgnetv1alpha1.Forward{Port: 8080, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			forward: wgnetv1alpha1.Forward{Port: 27000, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
 			policy:  wgnetv1alpha1.TrafficPolicyLocal,
 			accept:  true,
+		},
+		{
+			name:        "cluster custom health port forward on it rejected",
+			forward:     wgnetv1alpha1.Forward{Port: 8181, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			policy:      wgnetv1alpha1.TrafficPolicyCluster,
+			healthPort:  8181,
+			wantMessage: "a TCP forward on spec.link.healthPort (27000 when unset) is rejected under trafficPolicy Cluster",
+		},
+		{
+			name:       "cluster custom health port forward on default port accepted",
+			forward:    wgnetv1alpha1.Forward{Port: 27000, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			policy:     wgnetv1alpha1.TrafficPolicyCluster,
+			healthPort: 8181,
+			accept:     true,
+		},
+		{
+			name:        "local healthPort set rejected",
+			forward:     wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			policy:      wgnetv1alpha1.TrafficPolicyLocal,
+			healthPort:  8181,
+			wantMessage: "spec.link.healthPort applies only to trafficPolicy Cluster; a Local Gateway's health port is 27000 plus its link id",
+		},
+		{
+			name:        "healthPort out of range rejected by schema",
+			forward:     wgnetv1alpha1.Forward{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
+			policy:      wgnetv1alpha1.TrafficPolicyCluster,
+			healthPort:  70000,
+			wantMessage: "spec.link.healthPort",
 		},
 	}
 
@@ -332,6 +382,54 @@ func TestGatewayForwardHealthPortAdmission(t *testing.T) {
 
 			gw := newGateway(ns, ns, []wgnetv1alpha1.Forward{tt.forward}, nil)
 			gw.Spec.TrafficPolicy = tt.policy
+			gw.Spec.Link.HealthPort = tt.healthPort
+			assertAdmission(ctx, t, cl, gw, cl.Create(ctx, gw), tt.accept, tt.wantMessage)
+		})
+	}
+}
+
+// TestGatewayResponderAdmission covers: spec.responder.replicas is Cluster-only (the CEL rule
+// added alongside spec.link's), and spec.responder.port is bounded by the schema.
+func TestGatewayResponderAdmission(t *testing.T) {
+	ctx := context.Background()
+	te := setupEnvtest(t)
+	cl := te.client
+
+	tests := []struct {
+		name        string
+		policy      wgnetv1alpha1.TrafficPolicy
+		responder   wgnetv1alpha1.GatewayResponderSpec
+		accept      bool
+		wantMessage string
+	}{
+		{
+			name:        "local with replicas set rejected",
+			policy:      wgnetv1alpha1.TrafficPolicyLocal,
+			responder:   wgnetv1alpha1.GatewayResponderSpec{Replicas: 2},
+			wantMessage: "spec.responder.replicas applies only to trafficPolicy Cluster; Local runs one responder per node",
+		},
+		{
+			name:        "port out of range rejected by schema",
+			policy:      wgnetv1alpha1.TrafficPolicyCluster,
+			responder:   wgnetv1alpha1.GatewayResponderSpec{Port: 70000},
+			wantMessage: "spec.responder.port",
+		},
+		{
+			name:      "cluster with replicas accepted",
+			policy:    wgnetv1alpha1.TrafficPolicyCluster,
+			responder: wgnetv1alpha1.GatewayResponderSpec{Replicas: 3},
+			accept:    true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ns := fmt.Sprintf("responder-admission-%d", i)
+			mustCreate(ctx, t, cl, namespaceWithLabels(ns, nil))
+
+			gw := newGateway(ns, ns, nil, nil)
+			gw.Spec.TrafficPolicy = tt.policy
+			gw.Spec.Responder = tt.responder
 			assertAdmission(ctx, t, cl, gw, cl.Create(ctx, gw), tt.accept, tt.wantMessage)
 		})
 	}
@@ -487,7 +585,7 @@ func TestReconcileReservedHealthPortProvisionsNothing(t *testing.T) {
 			name:       "the only forward takes the reserved health port",
 			forward:    wgnetv1alpha1.Forward{Port: healthPort, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"},
 			wantReason: reasonReservedHealthPort,
-			wantMessage: fmt.Sprintf("1 forward(s) invalid: forward TCP port %d collides with this Local gateway's own health port",
+			wantMessage: fmt.Sprintf("1 forward(s) invalid: forward TCP port %d collides with this gateway's own health port",
 				healthPort),
 			wantEvents: []string{reasonReservedHealthPort},
 		},

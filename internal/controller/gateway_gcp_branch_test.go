@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -200,9 +201,10 @@ func TestReconcileLinkPeerBranch(t *testing.T) {
 		// pass reads back.
 		arrange func(t *testing.T, gw *wgnetv1alpha1.Gateway)
 		// wantPeers renders the expected peer list from the key material the pass generated.
-		wantPeers   func(t *testing.T, ns string, gw *wgnetv1alpha1.Gateway) []link.Peer
-		wantReason  string
-		wantMessage string
+		wantPeers      func(t *testing.T, ns string, gw *wgnetv1alpha1.Gateway) []link.Peer
+		wantHealthPort int32
+		wantReason     string
+		wantMessage    string
 	}{
 		{
 			name:      "load-balanced, MIG not observed",
@@ -211,8 +213,9 @@ func TestReconcileLinkPeerBranch(t *testing.T) {
 			wantPeers: func(*testing.T, string, *wgnetv1alpha1.Gateway) []link.Peer {
 				return []link.Peer{}
 			},
-			wantReason:  reasonMembersNotReady,
-			wantMessage: "no fleet member observed yet",
+			wantHealthPort: 27000,
+			wantReason:     reasonMembersNotReady,
+			wantMessage:    "no fleet member observed yet",
 		},
 		{
 			name:      "load-balanced, MIG not observed, holder pod ready",
@@ -226,8 +229,9 @@ func TestReconcileLinkPeerBranch(t *testing.T) {
 			wantPeers: func(*testing.T, string, *wgnetv1alpha1.Gateway) []link.Peer {
 				return []link.Peer{}
 			},
-			wantReason:  reasonMembersNotReady,
-			wantMessage: "no fleet member observed yet",
+			wantHealthPort: 27000,
+			wantReason:     reasonMembersNotReady,
+			wantMessage:    "no fleet member observed yet",
 		},
 		{
 			name:      "single instance",
@@ -246,7 +250,30 @@ func TestReconcileLinkPeerBranch(t *testing.T) {
 					PersistentKeepalive: int(effectiveWGKeepalive(gw)),
 				}}
 			},
-			wantReason: reasonProvisioning,
+			wantHealthPort: 27000,
+			wantReason:     reasonProvisioning,
+		},
+		{
+			name:      "single instance, custom health port",
+			namespace: "gcp-single-custom-health-port",
+			build: func(ns string) *wgnetv1alpha1.Gateway {
+				gw := newGateway(ns, ns, nil, nil)
+				gw.Spec.Link.HealthPort = 8181
+				return gw
+			},
+			wantPeers: func(t *testing.T, ns string, gw *wgnetv1alpha1.Gateway) []link.Peer {
+				t.Helper()
+				var secret corev1.Secret
+				mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: linkSecretName(gw)}, &secret)
+				return []link.Peer{{
+					Slot:                0,
+					PublicKey:           string(secret.Data[wg.LinkPeerPublicKey]),
+					AllowedIPs:          []string{effectiveWGSubnet(gw)},
+					PersistentKeepalive: int(effectiveWGKeepalive(gw)),
+				}}
+			},
+			wantHealthPort: 8181,
+			wantReason:     reasonProvisioning,
 		},
 	}
 
@@ -267,13 +294,21 @@ func TestReconcileLinkPeerBranch(t *testing.T) {
 			}
 			reconcileOnce(ctx, t, r, gw, "link rendered")
 
+			var responderSvc corev1.Service
+			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: responderComponentName(gw)}, &responderSvc)
+			if responderSvc.Spec.ClusterIP == "" {
+				t.Fatalf("responder service %s/%s has no ClusterIP", ns, responderComponentName(gw))
+			}
+
 			var cm corev1.ConfigMap
 			mustGet(ctx, t, te.client, client.ObjectKey{Namespace: ns, Name: linkComponentName(gw)}, &cm)
 			var rc link.RuntimeConfig
 			decodeJSON(t, cm.Data[linkConfigKey], &rc)
 			want := link.RuntimeConfig{
-				TrafficPolicy: string(wgnetv1alpha1.TrafficPolicyCluster),
-				HealthPort:    clusterHealthPort,
+				TrafficPolicy:   string(wgnetv1alpha1.TrafficPolicyCluster),
+				HealthPort:      int(tt.wantHealthPort),
+				ResponderPort:   int(effectiveResponderPort(gw)),
+				ResponderTarget: responderSvc.Spec.ClusterIP,
 				WireGuard: link.WireGuard{
 					Address: effectiveWGLinkAddress(gw) + "/29",
 					MTU:     int(effectiveWGMTU(gw)),
@@ -472,6 +507,14 @@ func TestWarnSuppressionClearsOnRecovery(t *testing.T) {
 			recorder := &fakeEventRecorder{}
 			r := &GatewayReconciler{Client: te.client, APIReader: te.client, Scheme: te.scheme,
 				Config: reconcileConfig(), Recorder: recorder}
+			responderPodName := "gateway-responder-warn-suppression-" + ns
+			createResponderPod(ctx, t, te.client, ns, responderPodName, "node-a", "10.0.1.5", responderSelectorLabels(gw))
+			t.Cleanup(func() {
+				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: responderPodName}}
+				if err := te.client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+					t.Logf("delete responder pod %s/%s: %v", ns, responderPodName, err)
+				}
+			})
 			reconcileOnce(ctx, t, r, gw, "finalizer")
 			for _, pass := range []struct {
 				name   string
