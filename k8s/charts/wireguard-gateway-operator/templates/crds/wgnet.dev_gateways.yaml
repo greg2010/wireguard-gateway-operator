@@ -244,6 +244,14 @@ spec:
                   Link configures the in-cluster link workload: a Deployment in Cluster mode, a
                   DaemonSet in Local mode. Every value has a default, so the block may be omitted.
                 properties:
+                  healthPort:
+                    description: |-
+                      HealthPort is the port the cloud health check probes on the VM and the link DNATs to
+                      the responder. Cluster only; 27000 when unset. A TCP forward may not use it. Mutable.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
                   nodeSelector:
                     additionalProperties:
                       type: string
@@ -268,6 +276,91 @@ spec:
                 enum:
                 - gcp
                 type: string
+              responder:
+                default: {}
+                description: |-
+                  Responder configures this Gateway's responder workload (Deployment in Cluster mode,
+                  DaemonSet in Local). Every value has a default, so the block may be omitted.
+                properties:
+                  image:
+                    description: |-
+                      Image is the responder container image; empty means the operator default
+                      (GATEWAY_RESPONDER_IMAGE).
+                    type: string
+                  port:
+                    description: Port is the port the responder listens on and the
+                      health DNAT targets; unset means 27000.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  replicas:
+                    description: Replicas is the responder Deployment's replica count.
+                      Cluster only; unset means 2.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  resources:
+                    description: Resources are the responder container's resource
+                      requests and limits.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
               trafficPolicy:
                 default: Cluster
                 description: |-
@@ -348,10 +441,17 @@ spec:
               rule: '!has(self.gcp.loadBalancer) || (self.wireguard.subnet == oldSelf.wireguard.subnet
                 && self.wireguard.gatewayAddress == oldSelf.wireguard.gatewayAddress
                 && self.wireguard.linkAddress == oldSelf.wireguard.linkAddress)'
-            - message: 'a TCP forward on port 8080 is rejected under trafficPolicy
-                Cluster: it is the link''s health port'
-              rule: self.trafficPolicy == 'Local' || !has(self.forwards) || self.forwards.all(f,
-                !(f.protocol == 'TCP' && f.port == 8080))
+            - message: 'a TCP forward on spec.link.healthPort (27000 when unset) is
+                rejected under trafficPolicy Cluster: it is the link''s health port'
+              rule: 'self.trafficPolicy == ''Local'' || !has(self.forwards) || self.forwards.all(f,
+                !(f.protocol == ''TCP'' && f.port == (has(self.link.healthPort) ?
+                self.link.healthPort : 27000)))'
+            - message: spec.link.healthPort applies only to trafficPolicy Cluster;
+                a Local Gateway's health port is 27000 plus its link id
+              rule: self.trafficPolicy != 'Local' || !has(self.link.healthPort)
+            - message: spec.responder.replicas applies only to trafficPolicy Cluster;
+                Local runs one responder per node
+              rule: self.trafficPolicy != 'Local' || !has(self.responder.replicas)
           status:
             properties:
               address:
@@ -501,6 +601,9 @@ spec:
             the prefix at 54'
           rule: '!has(self.spec) || !has(self.spec.gcp) || !has(self.spec.gcp.loadBalancer)
             || size(self.metadata.name) <= 37'
+        - message: 'metadata.name must be a DNS-1035 label of at most 53 characters:
+            the responder Service is named <name>-responder'
+          rule: size(self.metadata.name) <= 53 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:

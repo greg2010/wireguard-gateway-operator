@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -30,7 +31,9 @@ const (
 // +kubebuilder:validation:XValidation:rule="!has(self.forwards) || self.forwards.all(f, !(f.protocol == 'UDP' && f.port == self.wireguard.listenPort))",message="a UDP forward must not use the WireGuard listen port (spec.wireguard.listenPort)"
 // +kubebuilder:validation:XValidation:rule="self.trafficPolicy != 'Local' || self.link.replicas == 1",message="spec.link.replicas applies only to trafficPolicy Cluster; Local runs a DaemonSet on every eligible node"
 // +kubebuilder:validation:XValidation:rule="!has(self.gcp.loadBalancer) || (self.wireguard.subnet == oldSelf.wireguard.subnet && self.wireguard.gatewayAddress == oldSelf.wireguard.gatewayAddress && self.wireguard.linkAddress == oldSelf.wireguard.linkAddress)",message="spec.wireguard.subnet, gatewayAddress and linkAddress are immutable on a load-balanced Gateway"
-// +kubebuilder:validation:XValidation:rule="self.trafficPolicy == 'Local' || !has(self.forwards) || self.forwards.all(f, !(f.protocol == 'TCP' && f.port == 8080))",message="a TCP forward on port 8080 is rejected under trafficPolicy Cluster: it is the link's health port"
+// +kubebuilder:validation:XValidation:rule="self.trafficPolicy == 'Local' || !has(self.forwards) || self.forwards.all(f, !(f.protocol == 'TCP' && f.port == (has(self.link.healthPort) ? self.link.healthPort : 27000)))",message="a TCP forward on spec.link.healthPort (27000 when unset) is rejected under trafficPolicy Cluster: it is the link's health port"
+// +kubebuilder:validation:XValidation:rule="self.trafficPolicy != 'Local' || !has(self.link.healthPort)",message="spec.link.healthPort applies only to trafficPolicy Cluster; a Local Gateway's health port is 27000 plus its link id"
+// +kubebuilder:validation:XValidation:rule="self.trafficPolicy != 'Local' || !has(self.responder.replicas)",message="spec.responder.replicas applies only to trafficPolicy Cluster; Local runs one responder per node"
 type GatewaySpec struct {
 	GCP GatewayGCPSpec `json:"gcp"`
 
@@ -66,6 +69,12 @@ type GatewaySpec struct {
 
 	// DNSHostnames are FQDNs the operator publishes via a DNSEndpoint.
 	DNSHostnames []string `json:"dnsHostnames,omitempty"`
+
+	// Responder configures this Gateway's responder workload (Deployment in Cluster mode,
+	// DaemonSet in Local). Every value has a default, so the block may be omitted.
+	// +optional
+	// +kubebuilder:default={}
+	Responder GatewayResponderSpec `json:"responder,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="!has(self.zones) || self.zones.all(z, z.startsWith(self.region + '-'))",message="spec.gcp.zones entries must be inside spec.gcp.region"
@@ -233,6 +242,38 @@ type GatewayLinkSpec struct {
 	// mode, the DaemonSet's in Local mode.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// HealthPort is the port the cloud health check probes on the VM and the link DNATs to
+	// the responder. Cluster only; 27000 when unset. A TCP forward may not use it. Mutable.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	HealthPort int32 `json:"healthPort,omitempty"`
+}
+
+// GatewayResponderSpec configures this Gateway's responder workload: a Deployment in
+// Cluster mode, a DaemonSet in Local mode. Every value has a default, so the block may be
+// omitted. All fields mutable.
+type GatewayResponderSpec struct {
+	// Image is the responder container image; empty means the operator default
+	// (GATEWAY_RESPONDER_IMAGE).
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// Port is the port the responder listens on and the health DNAT targets; unset means 27000.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
+
+	// Replicas is the responder Deployment's replica count. Cluster only; unset means 2.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas,omitempty"`
+
+	// Resources are the responder container's resource requests and limits.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 type Forward struct {
@@ -358,6 +399,7 @@ type GatewayStatus struct {
 // +kubebuilder:printcolumn:name="Policy",type=string,JSONPath=`.spec.trafficPolicy`
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.link.activeNode`,priority=1
 // +kubebuilder:validation:XValidation:rule="!has(self.spec) || !has(self.spec.gcp) || !has(self.spec.gcp.loadBalancer) || size(self.metadata.name) <= 37",message="a load-balanced Gateway name is at most 37 characters: the instance template name prefix appends a 17-character revision suffix and GCP caps the prefix at 54"
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 53 && self.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$')",message="metadata.name must be a DNS-1035 label of at most 53 characters: the responder Service is named <name>-responder"
 
 type Gateway struct {
 	metav1.TypeMeta   `json:",inline"`
