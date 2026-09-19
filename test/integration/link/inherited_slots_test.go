@@ -6,9 +6,7 @@ package linkint
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
@@ -25,8 +23,8 @@ const (
 	inCoResidentLinkID = 17
 )
 
-// TestInheritedSlotIsHeldFencedAndTornDown handles a crashed holder's inherited slot.
-func TestInheritedSlotIsHeldFencedAndTornDown(t *testing.T) {
+// TestInheritedSlotIsHeldAndTornDown handles a crashed holder's inherited slot.
+func TestInheritedSlotIsHeldAndTornDown(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -55,14 +53,6 @@ func TestInheritedSlotIsHeldFencedAndTornDown(t *testing.T) {
 		t.Fatalf("inherited slots = %v, want %v", held, want)
 	}
 
-	// A held slot is not an applied one, so the fence this replica installs admits the health
-	// port on loopback alone.
-	netns.Apply(ctx, t, ctr, link.FencingRuleset(current, nil))
-	listing := netns.List(ctx, t, ctr, "table", "inet", "fence-"+gwIdent.NftTable)
-	if want := fenceListing(gwIdent); listing != want {
-		t.Errorf("fencing input chain listing = %q, want %q", listing, want)
-	}
-
 	// The standby's first pass: every held slot the config does not list is torn down, and no
 	// slot is brought up.
 	inherited := current
@@ -74,17 +64,6 @@ func TestInheritedSlotIsHeldFencedAndTornDown(t *testing.T) {
 	if got := gatewayInterfaces(ctx, t, ctr, inCoResidentLinkID); !slices.Equal(got, []string{coResident.Interface}) {
 		t.Errorf("co-resident gateway %d interfaces = %v, want %v", inCoResidentLinkID, got, []string{coResident.Interface})
 	}
-}
-
-// fenceListing is the fencing table the kernel lists back for a replica admitting the health port
-// on loopback alone, which is every replica that has applied no slot.
-func fenceListing(gwIdent link.GatewayIdentity) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "table inet fence-%s {\n\tchain input {\n", gwIdent.NftTable)
-	b.WriteString("\t\ttype filter hook input priority filter; policy accept;\n")
-	fmt.Fprintf(&b, "\t\ttcp dport %d iifname \"lo\" accept\n", gwIdent.HealthPort)
-	fmt.Fprintf(&b, "\t\ttcp dport %d drop\n\t}\n}\n", gwIdent.HealthPort)
-	return b.String()
 }
 
 // nodeLinkNames is the enumeration of the node's link names the startup discovery reads.

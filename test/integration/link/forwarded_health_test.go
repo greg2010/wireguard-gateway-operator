@@ -1,12 +1,13 @@
 package linkint
 
-// A member's broken data plane or sysctl withholds only that member's forwarded probe.
+// The holder DNATs the health port to a responder pod on its own node, the same way it DNATs a
+// forward: reachability through that path is the probe's verdict.
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,28 +19,15 @@ import (
 )
 
 const (
-	fhLinkID       = 9
-	fhHealthPort   = 27009
-	fhProbeTimeout = 5 * time.Second
+	fhLinkID        = 9
+	fhHealthPort    = 27009
+	fhResponderIP   = "10.94.0.2"
+	fhResponderPort = 8080
+	fhNodeName      = "fh-node"
 )
 
-// fhEchoScript answers every connection to port with "OK\n" once, the minimal proof a probe
-// reached a live local listener.
-func fhEchoScript(port int) string {
-	return fmt.Sprintf(`import socket
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("0.0.0.0", %d))
-srv.listen(16)
-while True:
-    conn, _ = srv.accept()
-    conn.sendall(b"OK\n")
-    conn.close()
-`, port)
-}
-
-// fhLocalTopologyScript wires client <-> vm <-> node, the same shape localTopologyScript builds,
-// minus the backend netns: forwarded-health traffic terminates on the node itself.
+// fhLocalTopologyScript wires client <-> vm <-> node, plus a responder netns reached from the
+// node over its own veth, standing in for a pod on the node's network.
 func fhLocalTopologyScript(iface string) string {
 	return fmt.Sprintf(`set -e
 ip netns add client
@@ -73,11 +61,21 @@ ip netns exec sink ip addr add 192.0.2.2/24 dev ds-sink
 ip netns exec sink ip link set ds-sink up
 ip netns exec sink ip link set lo up
 
+ip netns add responder
+ip link add fh-nd type veth peer name fh-rp
+ip link set fh-rp netns responder
+ip addr add 10.94.0.1/24 dev fh-nd
+ip link set fh-nd up
+ip netns exec responder ip addr add %[2]s/24 dev fh-rp
+ip netns exec responder ip link set fh-rp up
+ip netns exec responder ip link set lo up
+ip netns exec responder ip route add default via 10.94.0.1
+
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv4.conf.all.rp_filter=0
 sysctl -w net.ipv4.conf.%[1]s.rp_filter=0
 ip route replace default via 192.0.2.2 dev ds-nd
-`, iface)
+`, iface, fhResponderIP)
 }
 
 // fhVMRuleset DNATs every port but 51820 to the node's tunnel address, matching
@@ -97,197 +95,89 @@ table inet gateway {
 }
 `
 
-// TestForwardedHealth checks forwarded health through the fence.
+// fhRuntimeConfig is the Local single-slot fixture health-forwarding tests build on. A blank
+// responderIP omits the Responders entry, rendering no health DNAT.
+func fhRuntimeConfig(responderIP string) link.RuntimeConfig {
+	gwIdent := link.NewGatewayIdentity(fhLinkID)
+	rc := link.RuntimeConfig{
+		TrafficPolicy: link.TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		HealthPort:    fhHealthPort,
+		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB="}}},
+		ResponderPort: fhResponderPort,
+	}
+	if responderIP != "" {
+		rc.Responders = map[string]string{fhNodeName: responderIP}
+	}
+	return rc
+}
+
+// TestForwardedHealth checks the health probe forwarded to a responder pod through the tunnel.
 func TestForwardedHealth(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	gwIdent := link.NewGatewayIdentity(fhLinkID)
 	slotIdent := link.NewSlotIdentity(fhLinkID, 0)
-	rc := link.RuntimeConfig{
-		TrafficPolicy: link.TrafficPolicyLocal,
-		Identity:      &gwIdent,
-		HealthPort:    fhHealthPort,
-		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB="}}},
-	}
+	rc := fhRuntimeConfig(fhResponderIP)
 
-	ctr := netns.Start(ctx, t, "python3")
+	ctr := netns.Start(ctx, t, "python3", "conntrack-tools")
 	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", fhLocalTopologyScript(slotIdent.Interface)); code != 0 {
 		t.Fatalf("set up local netns topology (exit %d):\n%s", code, out)
 	}
 	programLocalRoutes(ctx, t, ctr, slotIdent, nil)
-	netns.Apply(ctx, t, ctr, link.FencingRuleset(rc, []int{0}))
-	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, nil))
+	netns.Apply(ctx, t, ctr, renderRulesetOnNode(t, rc, nil, fhNodeName))
 	applyInNetns(ctx, t, ctr, "vm", fhVMRuleset)
-	startEcho(ctx, t, ctr, fhHealthPort)
+	startForwardedResponder(ctx, t, ctr, fhResponderPort)
 
-	t.Run("local forwarded probe external source returns through tunnel", func(t *testing.T) {
-		before := outputReplyPackets(ctx, t, ctr, gwIdent.NftTable, slotIdent)
-		if got := fhProbe(ctx, t, ctr); got != "OK" {
-			t.Fatalf("probe through the fenced tunnel = %q, want %q", got, "OK")
+	t.Run("local_forwarded_probe_external_source_returns_through_tunnel", func(t *testing.T) {
+		if got := probeFrom(ctx, t, ctr, pfHTTPProbe, "client", "10.0.1.1", fhHealthPort); got != "HTTP/1.1 200 OK" {
+			t.Fatalf("probe through the tunnel to the responder = %q, want %q", got, "HTTP/1.1 200 OK")
 		}
-		if got := outputReplyPackets(ctx, t, ctr, gwIdent.NftTable, slotIdent) - before; got < 1 {
-			t.Errorf("health reply counter delta = %d, want greater than zero", got)
-		}
-	})
-
-	t.Run("local reply route correct before and after mark restore", func(t *testing.T) {
-		if iface := routeGetInterface(ctx, t, ctr, slotIdent, false); iface != "ds-nd" {
-			t.Fatalf("unmarked route to the prober uses %q, want decoy %q", iface, "ds-nd")
-		}
-		if iface := routeGetInterface(ctx, t, ctr, slotIdent, true); iface != slotIdent.Interface {
-			t.Fatalf("marked route to the prober uses %q, want slot interface %q", iface, slotIdent.Interface)
-		}
-		before := outputReplyPackets(ctx, t, ctr, gwIdent.NftTable, slotIdent)
-		if got := fhProbe(ctx, t, ctr); got != "OK" {
-			t.Fatalf("probe through the fenced tunnel = %q, want %q", got, "OK")
-		}
-		if got := outputReplyPackets(ctx, t, ctr, gwIdent.NftTable, slotIdent) - before; got < 1 {
-			t.Errorf("output reply-rule packet delta = %d, want greater than zero", got)
+		if got := conntrackDNATCount(ctx, t, ctr, fhHealthPort, fhResponderIP); got != 1 {
+			t.Errorf("conntrack entries DNATing the health port to the responder = %d, want exactly 1", got)
 		}
 	})
 }
 
-type linkStatistics struct {
-	Stats64 struct {
-		RX struct {
-			Packets uint64 `json:"packets"`
-		} `json:"rx"`
-		TX struct {
-			Packets uint64 `json:"packets"`
-		} `json:"tx"`
-	} `json:"stats64"`
-}
-
-func interfacePacketCount(ctx context.Context, t testing.TB, ctr testcontainers.Container, ns, iface, direction string) uint64 {
-	t.Helper()
-	args := []string{"ip", "-j", "-s", "link", "show", "dev", iface}
-	if ns != "" {
-		args = append([]string{"ip", "netns", "exec", ns}, args...)
-	}
-	code, out := netns.Exec(ctx, t, ctr, args...)
-	if code != 0 {
-		t.Fatalf("ip link statistics for %s failed (exit %d):\n%s", iface, code, out)
-	}
-	var stats []linkStatistics
-	if err := json.Unmarshal([]byte(out), &stats); err != nil || len(stats) != 1 {
-		t.Fatalf("decode link statistics for %s: %v\n%s", iface, err, out)
-	}
-	if direction == "rx" {
-		return stats[0].Stats64.RX.Packets
-	}
-	return stats[0].Stats64.TX.Packets
-}
-
-func routeGetInterface(ctx context.Context, t testing.TB, ctr testcontainers.Container, id link.SlotIdentity, marked bool) string {
-	t.Helper()
-	args := []string{"ip", "-j", "route", "get", "10.0.1.2", "from", "10.99.0.2"}
-	if marked {
-		args = append(args, "mark", id.Mark)
-	}
-	code, out := netns.Exec(ctx, t, ctr, args...)
-	if code != 0 {
-		t.Fatalf("ip route get failed (exit %d):\n%s", code, out)
-	}
-	var routes []struct {
-		Dev string `json:"dev"`
-	}
-	if err := json.Unmarshal([]byte(out), &routes); err != nil || len(routes) != 1 || routes[0].Dev == "" {
-		t.Fatalf("decode route lookup: %v\n%s", err, out)
-	}
-	return routes[0].Dev
-}
-
-func outputReplyPackets(ctx context.Context, t testing.TB, ctr testcontainers.Container, table string, id link.SlotIdentity) uint64 {
-	t.Helper()
-	code, out := netns.Exec(ctx, t, ctr, "nft", "list", "chain", "inet", table, "output")
-	if code != 0 {
-		t.Fatalf("nft list output chain failed (exit %d):\n%s", code, out)
-	}
-	linePattern := regexp.MustCompile(`(?m)^.*tcp sport ` + strconv.Itoa(fhHealthPort) + `.*` + regexp.QuoteMeta(id.Mark) + `.*counter packets ([0-9]+).*$`)
-	match := linePattern.FindStringSubmatch(out)
-	if len(match) != 2 {
-		t.Fatalf("output chain has no health reply rule for %s:\n%s", id.Interface, out)
-	}
-	packets, err := strconv.ParseUint(match[1], 10, 64)
+// TestForwardedHealthNoResponderRendersNoHealthDNAT pins that a node absent from Responders
+// renders a prerouting chain carrying exactly the forwards' DNAT lines.
+func TestForwardedHealthNoResponderRendersNoHealthDNAT(t *testing.T) {
+	rc := fhRuntimeConfig("")
+	forward := link.ResolvedForward{Name: "tcp-8443", PublicPort: 8443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080}
+	out, err := link.RenderNftables(rc, []link.ResolvedForward{forward}, fhNodeName)
 	if err != nil {
-		t.Fatalf("parse output reply-rule packets %q: %v", match[1], err)
+		t.Fatalf("RenderNftables: %v", err)
 	}
-	return packets
+	want := []string{
+		"type nat hook prerouting priority dstnat; policy accept;",
+		fmt.Sprintf(`iifname %q tcp dport 8443 counter dnat ip to 10.244.1.7 : 9080`, link.NewSlotIdentity(fhLinkID, 0).Interface),
+	}
+	if got := renderedChainLines(t, out, "prerouting"); !slices.Equal(got, want) {
+		t.Errorf("prerouting chain with no responder entry = %v, want exactly the forwards' DNAT lines %v", got, want)
+	}
 }
 
-// startEcho launches an echo listener on port in the container's own (node) netns and waits for
-// it to bind before returning, so no probe races the listener.
-func startEcho(ctx context.Context, t testing.TB, ctr testcontainers.Container, port int) {
+// renderedChainLines returns chain's rendered lines, trimmed of indentation, in the exact order
+// RenderNftables emitted them.
+func renderedChainLines(t testing.TB, ruleset, chain string) []string {
 	t.Helper()
-	path := fmt.Sprintf("/tmp/echo_%d.py", port)
-	if err := ctr.CopyToContainer(ctx, []byte(fhEchoScript(port)), path, 0o644); err != nil {
-		t.Fatalf("copy echo script for port %d: %v", port, err)
-	}
-	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", "python3 "+path+" &"); code != 0 {
-		t.Fatalf("start echo on port %d (exit %d):\n%s", port, code, out)
-	}
-	want := fmt.Sprintf(":%d", port)
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		code, out := netns.Exec(ctx, t, ctr, "ss", "-ltn")
-		if code == 0 && strings.Contains(out, want) {
-			return
+	lines := []string{}
+	inChain := false
+	for line := range strings.SplitSeq(ruleset, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "chain "+chain+" {":
+			inChain = true
+		case inChain && trimmed == "}":
+			return lines
+		case inChain && trimmed != "":
+			lines = append(lines, trimmed)
 		}
-		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatalf("echo listener did not bind %s within deadline", want)
-}
-
-// fhProbe dials the VM's public address at the health port from the client netns, returning the
-// echoed reply with its trailing newline trimmed, or "" on any failure.
-func fhProbe(ctx context.Context, t testing.TB, ctr testcontainers.Container) string {
-	t.Helper()
-	if err := ctr.CopyToContainer(ctx, []byte(probeScript), "/tmp/fh_probe.py", 0o644); err != nil {
-		t.Fatalf("copy probe script: %v", err)
-	}
-	secs := fmt.Sprintf("%.0f", fhProbeTimeout.Seconds())
-	cmd := fmt.Sprintf("ip netns exec client python3 /tmp/fh_probe.py 10.0.1.1 %d %s", fhHealthPort, secs)
-	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd)
-	if code != 0 {
-		t.Fatalf("probe exec failed (exit %d):\n%s", code, out)
-	}
-	return parseMarker(out)
-}
-
-// TestClusterForwardedProbeWithMasquerade checks the Cluster probe with masquerading.
-func TestClusterForwardedProbeWithMasquerade(t *testing.T) {
-	testcontainers.SkipIfProviderIsNotHealthy(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-	defer cancel()
-
-	ctr := startDataPathContainer(ctx, t)
-
-	rc := twoPeerClusterRC()
-	rc.HealthPort = fhHealthPort
-	forward := link.ResolvedForward{Name: "svc", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPA, TargetPort: dpTargetPort}
-	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, []link.ResolvedForward{forward}))
-	startEcho(ctx, t, ctr, fhHealthPort)
-
-	if got := probeOnce(ctx, t, ctr); got != dpMarkerA {
-		t.Errorf("forward probe through masquerading ruleset = %q, want %q", got, dpMarkerA)
-	}
-
-	if err := ctr.CopyToContainer(ctx, []byte(probeScript), "/tmp/health_probe.py", 0o644); err != nil {
-		t.Fatalf("copy health probe script: %v", err)
-	}
-	secs := fmt.Sprintf("%.0f", fhProbeTimeout.Seconds())
-	cmd := fmt.Sprintf("ip netns exec client python3 /tmp/health_probe.py 10.99.0.2 %d %s", fhHealthPort, secs)
-	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd)
-	if code != 0 {
-		t.Fatalf("health probe exec failed (exit %d):\n%s", code, out)
-	}
-	if got := parseMarker(out); got != "OK" {
-		t.Errorf("health probe through the admitted input rule = %q, want %q", got, "OK")
-	}
+	t.Fatalf("ruleset carries no chain %q:\n%s", chain, ruleset)
+	return nil
 }
 
 // TestMemberScopedFailures keeps member faults scoped to their own probes.
@@ -319,6 +209,36 @@ func TestMemberScopedFailures(t *testing.T) {
 		}
 	})
 
+	t.Run("broken_dnat_on_one_member_fails_only_that_probe (forwarded health)", func(t *testing.T) {
+		healthy := netns.Start(ctx, t, "python3")
+		broken := netns.Start(ctx, t, "python3")
+
+		healthyIdent := link.NewSlotIdentity(fhLinkID, 0)
+		healthyRC := fhRuntimeConfig(fhResponderIP)
+		// The broken member's Responders entry names an address nothing on its node answers:
+		// the health-DNAT equivalent of a misconfigured forward.
+		brokenRC := fhRuntimeConfig("10.94.0.99")
+
+		for _, ctr := range []testcontainers.Container{healthy, broken} {
+			if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", fhLocalTopologyScript(healthyIdent.Interface)); code != 0 {
+				t.Fatalf("set up local netns topology (exit %d):\n%s", code, out)
+			}
+			programLocalRoutes(ctx, t, ctr, healthyIdent, nil)
+			applyInNetns(ctx, t, ctr, "vm", fhVMRuleset)
+		}
+		netns.Apply(ctx, t, healthy, renderRulesetOnNode(t, healthyRC, nil, fhNodeName))
+		netns.Apply(ctx, t, broken, renderRulesetOnNode(t, brokenRC, nil, fhNodeName))
+		startForwardedResponder(ctx, t, healthy, fhResponderPort)
+
+		if got := probeFrom(ctx, t, healthy, pfHTTPProbe, "client", "10.0.1.1", fhHealthPort); got != "HTTP/1.1 200 OK" {
+			t.Errorf("healthy member's forwarded probe = %q, want %q", got, "HTTP/1.1 200 OK")
+		}
+		err := probeErrorFrom(ctx, t, broken, tcpProbe, "client", "10.0.1.1", fhHealthPort)
+		if !isTimeout(err) {
+			t.Errorf("broken member's forwarded probe = %q, want a timeout: its DNAT targets an address nothing answers", err)
+		}
+	})
+
 	t.Run("forwarding sysctl cleared fails only that member", func(t *testing.T) {
 		gwIdent := link.NewGatewayIdentity(fhLinkID)
 		slotIdent := link.NewSlotIdentity(fhLinkID, 0)
@@ -340,6 +260,79 @@ func TestMemberScopedFailures(t *testing.T) {
 			t.Errorf("member with ip_forward=0 forward probe = %q, want a timeout: the kernel must refuse to forward between interfaces", err)
 		}
 	})
+}
+
+// fhClusterResponderScript adds a responder netns reachable over a veth pair, the same shape
+// fhLocalTopologyScript wires for Local, so the Cluster health DNAT has a live target.
+const fhClusterResponderScript = `set -e
+ip netns add responder
+ip link add fh-nd type veth peer name fh-rp
+ip link set fh-rp netns responder
+ip addr add 10.94.0.1/24 dev fh-nd
+ip link set fh-nd up
+ip netns exec responder ip addr add ` + fhResponderIP + `/24 dev fh-rp
+ip netns exec responder ip link set fh-rp up
+ip netns exec responder ip link set lo up
+ip netns exec responder ip route add default via 10.94.0.1
+`
+
+// TestClusterForwardedProbeWithMasquerade checks the Cluster probe with masquerading, DNATed
+// through the tunnel to a responder pod reached over its own veth, the same path a forward takes.
+func TestClusterForwardedProbeWithMasquerade(t *testing.T) {
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	ctr := startDataPathContainer(ctx, t)
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", fhClusterResponderScript); code != 0 {
+		t.Fatalf("set up responder netns (exit %d):\n%s", code, out)
+	}
+	startForwardedResponder(ctx, t, ctr, fhResponderPort)
+
+	rc := twoPeerClusterRC()
+	rc.HealthPort = fhHealthPort
+	rc.ResponderTarget = fhResponderIP
+	rc.ResponderPort = fhResponderPort
+	forward := link.ResolvedForward{Name: "svc", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPA, TargetPort: dpTargetPort}
+	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, []link.ResolvedForward{forward}))
+
+	if got := probeOnce(ctx, t, ctr); got != dpMarkerA {
+		t.Errorf("forward probe through masquerading ruleset = %q, want %q", got, dpMarkerA)
+	}
+
+	if got := probeFrom(ctx, t, ctr, pfHTTPProbe, "client", dpGatewayAddr, fhHealthPort); got != "HTTP/1.1 200 OK" {
+		t.Errorf("health probe through the responder DNAT = %q, want %q", got, "HTTP/1.1 200 OK")
+	}
+	if got := conntrackDNATCount(ctx, t, ctr, fhHealthPort, fhResponderIP); got != 1 {
+		t.Errorf("conntrack entries DNATing the health port to the responder = %d, want exactly 1", got)
+	}
+}
+
+// TestClusterForwardedProbeNoResponderTargetRendersNoHealthDNAT pins that a Cluster config with no
+// ResponderTarget renders only the forwards' DNAT lines, plus the drop in the input chain.
+func TestClusterForwardedProbeNoResponderTargetRendersNoHealthDNAT(t *testing.T) {
+	rc := twoPeerClusterRC()
+	rc.HealthPort = fhHealthPort
+	forward := link.ResolvedForward{Name: "svc", PublicPort: dpRetargetPort, Protocol: "tcp", Target: dpClusterIPA, TargetPort: dpTargetPort}
+	out, err := link.RenderNftables(rc, []link.ResolvedForward{forward}, "")
+	if err != nil {
+		t.Fatalf("RenderNftables: %v", err)
+	}
+	wantPrerouting := []string{
+		"type nat hook prerouting priority dstnat; policy accept;",
+		fmt.Sprintf(`iif "wg0" tcp dport %d dnat ip to %s : %d`, dpRetargetPort, dpClusterIPA, dpTargetPort),
+	}
+	if got := renderedChainLines(t, out, "prerouting"); !slices.Equal(got, wantPrerouting) {
+		t.Errorf("prerouting chain with no responder target = %v, want %v", got, wantPrerouting)
+	}
+	wantInput := []string{
+		"type filter hook input priority filter; policy accept;",
+		`iif "wg0" drop`,
+	}
+	if got := renderedChainLines(t, out, "input"); !slices.Equal(got, wantInput) {
+		t.Errorf("input chain with no responder target = %v, want %v", got, wantInput)
+	}
 }
 
 // isHostUnreachable reports whether a probe failed with EHOSTUNREACH, the outcome a DNAT to an
@@ -371,4 +364,54 @@ func startLocalForwardMember(ctx context.Context, t testing.TB, id link.SlotIden
 		t.Fatalf("set net.ipv4.conf.%s.forwarding=%s failed (exit %d):\n%s", id.Interface, forwardingValue, code, out)
 	}
 	return ctr
+}
+
+type linkStatistics struct {
+	Stats64 struct {
+		RX struct {
+			Packets uint64 `json:"packets"`
+		} `json:"rx"`
+		TX struct {
+			Packets uint64 `json:"packets"`
+		} `json:"tx"`
+	} `json:"stats64"`
+}
+
+// interfacePacketCount reads iface's cumulative rx or tx packet count, from ns when non-empty
+// or the container's own netns otherwise.
+func interfacePacketCount(ctx context.Context, t testing.TB, ctr testcontainers.Container, ns, iface, direction string) uint64 {
+	t.Helper()
+	args := []string{"ip", "-j", "-s", "link", "show", "dev", iface}
+	if ns != "" {
+		args = append([]string{"ip", "netns", "exec", ns}, args...)
+	}
+	code, out := netns.Exec(ctx, t, ctr, args...)
+	if code != 0 {
+		t.Fatalf("ip link statistics for %s failed (exit %d):\n%s", iface, code, out)
+	}
+	var stats []linkStatistics
+	if err := json.Unmarshal([]byte(out), &stats); err != nil || len(stats) != 1 {
+		t.Fatalf("decode link statistics for %s: %v\n%s", iface, err, out)
+	}
+	if direction == "rx" {
+		return stats[0].Stats64.RX.Packets
+	}
+	return stats[0].Stats64.TX.Packets
+}
+
+// conntrackDNATCount counts conntrack entries whose original destination port is healthPort and
+// whose reply source is responderIP, the signature a health probe's DNAT to it leaves.
+func conntrackDNATCount(ctx context.Context, t testing.TB, ctr testcontainers.Container, healthPort int, responderIP string) int {
+	t.Helper()
+	code, out := netns.Exec(ctx, t, ctr, "conntrack", "-L", "-p", "tcp", "--dport", strconv.Itoa(healthPort))
+	if code != 0 && code != 1 {
+		t.Fatalf("conntrack -L failed (exit %d):\n%s", code, out)
+	}
+	count := 0
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(line, "dport="+strconv.Itoa(healthPort)) && strings.Contains(line, "src="+responderIP) {
+			count++
+		}
+	}
+	return count
 }

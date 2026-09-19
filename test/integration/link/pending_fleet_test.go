@@ -22,10 +22,18 @@ const (
 	pfLinkID = 14
 	// pfNodeAddr is the node end of the slot's carrier, the address the probe dials.
 	pfNodeAddr = "10.91.0.1"
+	// pfNodeName is the node name the fixture's Responders entry is keyed on.
+	pfNodeName = "pf-node"
+	// pfResponderAddr is the responder netns's address, reached from the node over a veth
+	// distinct from the slot's carrier, standing in for a pod IP on a real CNI.
+	pfResponderAddr = "10.93.0.2"
+	// pfResponderPort is the responder's container port, distinct from the gateway's health
+	// port so a passing probe proves the DNAT translated both the address and the port.
+	pfResponderPort = 8080
 )
 
-// pfTopologyScript attaches a client netns to the node over a veth named after the slot
-// interface, the carrier a probe arriving through the tunnel takes.
+// pfTopologyScript attaches a client netns over the slot's carrier and a responder netns over a
+// second veth, standing in for a pod on the node's network.
 func pfTopologyScript(iface string) string {
 	return fmt.Sprintf(`set -e
 ip link set lo up
@@ -37,7 +45,17 @@ ip link set %[1]s up
 ip netns exec client ip addr add 10.91.0.2/24 dev c-out
 ip netns exec client ip link set c-out up
 ip netns exec client ip link set lo up
-`, iface, pfNodeAddr)
+
+ip netns add responder
+ip link add pf-nd type veth peer name pf-rp
+ip link set pf-rp netns responder
+ip addr add 10.93.0.1/24 dev pf-nd
+ip link set pf-nd up
+ip netns exec responder ip addr add %[3]s/24 dev pf-rp
+ip netns exec responder ip link set pf-rp up
+ip netns exec responder ip link set lo up
+ip netns exec responder ip route add default via 10.93.0.1
+`, iface, pfNodeAddr, pfResponderAddr)
 }
 
 // pfResponderScript answers every request with a 200, so a probe's verdict is the status line a
@@ -89,37 +107,26 @@ func TestPendingFleetThenFirstMember(t *testing.T) {
 	}
 	oneMember := pending
 	oneMember.WireGuard.Peers = []link.Peer{{Slot: 0, PublicKey: "PUB0=", Endpoint: "203.0.113.1:51820", AllowedIPs: []string{"0.0.0.0/0"}}}
-
-	fenceTable := tableNameOf(t, link.FencingRuleset(pending, nil))
+	oneMember.Responders = map[string]string{pfNodeName: pfResponderAddr}
+	oneMember.ResponderPort = pfResponderPort
 
 	ctr := netns.Start(ctx, t, "python3")
-	netns.Apply(ctx, t, ctr, renderRuleset(t, pending, nil))
-	netns.Apply(ctx, t, ctr, link.FencingRuleset(pending, nil))
+	netns.Apply(ctx, t, ctr, renderRulesetOnNode(t, pending, nil, pfNodeName))
 
 	t.Run("zero peer config programs no slot", func(t *testing.T) {
-		wantTables := []string{"inet " + fenceTable, "inet " + gwIdent.NftTable}
-		if got := gatewayTables(ctx, t, ctr, []string{gwIdent.NftTable, fenceTable}); !slices.Equal(got, wantTables) {
+		wantTables := []string{"inet " + gwIdent.NftTable}
+		if got := gatewayTables(ctx, t, ctr, []string{gwIdent.NftTable}); !slices.Equal(got, wantTables) {
 			t.Errorf("gateway tables = %v, want %v", got, wantTables)
 		}
 
 		wantDataPlane := map[string][]string{
 			"premark":    {"type filter hook prerouting priority mangle; policy accept;"},
-			"output":     {"type route hook output priority mangle; policy accept;"},
 			"prerouting": {"type nat hook prerouting priority dstnat; policy accept;"},
 			"forward":    {"type filter hook forward priority filter; policy accept;"},
 			"input":      {"type filter hook input priority filter; policy accept;"},
 		}
 		if got := tableChains(ctx, t, ctr, gwIdent.NftTable); !reflect.DeepEqual(got, wantDataPlane) {
 			t.Errorf("data-plane table %s = %v, want %v", gwIdent.NftTable, got, wantDataPlane)
-		}
-
-		wantFence := map[string][]string{"input": {
-			"type filter hook input priority filter; policy accept;",
-			fmt.Sprintf("tcp dport %d iifname \"lo\" accept", gwIdent.HealthPort),
-			fmt.Sprintf("tcp dport %d drop", gwIdent.HealthPort),
-		}}
-		if got := tableChains(ctx, t, ctr, fenceTable); !reflect.DeepEqual(got, wantFence) {
-			t.Errorf("fencing table %s = %v, want %v", fenceTable, got, wantFence)
 		}
 
 		if got := gatewayLinkNames(ctx, t, ctr, pfLinkID); !slices.Equal(got, []string{}) {
@@ -131,51 +138,27 @@ func TestPendingFleetThenFirstMember(t *testing.T) {
 		if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", pfTopologyScript(slot0.Interface)); code != 0 {
 			t.Fatalf("set up the pending-fleet topology (exit %d):\n%s", code, out)
 		}
-		startForwardedResponder(ctx, t, ctr, gwIdent.HealthPort)
+		startForwardedResponder(ctx, t, ctr, pfResponderPort)
 		programLocalRoutes(ctx, t, ctr, slot0, nil)
-		netns.Apply(ctx, t, ctr, renderRuleset(t, oneMember, nil))
-		netns.Apply(ctx, t, ctr, link.FencingRuleset(oneMember, []int{0}))
+		netns.Apply(ctx, t, ctr, renderRulesetOnNode(t, oneMember, nil, pfNodeName))
 
 		assertGatewayState(ctx, t, ctr, pfLinkID, wantGatewayState(slot0), "after the first member's config")
 		if got := gatewayLinkNames(ctx, t, ctr, pfLinkID); !slices.Equal(got, []string{slot0.Interface}) {
 			t.Errorf("gateway tunnel interfaces = %v, want %v", got, []string{slot0.Interface})
 		}
 
-		wantInput := []string{
-			"type filter hook input priority filter; policy accept;",
-			fmt.Sprintf("iifname %q tcp dport %d counter accept", slot0.Interface, gwIdent.HealthPort),
-			fmt.Sprintf("iifname %q counter drop", slot0.Interface),
+		wantPrerouting := []string{
+			"type nat hook prerouting priority dstnat; policy accept;",
+			fmt.Sprintf("iifname %q tcp dport %d counter dnat ip to %s:%d", slot0.Interface, gwIdent.HealthPort, pfResponderAddr, pfResponderPort),
 		}
-		if got := tableChains(ctx, t, ctr, gwIdent.NftTable)["input"]; !slices.Equal(got, wantInput) {
-			t.Errorf("data-plane input chain = %v, want %v", got, wantInput)
-		}
-		wantFence := map[string][]string{"input": {
-			"type filter hook input priority filter; policy accept;",
-			fmt.Sprintf("tcp dport %d iifname \"lo\" accept", gwIdent.HealthPort),
-			fmt.Sprintf("tcp dport %d iifname %q accept", gwIdent.HealthPort, slot0.Interface),
-			fmt.Sprintf("tcp dport %d drop", gwIdent.HealthPort),
-		}}
-		if got := tableChains(ctx, t, ctr, fenceTable); !reflect.DeepEqual(got, wantFence) {
-			t.Errorf("fencing table %s = %v, want %v", fenceTable, got, wantFence)
+		if got := tableChains(ctx, t, ctr, gwIdent.NftTable)["prerouting"]; !slices.Equal(got, wantPrerouting) {
+			t.Errorf("data-plane prerouting chain = %v, want %v", got, wantPrerouting)
 		}
 
 		if got := probeFrom(ctx, t, ctr, pfHTTPProbe, "client", pfNodeAddr, gwIdent.HealthPort); got != "HTTP/1.1 200 OK" {
 			t.Errorf("forwarded probe through the first member's slot = %q, want %q", got, "HTTP/1.1 200 OK")
 		}
 	})
-}
-
-// tableNameOf returns the table an nft document creates, read from its `add table` line, so a
-// test names the fencing table the product names rather than restating its spelling.
-func tableNameOf(t testing.TB, ruleset string) string {
-	t.Helper()
-	for line := range strings.SplitSeq(ruleset, "\n") {
-		if name, ok := strings.CutPrefix(strings.TrimSpace(line), "add table inet "); ok {
-			return name
-		}
-	}
-	t.Fatalf("ruleset carries no `add table inet` line:\n%s", ruleset)
-	return ""
 }
 
 // gatewayTables is the loaded tables named in owned, sorted, each as `<family> <name>`.
@@ -253,21 +236,21 @@ func slotInterfaces(gatewayID int) []string {
 	return names
 }
 
-// startForwardedResponder launches the 200-answering listener on port in the node netns and waits
-// for its bind, so no probe races it.
+// startForwardedResponder launches the 200-answering listener on port in the responder netns and
+// waits for its bind, so no probe races it.
 func startForwardedResponder(ctx context.Context, t testing.TB, ctr testcontainers.Container, port int) {
 	t.Helper()
 	path := fmt.Sprintf("/tmp/responder_%d.py", port)
 	if err := ctr.CopyToContainer(ctx, []byte(pfResponderScript(port)), path, 0o644); err != nil {
 		t.Fatalf("copy responder script for port %d: %v", port, err)
 	}
-	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", "python3 "+path+" &"); code != 0 {
+	if code, out := netns.Exec(ctx, t, ctr, "ip", "netns", "exec", "responder", "sh", "-c", "python3 "+path+" &"); code != 0 {
 		t.Fatalf("start responder on port %d (exit %d):\n%s", port, code, out)
 	}
 	want := fmt.Sprintf(":%d", port)
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		code, out := netns.Exec(ctx, t, ctr, "ss", "-ltn")
+		code, out := netns.Exec(ctx, t, ctr, "ip", "netns", "exec", "responder", "ss", "-ltn")
 		if code == 0 && strings.Contains(out, want) {
 			return
 		}

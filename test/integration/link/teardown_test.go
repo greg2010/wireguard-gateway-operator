@@ -14,18 +14,18 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 )
 
-func TestFenceRemovesDataPlane(t *testing.T) {
+func TestTeardownRemovesDataPlane(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
 	ctr := netns.Start(ctx, t)
-	baseline := readFenceState(ctx, t, ctr, nil)
+	baseline := readTeardownState(ctx, t, ctr, nil)
 	createWG0(ctx, t, ctr)
 
 	// The rendered ruleset is the exact document the daemon loads, so the table the
-	// fence deletes is created by production code, not a stand-in.
+	// teardown deletes is created by production code, not a stand-in.
 	forwards := []link.ResolvedForward{
 		{Name: "tcp-svc", PublicPort: 8443, Protocol: "tcp", Target: "10.96.1.1", TargetPort: 443},
 		{Name: "udp-svc", PublicPort: 30000, Protocol: "udp", Target: "10.96.2.2", TargetPort: 9000},
@@ -33,21 +33,21 @@ func TestFenceRemovesDataPlane(t *testing.T) {
 	rc := link.RuntimeConfig{}
 	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, forwards))
 
-	// The fence is only meaningful if there is a data plane to tear down.
+	// The teardown is only meaningful if there is a data plane to tear down.
 	if !ifacePresent(ctx, t, ctr, "wg0") {
-		t.Fatal("precondition failed: wg0 absent before fence")
+		t.Fatal("precondition failed: wg0 absent before teardown")
 	}
 	if !nftTablePresent(ctx, t, ctr, "gateway") {
-		t.Fatal("precondition failed: inet gateway table absent before fence")
+		t.Fatal("precondition failed: inet gateway table absent before teardown")
 	}
 
 	runTeardownPlan(ctx, t, ctr, rc)
 
-	assertFenceState(ctx, t, ctr, nil, baseline, "after fence; want the baseline from before link setup")
+	assertTeardownState(ctx, t, ctr, nil, baseline, "after teardown; want the baseline from before link setup")
 }
 
-// TestLocalFenceRemovesNodeState removes every configured slot's node state.
-func TestLocalFenceRemovesNodeState(t *testing.T) {
+// TestLocalTeardownRemovesNodeState removes every configured slot's node state.
+func TestLocalTeardownRemovesNodeState(t *testing.T) {
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -66,7 +66,7 @@ func TestLocalFenceRemovesNodeState(t *testing.T) {
 
 	ctr := netns.Start(ctx, t)
 	routeTables := []int{slots[0].RouteTable, slots[1].RouteTable}
-	baseline := readFenceState(ctx, t, ctr, routeTables)
+	baseline := readTeardownState(ctx, t, ctr, routeTables)
 	for _, id := range slots {
 		// A dummy stands in for each WireGuard device: the ruleset and the route plan both
 		// name it, and nft resolves iifname at load time.
@@ -82,15 +82,15 @@ func TestLocalFenceRemovesNodeState(t *testing.T) {
 
 	for _, id := range slots {
 		if n := countPlanRules(ctx, t, ctr, id); n != 1 {
-			t.Fatalf("precondition failed: %d ip rules match slot %d's plan before the fence, want 1", n, id.RouteTable)
+			t.Fatalf("precondition failed: %d ip rules match slot %d's plan before the teardown, want 1", n, id.RouteTable)
 		}
 	}
 	if !nftTablePresent(ctx, t, ctr, gwIdent.NftTable) {
-		t.Fatalf("precondition failed: inet %s table absent before the fence", gwIdent.NftTable)
+		t.Fatalf("precondition failed: inet %s table absent before the teardown", gwIdent.NftTable)
 	}
 
 	runTeardownPlan(ctx, t, ctr, rc)
-	assertFenceState(ctx, t, ctr, routeTables, baseline, "after fence; want the baseline from before link setup")
+	assertTeardownState(ctx, t, ctr, routeTables, baseline, "after teardown; want the baseline from before link setup")
 }
 
 // runTeardownPlan runs the product's teardown plan in order. The test programmed every
@@ -100,7 +100,7 @@ func runTeardownPlan(ctx context.Context, t testing.TB, ctr testcontainers.Conta
 	for _, step := range link.TeardownCommands(rc) {
 		code, out := netns.Exec(ctx, t, ctr, append([]string{step.Name}, step.Args...)...)
 		if code != 0 {
-			t.Fatalf("fence: %s %s failed (exit %d):\n%s", step.Name, strings.Join(step.Args, " "), code, out)
+			t.Fatalf("teardown: %s %s failed (exit %d):\n%s", step.Name, strings.Join(step.Args, " "), code, out)
 		}
 	}
 }
@@ -117,28 +117,28 @@ func nftTablePresent(ctx context.Context, t testing.TB, ctr testcontainers.Conta
 	return code == 0
 }
 
-type fenceState struct {
+type teardownState struct {
 	Devices     []string
 	Tables      []string
 	Routes      map[int][]string
 	PolicyRules []string
 }
 
-func readFenceState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) fenceState {
+func readTeardownState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) teardownState {
 	t.Helper()
 	devices := nodeLinkNames(ctx, t, ctr)
 	slices.Sort(devices)
-	return fenceState{
+	return teardownState{
 		Devices:     devices,
 		Tables:      nftTableNames(ctx, t, ctr),
-		Routes:      fenceRoutes(ctx, t, ctr, routeTables),
+		Routes:      teardownRoutes(ctx, t, ctr, routeTables),
 		PolicyRules: jsonEntries(ctx, t, ctr, "ip -j rule show", "ip", "-j", "rule", "show"),
 	}
 }
 
-func assertFenceState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int, want fenceState, stage string) {
+func assertTeardownState(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int, want teardownState, stage string) {
 	t.Helper()
-	got := readFenceState(ctx, t, ctr, routeTables)
+	got := readTeardownState(ctx, t, ctr, routeTables)
 	if !slices.Equal(got.Devices, want.Devices) {
 		t.Errorf("network devices %s = %v, want %v", stage, got.Devices, want.Devices)
 	}
@@ -168,7 +168,7 @@ func nftTableNames(ctx context.Context, t testing.TB, ctr testcontainers.Contain
 	return names
 }
 
-func fenceRoutes(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) map[int][]string {
+func teardownRoutes(ctx context.Context, t testing.TB, ctr testcontainers.Container, routeTables []int) map[int][]string {
 	t.Helper()
 	routes := make(map[int][]string, len(routeTables))
 	for _, table := range routeTables {

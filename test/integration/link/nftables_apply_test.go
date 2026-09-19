@@ -141,11 +141,18 @@ func createWG0(ctx context.Context, t testing.TB, ctr testcontainers.Container) 
 	}
 }
 
-// renderRuleset renders forwards through the production RenderNftables for rc's mode,
-// the same bytes the daemon pipes to `nft -f -`.
+// renderRuleset renders forwards through RenderNftables as a replica with no node name would; a
+// Local caller exercising Responders uses renderRulesetOnNode instead.
 func renderRuleset(t testing.TB, rc link.RuntimeConfig, forwards []link.ResolvedForward) string {
 	t.Helper()
-	out, err := link.RenderNftables(rc, forwards)
+	return renderRulesetOnNode(t, rc, forwards, "")
+}
+
+// renderRulesetOnNode is renderRuleset with the node name RenderNftables uses to pick this
+// replica's entry from rc.Responders.
+func renderRulesetOnNode(t testing.TB, rc link.RuntimeConfig, forwards []link.ResolvedForward, nodeName string) string {
+	t.Helper()
+	out, err := link.RenderNftables(rc, forwards, nodeName)
 	if err != nil {
 		t.Fatalf("RenderNftables: %v", err)
 	}

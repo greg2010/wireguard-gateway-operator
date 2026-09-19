@@ -62,8 +62,8 @@ func TestNftablesRetargetDataPathFollowsClusterIP(t *testing.T) {
 	netns.Apply(ctx, t, ctr, renderRuleset(t, twoPeerClusterRC(), []link.ResolvedForward{forwardB}))
 	assertClusterForwardRules(ctx, t, ctr, []link.ResolvedForward{forwardB}, "after retarget")
 
-	// The production flush runs in the same netns the ruleset was loaded into (the container's
-	// root netns, per setupTopology): the same argv link.Apply would run after the nft -f - step.
+	// The production flush runs in the same netns the ruleset was loaded into (the container's root
+	// netns, per setupTopology): the same argv link's applyConfig would run after the nft -f - step.
 	if code, out := netns.Exec(ctx, t, ctr, append([]string{"conntrack"}, link.ConntrackFlushArgs(forwardA)...)...); code != 0 && !strings.Contains(out, "0 flow entries have been deleted") {
 		t.Fatalf("flush forward A's conntrack entries (exit %d):\n%s", code, out)
 	}
