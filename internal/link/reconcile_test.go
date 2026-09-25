@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +36,9 @@ func observedLogger(t testing.TB) (*zap.SugaredLogger, *observer.ObservedLogs) {
 	core, logs := observer.New(zapcore.DebugLevel)
 	return zap.New(core).Sugar(), logs
 }
+
+// noReassert stands in for the per-pass sysctl re-assert in tests about everything else.
+func noReassert(context.Context, RuntimeConfig) {}
 
 // applyRecorder is an injectable applyFunc that records each apply's peer endpoint, resolved and
 // unsatisfied forwards, and signals every call on a channel so tests wait without sleeping.
@@ -147,7 +151,7 @@ func startWatchAndReload(t *testing.T, body string, r *applyRecorder) (string, c
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", r.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", r.apply, noReassert, testLogger(t))
 	}()
 	return path, cancel, done
 }
@@ -393,7 +397,7 @@ func TestWatchAndReloadReactsToEndpointChange(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, noReassert, testLogger(t))
 	}()
 
 	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
@@ -452,7 +456,7 @@ func TestWatchAndReloadReAddsWatchOnDirRemoval(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", rec.apply, log)
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", rec.apply, noReassert, log)
 	}()
 
 	if ep := waitApply(t, rec); ep != "203.0.113.5:51820" {
@@ -579,7 +583,7 @@ func TestWatchAndReloadAppliesTheSnapshotItDigested(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, noReassert, testLogger(t))
 	}()
 
 	waitApply(t, rec)
@@ -697,7 +701,7 @@ func TestWatchAndReloadPendingForwardDefersOnlyWhenApplied(t *testing.T) {
 			cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 			done := make(chan error, 1)
 			go func() {
-				done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
+				done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, noReassert, testLogger(t))
 			}()
 
 			applyMatching(t, rec, 0, localConfigEndpoint, "web")
@@ -741,7 +745,7 @@ func TestWatchAndReloadTracksAddedForward(t *testing.T) {
 	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, testLogger(t))
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), false, "priv", rec.apply, noReassert, testLogger(t))
 	}()
 
 	// The first apply can precede the web informer's initial list, which resolves
@@ -797,7 +801,7 @@ func startLocalWatchAndReload(ctx context.Context, t *testing.T, ew *endpointWat
 	cfg := Config{ConfigPath: path, ReconcileInterval: 20 * time.Millisecond}
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), keptDataPlane, "priv", rec.apply, log)
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), keptDataPlane, "priv", rec.apply, noReassert, log)
 	}()
 	return logs, done
 }
@@ -1002,7 +1006,7 @@ func TestWatchAndReloadRefusesMismatchedConfig(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				done <- watchAndReload(ctx, cfg, ew, identity, false, "priv", rec.apply, testLogger(t))
+				done <- watchAndReload(ctx, cfg, ew, identity, false, "priv", rec.apply, noReassert, testLogger(t))
 			}()
 
 			assertNoApply(t, rec, 100*time.Millisecond)
@@ -1012,5 +1016,116 @@ func TestWatchAndReloadRefusesMismatchedConfig(t *testing.T) {
 				t.Fatalf("watchAndReload returned error on cancel: %v", err)
 			}
 		})
+	}
+}
+
+// TestWatchAndReloadReassertsSlotSysctls pins that passes with unchanged digests still correct a
+// slot sysctl drifted after the apply, as udev does after ip link add, and leave matching ones.
+func TestWatchAndReloadReassertsSlotSysctls(t *testing.T) {
+	const (
+		rp = HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter"
+		fw = HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding"
+	)
+	sysctls := &fakeSysctls{values: map[string]int{rp: 0, fw: 1}}
+	run := &runRecorder{hook: sysctls.write}
+	rec := newApplyRecorder()
+	log, logs := observedLogger(t)
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfig(t, path, localConfigJSON)
+	cfg := Config{ConfigPath: path, ReconcileInterval: 10 * time.Millisecond}
+	reassert := func(ctx context.Context, rc RuntimeConfig) {
+		reassertSlotSysctls(ctx, run.run, sysctls.read, rc, log)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchAndReload(ctx, cfg, nil, localConfigIdentity(), false, "priv", rec.apply, reassert, log)
+	}()
+	waitApply(t, rec)
+
+	// Two keys are read per pass, so each wait spans at least three more passes.
+	waitReads := func(n int) {
+		t.Helper()
+		target := sysctls.readCount() + n
+		eventually(t, func() bool { return sysctls.readCount() >= target }, "reload passes did not read the slot sysctls")
+	}
+	waitReads(6)
+	if got := stepLines(t, run.snapshot()); !slices.Equal(got, []string{}) {
+		t.Fatalf("commands with matching sysctls = %v, want []", got)
+	}
+
+	sysctls.driftAt(rp, map[string]int{rp: 2, fw: 0})
+	waitReads(6)
+
+	wantCmds := []string{"write " + rp + "=0", "write " + fw + "=1"}
+	if got := stepLines(t, run.snapshot()); !slices.Equal(got, wantCmds) {
+		t.Errorf("commands after drift = %v, want %v", got, wantCmds)
+	}
+	if got := rec.applyCount(); got != 1 {
+		t.Errorf("applies = %d, want 1: the correction must not wait for a digest change", got)
+	}
+	wantLogs := []logRecord{
+		{zapcore.InfoLevel, "re-asserted a drifted slot sysctl", map[string]any{"interface": "wg-gw3", "key": "rp_filter", "found": int64(2), "intended": int64(0)}},
+		{zapcore.InfoLevel, "re-asserted a drifted slot sysctl", map[string]any{"interface": "wg-gw3", "key": "forwarding", "found": int64(0), "intended": int64(1)}},
+	}
+	if got := logRecords(logs.FilterMessage("re-asserted a drifted slot sysctl")); !reflect.DeepEqual(got, wantLogs) {
+		t.Errorf("correction logs = %+v, want %+v", got, wantLogs)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
+	}
+}
+
+// TestWatchAndReloadReassertsSlotSysctlsWhilePending pins that the correction runs on a pass that
+// returns early for a pending watch on a kept data plane, before any apply.
+func TestWatchAndReloadReassertsSlotSysctlsWhilePending(t *testing.T) {
+	const (
+		node = "node-a"
+		rp   = HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter"
+		fw   = HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding"
+	)
+	web := Forward{Name: "web", PublicPort: 443, Protocol: "tcp", Namespace: "default", ServiceName: "web"}
+	cs, release := blockedSliceClientset(t)
+	defer close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ew, err := newEndpointWatcher(ctx, cs, node, []Forward{web}, "gw-ns",
+		labels.SelectorFromSet(map[string]string{"app": "gateway-link"}), time.Minute, testLogger(t))
+	if err != nil {
+		t.Fatalf("newEndpointWatcher: %v", err)
+	}
+
+	sysctls := &fakeSysctls{values: map[string]int{rp: 2, fw: 0}}
+	run := &runRecorder{hook: sysctls.write}
+	rec := newApplyRecorder()
+	path := filepath.Join(t.TempDir(), "config.json")
+	writeConfig(t, path, localConfigJSON)
+	cfg := Config{ConfigPath: path, ReconcileInterval: 10 * time.Millisecond}
+	reassert := func(ctx context.Context, rc RuntimeConfig) {
+		reassertSlotSysctls(ctx, run.run, sysctls.read, rc, testLogger(t))
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- watchAndReload(ctx, cfg, ew, localConfigIdentity(), true, "priv", rec.apply, reassert, testLogger(t))
+	}()
+
+	eventually(t, func() bool { return sysctls.readCount() >= 6 }, "reload passes did not read the slot sysctls")
+
+	wantCmds := []string{"write " + rp + "=0", "write " + fw + "=1"}
+	if got := stepLines(t, run.snapshot()); !slices.Equal(got, wantCmds) {
+		t.Errorf("commands while the watch is pending = %v, want %v", got, wantCmds)
+	}
+	if got := rec.applyCount(); got != 0 {
+		t.Errorf("applies = %d, want 0: the pending forward holds the kept data plane's apply back", got)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("watchAndReload returned error on cancel: %v", err)
 	}
 }

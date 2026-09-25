@@ -397,8 +397,9 @@ func localRC(id int, slots ...int) RuntimeConfig {
 	}
 }
 
-// TestRenderNftablesLocal pins the exact fragment set of the Local ruleset: no masquerade, the
-// premark, DNAT, clamp, forward and input rules. This node carries no Responders entry.
+// TestRenderNftablesLocal pins the exact fragment set of the Local ruleset without a public
+// address: no masquerade, the premark, DNAT, clamp, forward and input rules. This node carries
+// no Responders entry.
 func TestRenderNftablesLocal(t *testing.T) {
 	rc := localRC(3, 0)
 	forwards := []ResolvedForward{
@@ -512,6 +513,283 @@ func TestRenderNftablesLocalResponderDNAT(t *testing.T) {
 			t.Errorf("forward chain = %v, want %v", got, wantForward)
 		}
 	})
+}
+
+// TestRenderNftablesLocalHairpin pins the whole Local ruleset with and without a public address:
+// the hairpin prerouting DNAT, the output DNAT and the backend-to-itself masquerade per forward.
+func TestRenderNftablesLocalHairpin(t *testing.T) {
+	web := ResolvedForward{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9443}
+	plain := ResolvedForward{Name: "tcp-80", PublicPort: 80, Protocol: "tcp", Target: "10.244.1.8", TargetPort: 9080}
+
+	tcs := []struct {
+		name          string
+		slots         []int
+		responders    map[string]string
+		publicAddress string
+		forwards      []ResolvedForward
+		want          string
+	}{
+		{
+			name:     "no_public_address",
+			slots:    []int{0},
+			forwards: []ResolvedForward{web},
+			want: `add table inet gw3
+flush table inet gw3
+table inet gw3 {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000
+		ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3" ct state established,related counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9443 ct state new counter accept
+		iifname "wg-gw3" counter drop
+		oifname "wg-gw3" ct state established,related counter accept
+		oifname "wg-gw3" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "wg-gw3" counter drop
+	}
+}
+`,
+		},
+		{
+			name:          "public_address_one_forward",
+			slots:         []int{0},
+			publicAddress: "203.0.113.10",
+			forwards:      []ResolvedForward{web},
+			want: `add table inet gw3
+flush table inet gw3
+table inet gw3 {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000
+		ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain output {
+		type nat hook output priority -100; policy accept;
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.244.1.7 ip daddr 10.244.1.7 tcp dport 9443 counter masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3" ct state established,related counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9443 ct state new counter accept
+		iifname "wg-gw3" counter drop
+		oifname "wg-gw3" ct state established,related counter accept
+		oifname "wg-gw3" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "wg-gw3" counter drop
+	}
+}
+`,
+		},
+		{
+			name:          "public_address_two_forwards",
+			slots:         []int{0},
+			publicAddress: "203.0.113.10",
+			forwards:      []ResolvedForward{web, plain},
+			want: `add table inet gw3
+flush table inet gw3
+table inet gw3 {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000
+		ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg-gw3" tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+		ip daddr 203.0.113.10 tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain output {
+		type nat hook output priority -100; policy accept;
+		ip daddr 203.0.113.10 tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.244.1.8 ip daddr 10.244.1.8 tcp dport 9080 counter masquerade
+		ip saddr 10.244.1.7 ip daddr 10.244.1.7 tcp dport 9443 counter masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3" ct state established,related counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.8 tcp dport 9080 ct state new counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9443 ct state new counter accept
+		iifname "wg-gw3" counter drop
+		oifname "wg-gw3" ct state established,related counter accept
+		oifname "wg-gw3" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "wg-gw3" counter drop
+	}
+}
+`,
+		},
+		{
+			name:          "public_address_zero_forwards",
+			slots:         []int{0},
+			publicAddress: "203.0.113.10",
+			want: `add table inet gw3
+flush table inet gw3
+table inet gw3 {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000
+		ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain output {
+		type nat hook output priority -100; policy accept;
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3" ct state established,related counter accept
+		iifname "wg-gw3" counter drop
+		oifname "wg-gw3" ct state established,related counter accept
+		oifname "wg-gw3" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "wg-gw3" counter drop
+	}
+}
+`,
+		},
+		{
+			name:          "public_address_two_slots_with_responder",
+			slots:         []int{0, 1},
+			responders:    map[string]string{"node-a": "10.244.2.9"},
+			publicAddress: "203.0.113.10",
+			forwards:      []ResolvedForward{web, plain},
+			want: `add table inet gw3
+flush table inet gw3
+table inet gw3 {
+	chain premark {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname "wg-gw3" ct state new counter ct mark set ct mark and 0x0000ffff or 0x00030000
+		ct direction reply ct mark and 0xffff0000 == 0x00030000 counter meta mark set meta mark and 0x0000ffff or 0x00030000
+		iifname "wg-gw3-1" ct state new counter ct mark set ct mark and 0x0000ffff or 0x01030000
+		ct direction reply ct mark and 0xffff0000 == 0x01030000 counter meta mark set meta mark and 0x0000ffff or 0x01030000
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		iifname "wg-gw3" tcp dport 27003 counter dnat ip to 10.244.2.9 : 9090
+		iifname "wg-gw3" tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		iifname "wg-gw3" tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+		iifname "wg-gw3-1" tcp dport 27003 counter dnat ip to 10.244.2.9 : 9090
+		iifname "wg-gw3-1" tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		iifname "wg-gw3-1" tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+		ip daddr 203.0.113.10 tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain output {
+		type nat hook output priority -100; policy accept;
+		ip daddr 203.0.113.10 tcp dport 80 counter dnat ip to 10.244.1.8 : 9080
+		ip daddr 203.0.113.10 tcp dport 443 counter dnat ip to 10.244.1.7 : 9443
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.244.1.8 ip daddr 10.244.1.8 tcp dport 9080 counter masquerade
+		ip saddr 10.244.1.7 ip daddr 10.244.1.7 tcp dport 9443 counter masquerade
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		oifname "wg-gw3" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3" ct state established,related counter accept
+		iifname "wg-gw3" ip daddr 10.244.2.9 tcp dport 9090 ct state new counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.8 tcp dport 9080 ct state new counter accept
+		iifname "wg-gw3" ip daddr 10.244.1.7 tcp dport 9443 ct state new counter accept
+		iifname "wg-gw3" counter drop
+		oifname "wg-gw3" ct state established,related counter accept
+		oifname "wg-gw3" counter drop
+		oifname "wg-gw3-1" tcp flags syn counter tcp option maxseg size set rt mtu
+		iifname "wg-gw3-1" ct state established,related counter accept
+		iifname "wg-gw3-1" ip daddr 10.244.2.9 tcp dport 9090 ct state new counter accept
+		iifname "wg-gw3-1" ip daddr 10.244.1.8 tcp dport 9080 ct state new counter accept
+		iifname "wg-gw3-1" ip daddr 10.244.1.7 tcp dport 9443 ct state new counter accept
+		iifname "wg-gw3-1" counter drop
+		oifname "wg-gw3-1" ct state established,related counter accept
+		oifname "wg-gw3-1" counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iifname "wg-gw3" counter drop
+		iifname "wg-gw3-1" counter drop
+	}
+}
+`,
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := localRC(3, tc.slots...)
+			rc.PublicAddress = tc.publicAddress
+			rc.ResponderPort = 9090
+			rc.Responders = tc.responders
+			out, err := RenderNftables(rc, tc.forwards, "node-a")
+			if err != nil {
+				t.Fatalf("RenderNftables: %v", err)
+			}
+			if out != tc.want {
+				t.Errorf("rendered ruleset =\n%s\nwant\n%s", out, tc.want)
+			}
+		})
+	}
 }
 
 // TestRenderNftablesLocalMultiSlot covers the Local-mode multi-slot render invariants.

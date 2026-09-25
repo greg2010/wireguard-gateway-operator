@@ -598,6 +598,14 @@ means a second Gateway and a DNS move.
 
 In `Local` mode a Lease elects one active node, preferring nodes that carry a
 ready backend pod for every forward. `status.link.activeNode` names the holder.
+On the active node, pods and host processes that connect to the Gateway's public
+address on a forwarded port reach the local backend directly, without leaving the
+node. A backend that connects to itself through the public address sees the
+node's pod-side address as the client.
+When this redirect is first installed for a port, the operator deletes the
+connection-tracking entries to the public address on that port, so flows that
+started before it are redirected too.
+
 Local mode requires:
 
 - Loose `rp_filter` on every node the link may run on, per
@@ -652,8 +660,10 @@ if this pod acquires the Lease.
 
 `spec.wireguard.linkAddress` (default `10.99.0.2`) may be identical across
 Gateways in either mode. A `Local` link assigns it to that Gateway's own tunnel
-interface in the node's namespace, and every nftables rule, route and routing rule
-it installs selects by interface and firewall mark, never by that address.
+interface in the node's namespace, and no rule, route or routing rule it installs
+selects by that address. The tunnel rules and routes select by interface and
+firewall mark; the hairpin DNATs select by the Gateway's public address and the
+forwarded port, and the hairpin masquerade by the backend address.
 
 ## Cross-namespace forwards
 

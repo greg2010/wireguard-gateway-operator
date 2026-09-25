@@ -57,7 +57,7 @@ func resultsFor(slots []int, failed ...int) []SlotResult {
 // outcome without a real apply.
 func applyPassWith(t *testing.T, d *dataPlane, run runner, rc RuntimeConfig, results []SlotResult) []SlotResult {
 	t.Helper()
-	got, err := d.applyPass(context.Background(), run, rc, func(context.Context, []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+	got, err := d.applyPass(context.Background(), run, rc, func(context.Context, []ResolvedForward, string) ([]SlotResult, []ResolvedForward, error) {
 		return results, nil, nil
 	}, testLogger(t))
 	if err != nil {
@@ -406,8 +406,8 @@ func TestInheritedSlotAdoptedAfterAStandbyRace(t *testing.T) {
 				}
 			}
 
-			results, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-				return applyConfig(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, previous, nil, "", &responderProbeLatch{}, testLogger(t))
+			results, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward, previousAddress string) ([]SlotResult, []ResolvedForward, error) {
+				return applyConfig(ctx, rec.run, rc, "priv", func(context.Context, string) (string, error) { return "", nil }, previous, previousAddress, nil, "", &responderProbeLatch{}, testLogger(t))
 			}, testLogger(t))
 			if err != nil {
 				t.Fatalf("applyPass: %v", err)
@@ -451,7 +451,7 @@ func TestApplyPassThreadsForwards(t *testing.T) {
 			rec := &runRecorder{}
 
 			var previous [][]ResolvedForward
-			apply := func(_ context.Context, prev []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
+			apply := func(_ context.Context, prev []ResolvedForward, _ string) ([]SlotResult, []ResolvedForward, error) {
 				previous = append(previous, prev)
 				if len(previous) == 2 && tc.secondFails {
 					return nil, forwardB, failErr
@@ -495,6 +495,65 @@ func TestApplyPassThreadsForwards(t *testing.T) {
 			}
 			if !reflect.DeepEqual(previous[wantLen-1], forwardA) {
 				t.Errorf("last call's previous = %+v, want %+v", previous[wantLen-1], forwardA)
+			}
+		})
+	}
+}
+
+// TestApplyPassRemembersPublicAddress pins the public address a pass hands the next apply: the
+// last successful apply's, kept across a failure, and empty after the leadership-start reset.
+func TestApplyPassRemembersPublicAddress(t *testing.T) {
+	const addrA, addrB = "198.51.100.7", "198.51.100.9"
+	failErr := errors.New("injected apply failure")
+
+	tcs := []struct {
+		name        string
+		secondAddr  string
+		secondFails bool
+		startCycle  bool
+		// wantHanded is the previous address each of the three passes receives.
+		wantHanded []string
+	}{
+		{name: "successful_apply_is_remembered", secondAddr: addrB, wantHanded: []string{"", addrA, addrB}},
+		{name: "failed_apply_keeps_the_previous_address", secondAddr: addrB, secondFails: true, wantHanded: []string{"", addrA, addrA}},
+		{name: "leadership_start_clears_the_address", secondAddr: addrA, startCycle: true, wantHanded: []string{"", "", addrA}},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			first := dpRuntimeConfig(0)
+			first.PublicAddress = addrA
+			second := dpRuntimeConfig(0)
+			second.PublicAddress = tc.secondAddr
+			d := newDataPlane(first)
+			rec := &runRecorder{}
+
+			var handed []string
+			apply := func(fails bool) func(context.Context, []ResolvedForward, string) ([]SlotResult, []ResolvedForward, error) {
+				return func(_ context.Context, _ []ResolvedForward, previousAddress string) ([]SlotResult, []ResolvedForward, error) {
+					handed = append(handed, previousAddress)
+					if fails {
+						return resultsFor([]int{0}), nil, failErr
+					}
+					return resultsFor([]int{0}), nil, nil
+				}
+			}
+
+			if _, err := d.applyPass(context.Background(), rec.run, first, apply(false), testLogger(t)); err != nil {
+				t.Fatalf("pass 1: %v", err)
+			}
+			if tc.startCycle {
+				d.startLeading()
+			}
+			if _, err := d.applyPass(context.Background(), rec.run, second, apply(tc.secondFails), testLogger(t)); (err != nil) != tc.secondFails {
+				t.Fatalf("pass 2 error = %v, want failure %t", err, tc.secondFails)
+			}
+			if _, err := d.applyPass(context.Background(), rec.run, second, apply(false), testLogger(t)); err != nil {
+				t.Fatalf("pass 3: %v", err)
+			}
+
+			if !slices.Equal(handed, tc.wantHanded) {
+				t.Errorf("previous addresses handed to apply = %q, want %q", handed, tc.wantHanded)
 			}
 		})
 	}
@@ -640,8 +699,8 @@ func TestRulesetFailureHoldsThenTearsDownTheDepartedSlot(t *testing.T) {
 	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
 	pass := func(rec *runRecorder, d *dataPlane, rc RuntimeConfig) error {
-		_, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-			return applyConfig(ctx, rec.run, rc, "priv", resolve, previous, nil, "", &responderProbeLatch{}, testLogger(t))
+		_, err := d.applyPass(context.Background(), rec.run, rc, func(ctx context.Context, previous []ResolvedForward, previousAddress string) ([]SlotResult, []ResolvedForward, error) {
+			return applyConfig(ctx, rec.run, rc, "priv", resolve, previous, previousAddress, nil, "", &responderProbeLatch{}, testLogger(t))
 		}, testLogger(t))
 		return err
 	}
@@ -736,7 +795,7 @@ func TestStandbyPassOtherHolderEvidenceIsPerTerm(t *testing.T) {
 			d := newDataPlane(rc)
 			applyPassWith(t, d, (&runRecorder{}).run, rc, resultsFor([]int{0}))
 			d.observeOtherHolder()
-			d.clearOtherHolder()
+			d.startLeading()
 			if tc.observeNew {
 				d.observeOtherHolder()
 			}

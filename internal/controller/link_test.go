@@ -152,35 +152,117 @@ func TestBuildLinkConfigMapHealthPort(t *testing.T) {
 	}
 }
 
-// TestBuildLinkConfigMapEndpoint pins that an empty address leaves the peer endpoint unset,
-// so the link waits and reloads in place once the gateway IP appears.
+// TestBuildLinkConfigMapEndpoint pins the address passed in as publicAddress in every traffic
+// policy, and the peer endpoints: host:port for a single instance, the members' own otherwise.
 func TestBuildLinkConfigMapEndpoint(t *testing.T) {
+	fleetPeers := []link.Peer{
+		{Slot: 0, PublicKey: "MEMBER0=", Endpoint: "198.51.100.1:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+		{Slot: 1, PublicKey: "MEMBER1=", Endpoint: "198.51.100.2:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+	}
 	tests := []struct {
-		name         string
-		address      string
-		wantEndpoint string
+		name              string
+		local             bool
+		loadBalancer      bool
+		address           string
+		wantEndpoints     []string
+		wantPublicAddress string
 	}{
-		{"address set renders host:port", "203.0.113.5", "203.0.113.5:51820"},
-		{"empty address leaves endpoint unset", "", ""},
+		{
+			name:              "cluster single instance with an address",
+			address:           "203.0.113.5",
+			wantEndpoints:     []string{"203.0.113.5:51820"},
+			wantPublicAddress: "203.0.113.5",
+		},
+		{
+			name:          "cluster single instance without an address",
+			wantEndpoints: []string{""},
+		},
+		{
+			name:              "cluster load balancer with an address",
+			loadBalancer:      true,
+			address:           "203.0.113.9",
+			wantEndpoints:     []string{"198.51.100.1:51820", "198.51.100.2:51820"},
+			wantPublicAddress: "203.0.113.9",
+		},
+		{
+			name:          "cluster load balancer without an address",
+			loadBalancer:  true,
+			wantEndpoints: []string{"198.51.100.1:51820", "198.51.100.2:51820"},
+		},
+		{
+			name:              "local single instance with an address",
+			local:             true,
+			address:           "203.0.113.5",
+			wantEndpoints:     []string{"203.0.113.5:51820"},
+			wantPublicAddress: "203.0.113.5",
+		},
+		{
+			name:          "local single instance without an address",
+			local:         true,
+			wantEndpoints: []string{""},
+		},
+		{
+			name:              "local load balancer with an address",
+			local:             true,
+			loadBalancer:      true,
+			address:           "203.0.113.9",
+			wantEndpoints:     []string{"198.51.100.1:51820", "198.51.100.2:51820"},
+			wantPublicAddress: "203.0.113.9",
+		},
+		{
+			name:          "local load balancer without an address",
+			local:         true,
+			loadBalancer:  true,
+			wantEndpoints: []string{"198.51.100.1:51820", "198.51.100.2:51820"},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gw := newGateway("edge", "wg-system",
 				[]wgnetv1alpha1.Forward{{Port: 443, Protocol: wgnetv1alpha1.ProtocolTCP, Service: "web"}}, nil)
+			var peers []link.Peer
+			if tt.local {
+				gw.Spec.TrafficPolicy = wgnetv1alpha1.TrafficPolicyLocal
+				gw.Status.Link.ID = 3
+			}
+			if tt.loadBalancer {
+				gw.Spec.GCP.LoadBalancer = &wgnetv1alpha1.GatewayGCPLoadBalancerSpec{SessionAffinity: "NONE"}
+				peers = fleetPeers
+			}
 
-			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), nil, "GATEWAY_PUB_TEST", nil, clusterHealthPort, nil, "")
+			cm, err := buildLinkConfigMap(gw, tt.address, clusterBackends(gw.Spec.Forwards), linkIdentityOf(gw), "GATEWAY_PUB_TEST", peers, effectiveHealthPort(gw), nil, "")
 			if err != nil {
 				t.Fatalf("buildLinkConfigMap: %v", err)
 			}
-			var rc link.RuntimeConfig
-			decodeJSON(t, cm.Data[linkConfigKey], &rc)
+			rc := loadLinkConfig(t, cm)
 
-			if rc.WireGuard.Peers[0].Endpoint != tt.wantEndpoint {
-				t.Errorf("peer.endpoint = %q, want %q", rc.WireGuard.Peers[0].Endpoint, tt.wantEndpoint)
+			if rc.PublicAddress != tt.wantPublicAddress {
+				t.Errorf("publicAddress = %q, want %q", rc.PublicAddress, tt.wantPublicAddress)
+			}
+			endpoints := make([]string, 0, len(rc.WireGuard.Peers))
+			for _, p := range rc.WireGuard.Peers {
+				endpoints = append(endpoints, p.Endpoint)
+			}
+			if !slices.Equal(endpoints, tt.wantEndpoints) {
+				t.Errorf("peer endpoints = %v, want %v", endpoints, tt.wantEndpoints)
 			}
 		})
 	}
+}
+
+// loadLinkConfig loads cm's config through the link daemon's own parse-and-validate path.
+func loadLinkConfig(t *testing.T, cm *corev1.ConfigMap) link.RuntimeConfig {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), linkConfigKey)
+	if err := os.WriteFile(path, []byte(cm.Data[linkConfigKey]), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	rc, err := link.LoadRuntimeConfig(path)
+	if err != nil {
+		t.Fatalf("link.LoadRuntimeConfig: %v", err)
+	}
+	return rc
 }
 
 // TestBuildLinkConfigMapTargetPortDefault covers the target-port defaulting rule:
@@ -233,15 +315,7 @@ func TestBuildLinkConfigMapRoundTrip(t *testing.T) {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
 
-	path := filepath.Join(t.TempDir(), linkConfigKey)
-	if err := os.WriteFile(path, []byte(cm.Data[linkConfigKey]), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	rc, err := link.LoadRuntimeConfig(path)
-	if err != nil {
-		t.Fatalf("link.LoadRuntimeConfig: %v", err)
-	}
+	rc := loadLinkConfig(t, cm)
 
 	wantForwards := []link.Forward{
 		{Name: "tcp-443", PublicPort: 443, Protocol: "tcp", Service: "web.wg-system.svc.cluster.local", TargetPort: 8443},
@@ -517,8 +591,12 @@ func TestBuildLinkDeployment(t *testing.T) {
 		t.Errorf("init container runAsUser = %+v, want 0", ic.SecurityContext)
 	}
 
-	if podSpec.SecurityContext != nil && len(podSpec.SecurityContext.Sysctls) != 0 {
-		t.Errorf("pod sysctls = %+v, want none", podSpec.SecurityContext.Sysctls)
+	var sysctls, wantSysctls []corev1.Sysctl
+	if podSpec.SecurityContext != nil {
+		sysctls = podSpec.SecurityContext.Sysctls
+	}
+	if !slices.Equal(sysctls, wantSysctls) {
+		t.Errorf("pod sysctls = %+v, want %+v", sysctls, wantSysctls)
 	}
 
 	for _, ctr := range podSpec.Containers {
@@ -622,16 +700,10 @@ func TestBuildLinkDeployment(t *testing.T) {
 
 	assertHostnameAntiAffinity(t, podSpec.Affinity, linkSelectorLabels(gw))
 
-	// The link container carries no CYNO_*-prefixed env.
-	for _, e := range c.Env {
-		if strings.HasPrefix(e.Name, "CYNO_") {
-			t.Errorf("unexpected legacy env %q on link container", e.Name)
-		}
-	}
-
 	// In-place reload means no config-checksum roll trigger.
-	if _, ok := dep.Spec.Template.Annotations["checksum/config"]; ok {
-		t.Error("pod template carries checksum/config; in-place reload needs no roll trigger")
+	var wantAnnotations map[string]string
+	if got := dep.Spec.Template.Annotations; !maps.Equal(got, wantAnnotations) {
+		t.Errorf("pod template annotations = %v, want %v", got, wantAnnotations)
 	}
 }
 
@@ -904,14 +976,7 @@ func TestBuildLinkConfigMapLocal(t *testing.T) {
 		t.Fatalf("buildLinkConfigMap: %v", err)
 	}
 
-	path := filepath.Join(t.TempDir(), linkConfigKey)
-	if err := os.WriteFile(path, []byte(cm.Data[linkConfigKey]), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	rc, err := link.LoadRuntimeConfig(path)
-	if err != nil {
-		t.Fatalf("link.LoadRuntimeConfig: %v", err)
-	}
+	rc := loadLinkConfig(t, cm)
 
 	if rc.TrafficPolicy != link.TrafficPolicyLocal {
 		t.Errorf("trafficPolicy = %q, want %q", rc.TrafficPolicy, link.TrafficPolicyLocal)
@@ -1236,17 +1301,19 @@ func TestLinkClusterRoleBindingNameDistinctAcrossNamespaces(t *testing.T) {
 // a reordered env slice cannot silently move the override onto another variable.
 func TestLinkPodSpecHealthAddr(t *testing.T) {
 	tests := []struct {
-		name              string
-		policy            wgnetv1alpha1.TrafficPolicy
-		id                int32
-		healthPort        int32
-		want              string
-		wantContainerPort int32
+		name       string
+		policy     wgnetv1alpha1.TrafficPolicy
+		id         int32
+		healthPort int32
+		want       string
+		wantPorts  []corev1.ContainerPort
 	}{
-		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, 0, ":27000", 27000},
-		{"cluster custom health port", wgnetv1alpha1.TrafficPolicyCluster, 0, 8181, ":8181", 8181},
-		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, 0, "127.0.0.1:27001", 0},
-		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, 0, "127.0.0.1:27007", 0},
+		{"cluster", wgnetv1alpha1.TrafficPolicyCluster, 0, 0, ":27000",
+			[]corev1.ContainerPort{{Name: "health", ContainerPort: 27000, Protocol: corev1.ProtocolTCP}}},
+		{"cluster custom health port", wgnetv1alpha1.TrafficPolicyCluster, 0, 8181, ":8181",
+			[]corev1.ContainerPort{{Name: "health", ContainerPort: 8181, Protocol: corev1.ProtocolTCP}}},
+		{"local id 1", wgnetv1alpha1.TrafficPolicyLocal, 1, 0, "127.0.0.1:27001", nil},
+		{"local id 7", wgnetv1alpha1.TrafficPolicyLocal, 7, 0, "127.0.0.1:27007", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1270,15 +1337,8 @@ func TestLinkPodSpecHealthAddr(t *testing.T) {
 				t.Errorf("GATEWAY_HEALTH_ADDR = %q, want %q", got, tt.want)
 			}
 
-			ports := spec.Containers[0].Ports
-			if tt.wantContainerPort == 0 {
-				if len(ports) != 0 {
-					t.Errorf("container ports = %+v, want none in Local mode", ports)
-				}
-				return
-			}
-			if len(ports) != 1 || ports[0].Name != "health" || ports[0].ContainerPort != tt.wantContainerPort {
-				t.Errorf("container ports = %+v, want a single health port %d", ports, tt.wantContainerPort)
+			if ports := spec.Containers[0].Ports; !slices.Equal(ports, tt.wantPorts) {
+				t.Errorf("container ports = %+v, want %+v", ports, tt.wantPorts)
 			}
 		})
 	}

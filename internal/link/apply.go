@@ -122,13 +122,32 @@ func buildApplyCommands(rc RuntimeConfig, wgConfPaths map[int]string, nftRuleset
 			command{name: "wg", args: []string{"syncconf", id.Interface, wgConfPaths[p.Slot]}},
 			command{name: "ip", args: []string{"addr", "replace", rc.WireGuard.Address, "dev", id.Interface}},
 			command{name: "ip", args: linkSetFor(id.Interface)},
-			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/rp_filter", writeValue: "0"},
-			command{writePath: HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/forwarding", writeValue: "1"},
 		)
+		for _, s := range slotSysctls {
+			cmds = append(cmds, slotSysctlCommand(id.Interface, s))
+		}
 		cmds = append(cmds, localRouteCommands(id, targets)...)
 		plans = append(plans, slotPlan{Slot: p.Slot, Cmds: cmds})
 	}
 	return plans, final
+}
+
+// slotSysctl is one per-interface IPv4 sysctl key and the value a Local slot needs.
+type slotSysctl struct {
+	key   string
+	value int
+}
+
+// slotSysctls are written by the pass that creates a slot and re-asserted on every reload pass:
+// on systemd hosts udev re-applies the rp_filter=2 glob asynchronously after ip link add.
+var slotSysctls = [...]slotSysctl{{key: "rp_filter", value: 0}, {key: "forwarding", value: 1}}
+
+func slotSysctlPath(iface, key string) string {
+	return HostProcSysNetPath + "/ipv4/conf/" + iface + "/" + key
+}
+
+func slotSysctlCommand(iface string, s slotSysctl) command {
+	return command{writePath: slotSysctlPath(iface, s.key), writeValue: strconv.Itoa(s.value)}
 }
 
 // localRouteCommands builds the Local route plan from sorted, unique targets: default route, throw
@@ -233,6 +252,36 @@ func conntrackFlushCommands(previous, current []ResolvedForward) []command {
 	return cmds
 }
 
+// hairpinConntrackCommands deletes flows to address on each hairpin port new since previousAddress
+// and previous: a nat chain sees a flow's first packet only, so older flows would bypass the rule.
+func hairpinConntrackCommands(address, previousAddress string, previous, current []ResolvedForward) []command {
+	if address == "" {
+		return nil
+	}
+	type hairpinPort struct {
+		protocol string
+		port     int
+	}
+	installed := make(map[hairpinPort]bool, len(previous))
+	if address == previousAddress {
+		for _, f := range previous {
+			installed[hairpinPort{f.Protocol, f.PublicPort}] = true
+		}
+	}
+	var cmds []command
+	for _, f := range current {
+		if installed[hairpinPort{f.Protocol, f.PublicPort}] {
+			continue
+		}
+		cmds = append(cmds, command{
+			name:            "conntrack",
+			args:            []string{"-D", "-p", f.Protocol, "--orig-dst", address, "--orig-port-dst", strconv.Itoa(f.PublicPort)},
+			tolerateNoFlows: true,
+		})
+	}
+	return cmds
+}
+
 // ResolveFunc resolves a Cluster-mode forward's backend Service to a concrete address.
 type ResolveFunc func(ctx context.Context, host string) (string, error)
 
@@ -275,8 +324,8 @@ type SlotResult struct {
 }
 
 // applyConfig programs network state without concurrent calls; slot failures land in SlotResult.
-// previous is the last-applied forward set (nil on first call); it flushes stale conntrack.
-func applyConfig(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, previous, localForwards []ResolvedForward, nodeName string, latch *responderProbeLatch, log *zap.SugaredLogger) (results []SlotResult, applied []ResolvedForward, err error) {
+// previous and previousAddress are the last apply's forwards and address, for conntrack deletes.
+func applyConfig(ctx context.Context, run runner, rc RuntimeConfig, privKey string, resolve ResolveFunc, previous []ResolvedForward, previousAddress string, localForwards []ResolvedForward, nodeName string, latch *responderProbeLatch, log *zap.SugaredLogger) (results []SlotResult, applied []ResolvedForward, err error) {
 	warnUnansweredProbes(latch, rc, nodeName, log)
 	wgConfPaths, nftRuleset, resolved, cleanup, err := renderConfig(ctx, rc, privKey, resolve, localForwards, nodeName, log)
 	if err != nil {
@@ -338,6 +387,11 @@ func applyConfig(ctx context.Context, run runner, rc RuntimeConfig, privKey stri
 	}
 	if err := flushConntrack(ctx, run, previous, resolved, log); err != nil {
 		return results, nil, err
+	}
+	for _, c := range hairpinConntrackCommands(rc.PublicAddress, previousAddress, previous, resolved) {
+		if err := runStep(ctx, run, c, log); err != nil {
+			return results, nil, fmt.Errorf("delete conntrack for hairpin %s: %w", strings.Join(c.args, " "), err)
+		}
 	}
 	return results, resolved, nil
 }
@@ -630,8 +684,8 @@ func unreadableSysctlFault(node string, err error) preCheckFault {
 	return preCheckFault{Reason: FaultApplyFailed, Message: fmt.Sprintf("%s: %v", node, err)}
 }
 
-// readSysctlInt reads and parses a single-integer sysctl file. A missing, unreadable or
-// unparseable file is an error naming the path; the caller cannot distinguish the cases.
+// readSysctlInt reads and parses a single-integer sysctl file. Every error names the path; a
+// missing file's error wraps os.ErrNotExist.
 func readSysctlInt(path string) (int, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -642,4 +696,37 @@ func readSysctlInt(path string) (int, error) {
 		return 0, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return v, nil
+}
+
+// sysctlReader reads one integer sysctl file. An error wrapping os.ErrNotExist means the file is
+// absent, which for a per-interface key means the interface is.
+type sysctlReader func(path string) (int, error)
+
+// reassertSlotSysctls re-writes every Local slot sysctl whose value differs from slotSysctls and
+// skips a slot whose interface is absent. Failures are logged, not returned: the next pass retries.
+func reassertSlotSysctls(ctx context.Context, run runner, read sysctlReader, rc RuntimeConfig, log *zap.SugaredLogger) {
+	if !rc.isLocal() {
+		return
+	}
+	for _, p := range rc.WireGuard.Peers {
+		iface := NewSlotIdentity(rc.Identity.ID, p.Slot).Interface
+		for _, s := range slotSysctls {
+			found, err := read(slotSysctlPath(iface, s.key))
+			if errors.Is(err, os.ErrNotExist) {
+				break
+			}
+			if err != nil {
+				log.Warnw("read slot sysctl", "interface", iface, "key", s.key, "error", err)
+				continue
+			}
+			if found == s.value {
+				continue
+			}
+			if err := run(ctx, slotSysctlCommand(iface, s)); err != nil {
+				log.Warnw("re-assert slot sysctl", "interface", iface, "key", s.key, "error", err)
+				continue
+			}
+			log.Infow("re-asserted a drifted slot sysctl", "interface", iface, "key", s.key, "found", found, "intended", s.value)
+		}
+	}
 }

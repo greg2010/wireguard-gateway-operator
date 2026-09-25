@@ -106,12 +106,13 @@ type localSlotData struct {
 }
 
 // nftablesLocalData is the render input for Local's per-Gateway table. An empty ResponderIP
-// omits the health DNAT and its forward-chain accept.
+// omits the health DNAT and its forward-chain accept; an empty PublicAddress omits the hairpin.
 type nftablesLocalData struct {
 	Table         string
 	HealthPort    int
 	ResponderIP   string
 	ResponderPort int
+	PublicAddress string
 	Slots         []localSlotData
 	Forwards      []ResolvedForward
 }
@@ -147,6 +148,7 @@ func RenderNftables(rc RuntimeConfig, forwards []ResolvedForward, nodeName strin
 			HealthPort:    rc.HealthPort,
 			ResponderIP:   rc.Responders[nodeName],
 			ResponderPort: rc.ResponderPort,
+			PublicAddress: rc.PublicAddress,
 			Slots:         slots,
 			Forwards:      sorted,
 		}

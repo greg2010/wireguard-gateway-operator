@@ -239,6 +239,31 @@ func TestLoadRuntimeConfigValidation(t *testing.T) {
 			        "wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
 			wantErr: "",
 		},
+		{
+			name:    "public_address_empty_valid",
+			body:    `{"publicAddress":"","wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "",
+		},
+		{
+			name:    "public_address_ipv4_valid",
+			body:    `{"publicAddress":"203.0.113.10","wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: "",
+		},
+		{
+			name:    "public_address_hostname_unparsable",
+			body:    `{"publicAddress":"gateway.example","wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: `publicAddress: ParseAddr("gateway.example"): unexpected character (at "gateway.example")`,
+		},
+		{
+			name:    "public_address_ipv6_invalid",
+			body:    `{"publicAddress":"2001:db8::1","wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: `publicAddress must be an IPv4 address, got "2001:db8::1"`,
+		},
+		{
+			name:    "public_address_unspecified_invalid",
+			body:    `{"publicAddress":"0.0.0.0","wireguard":{"address":"10.0.0.2/32",` + onePeer + `}}`,
+			wantErr: `publicAddress must not be the unspecified address, got "0.0.0.0"`,
+		},
 	}
 
 	for _, tc := range tcs {

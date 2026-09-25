@@ -20,8 +20,11 @@ type dataPlane struct {
 	otherHolder bool
 	// forwards is the forward set the last successful apply programmed, read by the next apply so
 	// it can flush the conntrack entries of whatever tuple no longer appears.
-	forwards   []ResolvedForward
-	probeLatch responderProbeLatch
+	forwards []ResolvedForward
+	// publicAddress is the PublicAddress of the last successful apply this leadership cycle, read by
+	// the next apply so it can delete the flows that predate a newly installed hairpin rule.
+	publicAddress string
+	probeLatch    responderProbeLatch
 }
 
 func newDataPlane(rc RuntimeConfig) *dataPlane {
@@ -43,32 +46,34 @@ func (d *dataPlane) observeOtherHolder() {
 	d.otherHolder = true
 }
 
-func (d *dataPlane) clearOtherHolder() {
+// startLeading resets the per-term state at the start of each leadership cycle: the other-holder
+// evidence and the remembered public address, so the cycle's first apply installs the hairpin anew.
+func (d *dataPlane) startLeading() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.otherHolder = false
+	d.publicAddress = ""
 }
 
 // applyPass records outcomes under the node lock, threading the last successfully applied forward
-// set into apply and storing its returned set only on success.
+// set and public address into apply and storing the new ones only on success.
 func (d *dataPlane) applyPass(ctx context.Context, run runner, current RuntimeConfig,
-	apply func(context.Context, []ResolvedForward) ([]SlotResult, []ResolvedForward, error), log *zap.SugaredLogger) ([]SlotResult, error) {
+	apply func(context.Context, []ResolvedForward, string) ([]SlotResult, []ResolvedForward, error), log *zap.SugaredLogger) ([]SlotResult, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	previous := d.forwards
 	if !current.isLocal() {
-		results, applied, err := apply(ctx, previous)
+		results, applied, err := apply(ctx, d.forwards, d.publicAddress)
 		if err == nil {
-			d.forwards = applied
+			d.forwards, d.publicAddress = applied, current.PublicAddress
 		}
 		return results, err
 	}
 
 	d.rc = current
 	departed := d.teardownSlots(ctx, run, configuredSlots(current), log)
-	results, applied, err := apply(ctx, previous)
+	results, applied, err := apply(ctx, d.forwards, d.publicAddress)
 	if err == nil {
-		d.forwards = applied
+		d.forwards, d.publicAddress = applied, current.PublicAddress
 	}
 	d.record(results)
 	return append(slices.Clone(results), departed...), err

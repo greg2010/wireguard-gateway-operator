@@ -1047,8 +1047,9 @@ func newRunElectionFixture(t *testing.T, namespace, leaseName, podName string) *
 			f.teardowns.Add(1)
 			return nil
 		},
-		timing: fastElectionTiming,
-		log:    testLogger(t),
+		reassert: noReassert,
+		timing:   fastElectionTiming,
+		log:      testLogger(t),
 	}
 	return f
 }

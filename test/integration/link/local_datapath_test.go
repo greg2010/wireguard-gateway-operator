@@ -52,6 +52,16 @@ const (
 	lpEgressPort = 8446
 	// lpProbeTimeout bounds a single in-container probe attempt.
 	lpProbeTimeout = 5 * time.Second
+	// lpNodeBackendSideAddr is the node's address on the backend's link, the masquerade
+	// source of a backend reaching itself.
+	lpNodeBackendSideAddr = "10.244.1.1"
+	// lpDecoyAddr is the decoy device's address, and so the node's source for any address
+	// routed by the main-table default.
+	lpDecoyAddr = "192.0.2.1"
+	// lpHairpinPublicAddr is the gateway's public address in the hairpin test. No netns owns it.
+	lpHairpinPublicAddr = "198.51.100.10"
+	// lpHairpinPodAddr is the address of a client pod on the holder.
+	lpHairpinPodAddr = "10.244.2.2"
 )
 
 // localTopologyScript builds client / vm / node / backend. The node's main-table
@@ -66,40 +76,40 @@ ip netns add backend
 ip link add vc-cl type veth peer name vc-vm
 ip link set vc-cl netns client
 ip link set vc-vm netns vm
-ip netns exec client ip addr add 10.0.1.2/24 dev vc-cl
+ip netns exec client ip addr add %[2]s/24 dev vc-cl
 ip netns exec client ip link set vc-cl up
 ip netns exec client ip link set lo up
-ip netns exec client ip route add default via 10.0.1.1
-ip netns exec vm ip addr add 10.0.1.1/24 dev vc-vm
+ip netns exec client ip route add default via %[3]s
+ip netns exec vm ip addr add %[3]s/24 dev vc-vm
 ip netns exec vm ip link set vc-vm up
 ip netns exec vm ip link set lo up
 
 # vm <-> node (the tunnel stand-in; the node end carries the derived interface name)
 ip link add vt-vm type veth peer name %[1]s
 ip link set vt-vm netns vm
-ip netns exec vm ip addr add 10.99.0.1/24 dev vt-vm
+ip netns exec vm ip addr add %[4]s/24 dev vt-vm
 ip netns exec vm ip link set vt-vm up
-ip netns exec vm ip route add 10.244.1.0/24 via 10.99.0.2
+ip netns exec vm ip route add 10.244.1.0/24 via %[5]s
 ip netns exec vm sysctl -w net.ipv4.ip_forward=1
 ip netns exec vm sysctl -w net.ipv4.conf.all.rp_filter=0
 # The product's route out of the per-Gateway table is a device route, which on this
 # veth stand-in leaves the reply with no link-layer next hop unless the vm end answers
 # for the addresses behind it.
 ip netns exec vm sysctl -w net.ipv4.conf.vt-vm.proxy_arp=1
-ip addr add 10.99.0.2/24 dev %[1]s
+ip addr add %[5]s/24 dev %[1]s
 ip link set %[1]s up
 
 # node <-> backend
 ip link add vb-nd type veth peer name vb-be
 ip link set vb-be netns backend
-ip addr add 10.244.1.1/24 dev vb-nd
+ip addr add %[6]s/24 dev vb-nd
 ip link set vb-nd up
 ip netns exec backend ip link set vb-be up
 ip netns exec backend ip link set lo up
 ip netns exec backend ip addr add 10.244.1.2/24 dev vb-be
-ip netns exec backend ip addr add 10.244.1.7/32 dev vb-be
-ip netns exec backend ip addr add 10.244.1.8/32 dev vb-be
-ip netns exec backend ip route add default via 10.244.1.1
+ip netns exec backend ip addr add %[7]s/32 dev vb-be
+ip netns exec backend ip addr add %[8]s/32 dev vb-be
+ip netns exec backend ip route add default via %[6]s
 
 # node: forwarding on, conf.all rp_filter off, decoy main-table default. The route
 # table and rule that carry the reply are the product's own plan, run separately. The
@@ -112,10 +122,11 @@ sysctl -w net.ipv4.conf.%[1]s.rp_filter=0
 sysctl -w net.ipv4.conf.all.src_valid_mark=1
 sysctl -w net.ipv4.conf.vb-nd.rp_filter=1
 ip link add decoy0 type dummy
-ip addr add 192.0.2.1/24 dev decoy0
+ip addr add %[9]s/24 dev decoy0
 ip link set decoy0 up
 ip route replace default dev decoy0
-`, iface)
+`, iface, lpClientAddr, lpVMPublicAddr, lpVMTunnelAddr, lpTunnelAddr,
+		lpNodeBackendSideAddr, lpPodIP, lpUnprogrammedIP, lpDecoyAddr)
 }
 
 // vmRuleset is the VM half: a catch-all DNAT to the link tunnel address and no
@@ -178,6 +189,7 @@ func TestLocalDataPathPreservesClientSource(t *testing.T) {
 	rc := link.RuntimeConfig{
 		TrafficPolicy: link.TrafficPolicyLocal,
 		Identity:      &gwIdent,
+		PublicAddress: lpVMPublicAddr,
 		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB="}}},
 	}
 	forwards := []link.ResolvedForward{
@@ -289,6 +301,86 @@ func TestLocalDataPathPreservesClientSource(t *testing.T) {
 			t.Errorf("the forward chain's oifname %q drop counted %d packets before the probe and %d after, want an increase; the connection must die on that rule, not elsewhere", ident.Interface, before, after)
 		}
 	})
+}
+
+// hairpinTopologyScript adds a pod netns on the node, as a client pod on the holder, and gives
+// the backend a route to the public address sourced from its pod address, as a real pod has.
+var hairpinTopologyScript = fmt.Sprintf(`set -e
+ip netns add pod
+ip link add vp-nd type veth peer name vp-pd
+ip link set vp-pd netns pod
+ip addr add 10.244.2.1/24 dev vp-nd
+ip link set vp-nd up
+ip netns exec pod ip addr add %[1]s/24 dev vp-pd
+ip netns exec pod ip link set vp-pd up
+ip netns exec pod ip link set lo up
+ip netns exec pod ip route add default via 10.244.2.1
+ip netns exec backend ip route add %[2]s/32 via %[3]s src %[4]s
+`, lpHairpinPodAddr, lpHairpinPublicAddr, lpNodeBackendSideAddr, lpPodIP)
+
+// TestLocalDataPathHairpin proves a client on the holder reaches the forward's backend on the
+// gateway's public address without the tunnel: from a pod, from the node, and from the backend.
+func TestLocalDataPathHairpin(t *testing.T) {
+	testcontainers.SkipIfProviderIsNotHealthy(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	gwIdent := link.NewGatewayIdentity(lpLinkID)
+	ident := link.NewSlotIdentity(lpLinkID, 0)
+
+	ctr := netns.Start(ctx, t, "python3")
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", localTopologyScript(ident.Interface)); code != 0 {
+		t.Fatalf("set up local netns topology (exit %d):\n%s", code, out)
+	}
+	if code, out := netns.Exec(ctx, t, ctr, "sh", "-c", hairpinTopologyScript); code != 0 {
+		t.Fatalf("set up hairpin clients (exit %d):\n%s", code, out)
+	}
+	startPeerBackend(ctx, t, ctr)
+
+	rc := link.RuntimeConfig{
+		TrafficPolicy: link.TrafficPolicyLocal,
+		Identity:      &gwIdent,
+		PublicAddress: lpHairpinPublicAddr,
+		WireGuard:     link.WireGuard{Peers: []link.Peer{{Slot: 0, PublicKey: "PUB="}}},
+	}
+	forwards := []link.ResolvedForward{{Name: "tcp-8443", PublicPort: lpPublicPort, Protocol: "tcp", Target: lpPodIP, TargetPort: lpPodPort}}
+	programLocalRoutes(ctx, t, ctr, ident, []string{lpPodIP})
+	netns.Apply(ctx, t, ctr, renderRuleset(t, rc, forwards))
+
+	tcs := []struct {
+		name     string
+		ns       string
+		wantPeer string
+	}{
+		{
+			name:     "a pod on the holder reaches the backend with its own address",
+			ns:       "pod",
+			wantPeer: lpHairpinPodAddr,
+		},
+		{
+			name:     "the holder node reaches the backend with its own source address",
+			ns:       "",
+			wantPeer: lpDecoyAddr,
+		},
+		{
+			name:     "the backend reaches itself masqueraded to the node's pod-side address",
+			ns:       "backend",
+			wantPeer: lpNodeBackendSideAddr,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			got := probeFrom(ctx, t, ctr, tcpProbe, tc.ns, lpHairpinPublicAddr, lpPublicPort)
+			peer, marker, ok := strings.Cut(got, " ")
+			if !ok || marker != lpMarker {
+				t.Fatalf("probe to %s:%d = %q, want %q with a peer address prefix", lpHairpinPublicAddr, lpPublicPort, got, lpMarker)
+			}
+			if peer != tc.wantPeer {
+				t.Errorf("backend observed peer %q, want %q", peer, tc.wantPeer)
+			}
+		})
+	}
 }
 
 // TestLocalDatapathTwoSlots proves each slot's mark and route table returns its own flow while
@@ -593,8 +685,8 @@ var (
 	udpProbe = probeKind{name: "udp", script: udpProbeScript, path: "/tmp/udp_probe.py"}
 )
 
-// probeFrom runs a probe under ip netns exec ns against addr:port, returning "" on an
-// ERR: line.
+// probeFrom runs a probe under ip netns exec ns against addr:port, or in the node netns when
+// ns is "", returning "" on an ERR: line.
 func probeFrom(ctx context.Context, t testing.TB, ctr testcontainers.Container, kind probeKind, ns, addr string, port int) string {
 	t.Helper()
 	return parseMarker(runProbeScript(ctx, t, ctr, kind, ns, addr, port))
@@ -621,7 +713,10 @@ func runProbeScript(ctx context.Context, t testing.TB, ctr testcontainers.Contai
 		t.Fatalf("copy %s probe script: %v", kind.name, err)
 	}
 	secs := fmt.Sprintf("%.0f", lpProbeTimeout.Seconds())
-	cmd := fmt.Sprintf("ip netns exec %s python3 %s %s %d %s", ns, kind.path, addr, port, secs)
+	cmd := fmt.Sprintf("python3 %s %s %d %s", kind.path, addr, port, secs)
+	if ns != "" {
+		cmd = "ip netns exec " + ns + " " + cmd
+	}
 	code, out := netns.Exec(ctx, t, ctr, "sh", "-c", cmd)
 	if code != 0 {
 		t.Fatalf("%s probe exec failed (exit %d):\n%s", kind.name, code, out)

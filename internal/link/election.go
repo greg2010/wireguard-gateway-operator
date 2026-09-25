@@ -72,7 +72,9 @@ type electionDeps struct {
 	cs        kubernetes.Interface
 	privKey   string
 	reconcile applyFunc
-	timing    electionTiming
+	// reassert is watchAndReload's per-pass correction of drifted node state.
+	reassert func(context.Context, RuntimeConfig)
+	timing   electionTiming
 	// fence removes this replica's data plane. Required: Run populates it with the
 	// Teardown closure for the loaded RuntimeConfig.
 	fence func(ctx context.Context) error
@@ -314,7 +316,7 @@ func (d *electionDeps) runElection(outerCtx, gctx context.Context) error {
 					// Lease past the termination grace period while a voluntary end waits for the fence.
 					acquiredTerm, acquiredTermKnown := readLeaseTransitions(watchCtx, d.cs, d.cfg.PodNamespace, d.cfg.LeaseName, d.log)
 
-					reloadErr := watchAndReload(watchCtx, d.cfg, d.ew, d.identity, keptDataPlane, d.privKey, d.reconcile, d.log)
+					reloadErr := watchAndReload(watchCtx, d.cfg, d.ew, d.identity, keptDataPlane, d.privKey, d.reconcile, d.reassert, d.log)
 					close(reloadDone)
 					cancelWatch()
 					// A return while leadership continues and nothing asked the loop to stop means

@@ -19,7 +19,28 @@ table inet {{ .Table }} {
 		iifname "{{ $s.Interface }}" {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
 {{- end }}
 {{- end }}
+{{- if .PublicAddress }}
+{{- range $f := .Forwards }}
+		ip daddr {{ $.PublicAddress }} {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
+{{- end }}
+{{- end }}
 	}
+{{- if .PublicAddress }}
+
+	chain output {
+		type nat hook output priority -100; policy accept;
+{{- range $f := .Forwards }}
+		ip daddr {{ $.PublicAddress }} {{ $f.Protocol }} dport {{ $f.PublicPort }} counter dnat ip to {{ $f.Target }} : {{ $f.TargetPort }}
+{{- end }}
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+{{- range $f := .Forwards }}
+		ip saddr {{ $f.Target }} ip daddr {{ $f.Target }} {{ $f.Protocol }} dport {{ $f.TargetPort }} counter masquerade
+{{- end }}
+	}
+{{- end }}
 
 	chain forward {
 		type filter hook forward priority filter; policy accept;

@@ -4,14 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestResolveForwards(t *testing.T) {
@@ -299,10 +305,10 @@ func TestApplyIsIdempotent(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
+	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
+	if _, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t)); err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
 
@@ -373,6 +379,191 @@ func TestConntrackFlushCommands(t *testing.T) {
 	}
 }
 
+// TestHairpinConntrackCommands pins which forwards get a conntrack deletion for the public
+// address: every one when the address is new, else only those previous lacked, none without one.
+func TestHairpinConntrackCommands(t *testing.T) {
+	const addr, otherAddr = "198.51.100.7", "198.51.100.9"
+	web := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080}
+	game := ResolvedForward{Name: "game", PublicPort: 30000, Protocol: "udp", Target: "10.244.1.8", TargetPort: 9000}
+	webRetargeted := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.9", TargetPort: 9080}
+	deleteFor := func(address string, f ResolvedForward) command {
+		return command{name: "conntrack", args: []string{"-D", "-p", f.Protocol, "--orig-dst", address, "--orig-port-dst", strconv.Itoa(f.PublicPort)}, tolerateNoFlows: true}
+	}
+
+	tcs := []struct {
+		name            string
+		address         string
+		previousAddress string
+		previous        []ResolvedForward
+		current         []ResolvedForward
+		want            []command
+	}{
+		{
+			name:    "first_install_deletes_every_forward_in_config_order",
+			address: addr,
+			current: []ResolvedForward{web, game},
+			want:    []command{deleteFor(addr, web), deleteFor(addr, game)},
+		},
+		{
+			name:            "unchanged_address_and_forwards",
+			address:         addr,
+			previousAddress: addr,
+			previous:        []ResolvedForward{web, game},
+			current:         []ResolvedForward{web, game},
+			want:            []command{},
+		},
+		{
+			name:            "retargeted_forward_keeps_its_hairpin_port",
+			address:         addr,
+			previousAddress: addr,
+			previous:        []ResolvedForward{web},
+			current:         []ResolvedForward{webRetargeted},
+			want:            []command{},
+		},
+		{
+			name:            "added_forward_only",
+			address:         addr,
+			previousAddress: addr,
+			previous:        []ResolvedForward{web},
+			current:         []ResolvedForward{web, game},
+			want:            []command{deleteFor(addr, game)},
+		},
+		{
+			name:            "changed_address_deletes_every_forward",
+			address:         otherAddr,
+			previousAddress: addr,
+			previous:        []ResolvedForward{web, game},
+			current:         []ResolvedForward{web, game},
+			want:            []command{deleteFor(otherAddr, web), deleteFor(otherAddr, game)},
+		},
+		{
+			name:            "removed_address",
+			previousAddress: addr,
+			previous:        []ResolvedForward{web, game},
+			current:         []ResolvedForward{web, game},
+			want:            []command{},
+		},
+		{
+			name:    "no_address_either_time",
+			current: []ResolvedForward{web, game},
+			want:    []command{},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hairpinConntrackCommands(tc.address, tc.previousAddress, tc.previous, tc.current)
+			if got == nil {
+				got = []command{}
+			}
+			assertCommandPlan(t, got, tc.want)
+		})
+	}
+}
+
+// TestApplyDeletesHairpinConntrack pins where a Local apply runs the hairpin deletions: right
+// after the nft step and the retarget flush, and that a zero-match deletion is a success.
+func TestApplyDeletesHairpinConntrack(t *testing.T) {
+	const addr = "198.51.100.7"
+	id := NewSlotIdentity(3, 0)
+	table := strconv.Itoa(id.RouteTable)
+	web := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.7", TargetPort: 9080}
+	webOld := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.244.1.5", TargetPort: 9080}
+	game := ResolvedForward{Name: "game", PublicPort: 30000, Protocol: "udp", Target: "10.244.1.8", TargetPort: 9000}
+	plan := []string{
+		"ip link show " + id.Interface,
+		"wg syncconf " + id.Interface + " " + wgConfArg,
+		"ip addr replace 10.244.1.7/32 dev " + id.Interface,
+		"ip link set " + id.Interface + " up",
+		"write " + HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/rp_filter=0",
+		"write " + HostProcSysNetPath + "/ipv4/conf/" + id.Interface + "/forwarding=1",
+		"ip route replace default dev " + id.Interface + " table " + table,
+		"ip route flush table " + table + " type throw",
+		"ip route replace throw 10.244.1.7/32 table " + table,
+		"ip route replace throw 10.244.1.8/32 table " + table,
+		"ip rule add fwmark " + id.Mark + "/" + id.MarkMask + " lookup " + table + " priority " + rulePriority,
+		"nft -f -",
+	}
+	noFlows := errors.New("conntrack v1.4.8 (conntrack-tools): 0 flow entries have been deleted")
+
+	tcs := []struct {
+		name            string
+		address         string
+		previousAddress string
+		previous        []ResolvedForward
+		conntrackErr    error
+		wantTail        []string
+	}{
+		{
+			name:     "first_install_deletes_after_the_flush",
+			address:  addr,
+			previous: []ResolvedForward{webOld, game},
+			wantTail: []string{
+				"conntrack " + strings.Join(ConntrackFlushArgs(webOld), " "),
+				"conntrack -D -p tcp --orig-dst " + addr + " --orig-port-dst 443",
+				"conntrack -D -p udp --orig-dst " + addr + " --orig-port-dst 30000",
+			},
+		},
+		{
+			name:            "unchanged_address",
+			address:         addr,
+			previousAddress: addr,
+			previous:        []ResolvedForward{web, game},
+			wantTail:        []string{},
+		},
+		{
+			name:            "removed_address",
+			previousAddress: addr,
+			previous:        []ResolvedForward{web, game},
+			wantTail:        []string{},
+		},
+		{
+			name:         "zero_matches_is_success",
+			address:      addr,
+			previous:     []ResolvedForward{web, game},
+			conntrackErr: noFlows,
+			wantTail: []string{
+				"conntrack -D -p tcp --orig-dst " + addr + " --orig-port-dst 443",
+				"conntrack -D -p udp --orig-dst " + addr + " --orig-port-dst 30000",
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := RuntimeConfig{
+				TrafficPolicy: TrafficPolicyLocal,
+				Identity:      testLocalIdentity(),
+				PublicAddress: tc.address,
+				WireGuard: WireGuard{
+					Address: "10.244.1.7/32",
+					Peers:   []Peer{{Slot: 0, PublicKey: "PUB=", Endpoint: "203.0.113.5:51820", AllowedIPs: []string{"0.0.0.0/0"}}},
+				},
+			}
+			rec := &runRecorder{hook: func(c command) error {
+				if c.name == "conntrack" {
+					return tc.conntrackErr
+				}
+				return nil
+			}}
+			resolve := func(context.Context, string) (string, error) { return "", nil }
+
+			results, applied, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, tc.previous, tc.previousAddress, []ResolvedForward{web, game}, "", &responderProbeLatch{}, testLogger(t))
+			if err != nil {
+				t.Fatalf("Apply: %v", err)
+			}
+			assertSlotOutcomes(t, results, resultsFor([]int{0}))
+			if !reflect.DeepEqual(applied, []ResolvedForward{web, game}) {
+				t.Errorf("applied = %+v, want %+v", applied, []ResolvedForward{web, game})
+			}
+			want := append(slices.Clone(plan), tc.wantTail...)
+			if got := stepLines(t, rec.snapshot()); !slices.Equal(got, want) {
+				t.Errorf("executed steps =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+			}
+		})
+	}
+}
+
 // TestApplyFlushesRetargetedForwards runs Apply twice with a retargeted Cluster forward: the first
 // call's exact plan carries no conntrack step; the second's ends with the nft step then one flush.
 func TestApplyFlushesRetargetedForwards(t *testing.T) {
@@ -391,7 +582,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 	forwardB := ResolvedForward{Name: "web", PublicPort: 443, Protocol: "tcp", Target: "10.96.1.20", TargetPort: 8443}
 
 	first := &runRecorder{}
-	_, applied1, err := applyConfig(context.Background(), first.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
+	_, applied1, err := applyConfig(context.Background(), first.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
@@ -412,7 +603,7 @@ func TestApplyFlushesRetargetedForwards(t *testing.T) {
 	})
 
 	second := &runRecorder{}
-	_, applied2, err := applyConfig(context.Background(), second.run, rc, "priv", resolve, applied1, nil, "", &responderProbeLatch{}, testLogger(t))
+	_, applied2, err := applyConfig(context.Background(), second.run, rc, "priv", resolve, applied1, "", nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("second Apply: %v", err)
 	}
@@ -484,7 +675,7 @@ func TestApplyToleratesEmptyFlush(t *testing.T) {
 				}
 				return nil
 			}}
-			_, applied, err := applyConfig(context.Background(), rec.run, rc, "priv", resolveB, []ResolvedForward{forwardA}, nil, "", &responderProbeLatch{}, testLogger(t))
+			_, applied, err := applyConfig(context.Background(), rec.run, rc, "priv", resolveB, []ResolvedForward{forwardA}, "", nil, "", &responderProbeLatch{}, testLogger(t))
 			if tc.wantErr {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
 					t.Fatalf("Apply error = %v, want one containing %q", err, tc.wantErrSub)
@@ -562,7 +753,7 @@ func TestApplyFailsOnProbeError(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "10.96.1.10", nil }
 
-	_, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
+	_, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t))
 	if !errors.Is(err, probeErr) {
 		t.Fatalf("Apply = %v, want one wrapping %v", err, probeErr)
 	}
@@ -590,7 +781,7 @@ func TestApplyOneFailingSlotOthersContinue(t *testing.T) {
 	}
 	resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-	results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
+	results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t))
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -714,7 +905,7 @@ func TestApplyRulesetFailureHoldsEveryAttemptedSlot(t *testing.T) {
 			}
 			resolve := func(_ context.Context, _ string) (string, error) { return "", nil }
 
-			results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, nil, "", &responderProbeLatch{}, testLogger(t))
+			results, _, err := applyConfig(context.Background(), rec.run, rc, "priv", resolve, nil, "", nil, "", &responderProbeLatch{}, testLogger(t))
 			if err == nil || !errors.Is(err, nftErr) {
 				t.Fatalf("Apply error = %v, want one wrapping %v", err, nftErr)
 			}
@@ -883,6 +1074,43 @@ func TestPreCheckLocal(t *testing.T) {
 			}
 			if tc.wantMessageSub != "" && !strings.Contains(fault.Message, tc.wantMessageSub) {
 				t.Errorf("fault.Message = %q, want substring %q", fault.Message, tc.wantMessageSub)
+			}
+		})
+	}
+}
+
+// TestReadSysctlInt pins the value a sysctl file parses to and the error kinds callers branch on.
+func TestReadSysctlInt(t *testing.T) {
+	tcs := []struct {
+		name    string
+		content *string
+		want    int
+		wantErr error
+	}{
+		{name: "value_with_trailing_newline", content: new("2\n"), want: 2},
+		{name: "missing_file_wraps_not_exist", wantErr: os.ErrNotExist},
+		{name: "unparseable_value_wraps_syntax_error", content: new("not-a-number"), wantErr: strconv.ErrSyntax},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			prefix := t.TempDir()
+			if tc.content != nil {
+				writeSysctl(t, prefix, "ipv4/conf/wg-gw3/rp_filter", *tc.content)
+			}
+
+			got, err := readSysctlInt(filepath.Join(prefix, "ipv4/conf/wg-gw3/rp_filter"))
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("readSysctlInt error = %v, want one wrapping %v", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readSysctlInt: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("readSysctlInt = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -1442,4 +1670,212 @@ func dnatTargets(ruleset string) []string {
 		}
 	}
 	return targets
+}
+
+// fakeSysctls is an in-memory /proc/sys/net for the sysctl re-assert: read answers from values,
+// a path in errs fails with that error, and any other path is absent.
+type fakeSysctls struct {
+	mu     sync.Mutex
+	values map[string]int
+	errs   map[string]error
+	reads  int
+
+	driftOn string
+	drift   map[string]int
+}
+
+func (f *fakeSysctls) read(path string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if path == f.driftOn && f.drift != nil {
+		maps.Copy(f.values, f.drift)
+		f.drift = nil
+	}
+	if err, ok := f.errs[path]; ok {
+		return 0, err
+	}
+	v, ok := f.values[path]
+	if !ok {
+		return 0, fmt.Errorf("read %s: %w", path, os.ErrNotExist)
+	}
+	return v, nil
+}
+
+func (f *fakeSysctls) set(path string, v int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.values[path] = v
+}
+
+// driftAt stages values to land together on the next read of trigger, so a pass that starts by
+// reading trigger sees every drifted key at once, whatever the reload loop's timing.
+func (f *fakeSysctls) driftAt(trigger string, values map[string]int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.driftOn = trigger
+	f.drift = values
+}
+
+func (f *fakeSysctls) readCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+// write stores a sysctl write step's value, so a corrected key reads back as corrected.
+func (f *fakeSysctls) write(c command) error {
+	v, err := strconv.Atoi(c.writeValue)
+	if err != nil {
+		return fmt.Errorf("parse write value %q: %w", c.writeValue, err)
+	}
+	f.set(c.writePath, v)
+	return nil
+}
+
+// logRecord is one observed log entry reduced to what a test asserts on.
+type logRecord struct {
+	level   zapcore.Level
+	message string
+	fields  map[string]any
+}
+
+func logRecords(logs *observer.ObservedLogs) []logRecord {
+	records := []logRecord{}
+	for _, e := range logs.All() {
+		records = append(records, logRecord{level: e.Level, message: e.Message, fields: e.ContextMap()})
+	}
+	return records
+}
+
+// TestReassertSlotSysctls pins the per-pass correction of each slot's rp_filter and forwarding:
+// exactly the drifted keys are re-written through the apply step, each logged once.
+func TestReassertSlotSysctls(t *testing.T) {
+	const (
+		rp0       = HostProcSysNetPath + "/ipv4/conf/wg-gw3/rp_filter"
+		fw0       = HostProcSysNetPath + "/ipv4/conf/wg-gw3/forwarding"
+		rp1       = HostProcSysNetPath + "/ipv4/conf/wg-gw3-1/rp_filter"
+		fw1       = HostProcSysNetPath + "/ipv4/conf/wg-gw3-1/forwarding"
+		readWarn  = "read slot sysctl"
+		writeWarn = "re-assert slot sysctl"
+		info      = "re-asserted a drifted slot sysctl"
+	)
+	readErr := errors.New("input/output error")
+	writeErr := errors.New("write: permission denied")
+
+	tcs := []struct {
+		name      string
+		rc        RuntimeConfig
+		values    map[string]int
+		errs      map[string]error
+		writeErrs map[string]error
+		wantCmds  []command
+		wantLogs  []logRecord
+	}{
+		{
+			name:     "zero peers",
+			rc:       localRC(3),
+			wantCmds: []command{},
+			wantLogs: []logRecord{},
+		},
+		{
+			name:     "matching values",
+			rc:       localRC(3, 0, 1),
+			values:   map[string]int{rp0: 0, fw0: 1, rp1: 0, fw1: 1},
+			wantCmds: []command{},
+			wantLogs: []logRecord{},
+		},
+		{
+			name:     "drifted rp_filter",
+			rc:       localRC(3, 0),
+			values:   map[string]int{rp0: 2, fw0: 1},
+			wantCmds: []command{{writePath: rp0, writeValue: "0"}},
+			wantLogs: []logRecord{{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3", "key": "rp_filter", "found": int64(2), "intended": int64(0)}}},
+		},
+		{
+			name:     "drifted forwarding",
+			rc:       localRC(3, 0),
+			values:   map[string]int{rp0: 0, fw0: 0},
+			wantCmds: []command{{writePath: fw0, writeValue: "1"}},
+			wantLogs: []logRecord{{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3", "key": "forwarding", "found": int64(0), "intended": int64(1)}}},
+		},
+		{
+			name:   "both keys drifted on the second slot",
+			rc:     localRC(3, 0, 1),
+			values: map[string]int{rp0: 0, fw0: 1, rp1: 2, fw1: 0},
+			wantCmds: []command{
+				{writePath: rp1, writeValue: "0"},
+				{writePath: fw1, writeValue: "1"},
+			},
+			wantLogs: []logRecord{
+				{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3-1", "key": "rp_filter", "found": int64(2), "intended": int64(0)}},
+				{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3-1", "key": "forwarding", "found": int64(0), "intended": int64(1)}},
+			},
+		},
+		{
+			name:     "absent interface is skipped",
+			rc:       localRC(3, 0, 1),
+			values:   map[string]int{rp1: 2, fw1: 1},
+			wantCmds: []command{{writePath: rp1, writeValue: "0"}},
+			wantLogs: []logRecord{{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3-1", "key": "rp_filter", "found": int64(2), "intended": int64(0)}}},
+		},
+		{
+			name:     "unreadable key is logged and skipped",
+			rc:       localRC(3, 0),
+			values:   map[string]int{fw0: 0},
+			errs:     map[string]error{rp0: readErr},
+			wantCmds: []command{{writePath: fw0, writeValue: "1"}},
+			wantLogs: []logRecord{
+				{zapcore.WarnLevel, readWarn, map[string]any{"interface": "wg-gw3", "key": "rp_filter", "error": readErr.Error()}},
+				{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3", "key": "forwarding", "found": int64(0), "intended": int64(1)}},
+			},
+		},
+		{
+			name:      "failed write is logged and the next key still corrected",
+			rc:        localRC(3, 0),
+			values:    map[string]int{rp0: 2, fw0: 0},
+			writeErrs: map[string]error{rp0: writeErr},
+			wantCmds: []command{
+				{writePath: rp0, writeValue: "0"},
+				{writePath: fw0, writeValue: "1"},
+			},
+			wantLogs: []logRecord{
+				{zapcore.WarnLevel, writeWarn, map[string]any{"interface": "wg-gw3", "key": "rp_filter", "error": writeErr.Error()}},
+				{zapcore.InfoLevel, info, map[string]any{"interface": "wg-gw3", "key": "forwarding", "found": int64(0), "intended": int64(1)}},
+			},
+		},
+		{
+			name:     "cluster mode",
+			rc:       RuntimeConfig{WireGuard: WireGuard{Peers: []Peer{{Slot: 0, PublicKey: "PUB="}}}},
+			values:   map[string]int{HostProcSysNetPath + "/ipv4/conf/wg0/rp_filter": 2},
+			wantCmds: []command{},
+			wantLogs: []logRecord{},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			sysctls := &fakeSysctls{values: tc.values, errs: tc.errs}
+			rec := &runRecorder{hook: func(c command) error {
+				if err, ok := tc.writeErrs[c.writePath]; ok {
+					return err
+				}
+				return sysctls.write(c)
+			}}
+			log, logs := observedLogger(t)
+
+			reassertSlotSysctls(context.Background(), rec.run, sysctls.read, tc.rc, log)
+
+			got := rec.snapshot()
+			if got == nil {
+				got = []command{}
+			}
+			if !reflect.DeepEqual(got, tc.wantCmds) {
+				t.Errorf("commands = %+v, want %+v", got, tc.wantCmds)
+			}
+			if gotLogs := logRecords(logs); !reflect.DeepEqual(gotLogs, tc.wantLogs) {
+				t.Errorf("logs = %+v, want %+v", gotLogs, tc.wantLogs)
+			}
+		})
+	}
 }

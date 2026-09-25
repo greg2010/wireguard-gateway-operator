@@ -376,6 +376,7 @@ func buildLinkConfigMap(gw *wgnetv1alpha1.Gateway, address string, backends []fo
 		Identity:      ident,
 		HealthPort:    healthPort,
 		ResponderPort: responderPort,
+		PublicAddress: address,
 		WireGuard: link.WireGuard{
 			Address:    fmt.Sprintf("%s/%s", effectiveWGLinkAddress(gw), suffix),
 			ListenPort: 0,

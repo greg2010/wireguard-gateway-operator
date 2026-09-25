@@ -3,6 +3,7 @@ package link
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -68,6 +69,10 @@ type RuntimeConfig struct {
 	ResponderPort int `json:"responderPort,omitempty"`
 	// ResponderTarget is the Cluster-shape health DNAT target, the responder Service ClusterIP.
 	ResponderTarget string `json:"responderTarget,omitempty"`
+
+	// PublicAddress is the IPv4 address clients reach the gateway on: the load balancer's
+	// forwarding-rule address, or the single instance's external address. Empty until known.
+	PublicAddress string `json:"publicAddress,omitempty"`
 
 	WireGuard WireGuard `json:"wireguard"`
 	Forwards  []Forward `json:"forwards"`
@@ -181,6 +186,18 @@ func (rc *RuntimeConfig) validate() error {
 	}
 	if rc.ResponderPort == 0 && rc.ResponderTarget != "" {
 		return fmt.Errorf("responderPort must be nonzero when responderTarget is set (responderTarget %q)", rc.ResponderTarget)
+	}
+	if rc.PublicAddress != "" {
+		addr, err := netip.ParseAddr(rc.PublicAddress)
+		if err != nil {
+			return fmt.Errorf("publicAddress: %w", err)
+		}
+		if !addr.Is4() {
+			return fmt.Errorf("publicAddress must be an IPv4 address, got %q", rc.PublicAddress)
+		}
+		if addr.IsUnspecified() {
+			return fmt.Errorf("publicAddress must not be the unspecified address, got %q", rc.PublicAddress)
+		}
 	}
 	seenSlots := make(map[int]bool, len(rc.WireGuard.Peers))
 	for i := range rc.WireGuard.Peers {

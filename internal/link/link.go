@@ -93,8 +93,8 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 	resolve := newResolver(net.DefaultResolver.LookupIP)
 
 	apply := func(ctx context.Context, rc RuntimeConfig, privKey string, localForwards []ResolvedForward) ([]SlotResult, error) {
-		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context, previous []ResolvedForward) ([]SlotResult, []ResolvedForward, error) {
-			return applyConfig(ctx, execCommand, rc, privKey, resolve, previous, localForwards, cfg.NodeName, &dp.probeLatch, log)
+		return dp.applyPass(ctx, execCommand, rc, func(ctx context.Context, previous []ResolvedForward, previousAddress string) ([]SlotResult, []ResolvedForward, error) {
+			return applyConfig(ctx, execCommand, rc, privKey, resolve, previous, previousAddress, localForwards, cfg.NodeName, &dp.probeLatch, log)
 		}, log)
 	}
 	reconcile := newLeaderReconcile(cs, cfg, rd, preCheck, apply, log)
@@ -118,14 +118,17 @@ func Run(ctx context.Context, cfg Config, log *zap.SugaredLogger) error {
 		cs:        cs,
 		privKey:   privKey,
 		reconcile: reconcile,
-		timing:    defaultElectionTiming,
+		reassert: func(ctx context.Context, rc RuntimeConfig) {
+			reassertSlotSysctls(ctx, execCommand, readSysctlInt, rc, log)
+		},
+		timing: defaultElectionTiming,
 
 		inheritedDataPlane: inherited,
 		fence: func(ctx context.Context) error {
 			return dp.stepDown(ctx, execCommand, log)
 		},
 		onOtherHolder:    dp.observeOtherHolder,
-		onStartedLeading: dp.clearOtherHolder,
+		onStartedLeading: dp.startLeading,
 		log:              log,
 	}
 	g.Go(func() error {

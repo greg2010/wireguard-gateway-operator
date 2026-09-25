@@ -202,7 +202,7 @@ func TestLeaderReconcileRetriesAfterFailedPublish(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", reconcile, testLogger(t))
+		done <- watchAndReload(ctx, cfg, nil, nil, false, "priv", reconcile, noReassert, testLogger(t))
 	}()
 
 	for i := range 2 {

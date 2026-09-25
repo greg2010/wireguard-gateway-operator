@@ -21,9 +21,9 @@ const defaultReconcileInterval = 10 * time.Second
 // applyFunc applies the current runtime configuration.
 type applyFunc func(ctx context.Context, rc RuntimeConfig, privKey string, forwards []ResolvedForward, unsatisfied []unsatisfiedForward) ([]SlotResult, error)
 
-// watchAndReload re-applies on config or endpoint change, keyed on a second digest over the
-// ruleset and the unsatisfied set, which no ruleset shows. keptDataPlane seeds appliedForwards.
-func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identity *GatewayIdentity, keptDataPlane bool, privKey string, reconcile applyFunc, log *zap.SugaredLogger) error {
+// watchAndReload re-applies on a config or endpoint change, also digesting the unsatisfied set,
+// which no ruleset shows. keptDataPlane seeds appliedForwards; reassert runs before the digests.
+func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identity *GatewayIdentity, keptDataPlane bool, privKey string, reconcile applyFunc, reassert func(context.Context, RuntimeConfig), log *zap.SugaredLogger) error {
 	var changes <-chan struct{}
 	if ew != nil {
 		var cancelChanges func()
@@ -41,6 +41,7 @@ func watchAndReload(ctx context.Context, cfg Config, ew *endpointWatcher, identi
 			log.Warnw("load runtime config", "path", cfg.ConfigPath, "error", err)
 			return
 		}
+		reassert(ctx, rc)
 		cfgDigest, err := configDigest(rc)
 		if err != nil {
 			log.Warnw("digest runtime config", "error", err)
