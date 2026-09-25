@@ -7,13 +7,13 @@ providers:
     # declaring it explicitly here duplicates it and wedges RBAC ClusterRole
     # creation for the whole gcp family.
     enabled: false
-    package: xpkg.upbound.io/upbound/provider-family-gcp:v2.5.4
+    package: xpkg.upbound.io/upbound/provider-family-gcp:v3.0.3
   compute:
-    package: xpkg.upbound.io/upbound/provider-gcp-compute:v2.5.4
+    package: xpkg.upbound.io/upbound/provider-gcp-compute:v3.0.3
   cloudplatform:
-    package: xpkg.upbound.io/upbound/provider-gcp-cloudplatform:v2.5.4
+    package: xpkg.upbound.io/upbound/provider-gcp-cloudplatform:v3.0.3
   secretmanager:
-    package: xpkg.upbound.io/upbound/provider-gcp-secretmanager:v2.5.4
+    package: xpkg.upbound.io/upbound/provider-gcp-secretmanager:v3.0.3
 
 functions:
   goTemplating:
